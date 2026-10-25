@@ -6,12 +6,19 @@ import (
 	"strings"
 )
 
-// NormalizeRule classifies input as an IPv4 network (isNet) or a domain
+// NormalizeRule classifies input as a network (isNet: IPv4 CIDR, IP, or an
+// autonomous system "AS49675" that stands for all its networks) or a domain,
 // and returns its canonical form.
 func NormalizeRule(s string) (isNet bool, val string, err error) {
 	s = strings.TrimSpace(strings.ToLower(s))
 	if s == "" {
 		return false, "", fmt.Errorf("empty rule")
+	}
+	if n, ok := strings.CutPrefix(s, "as"); ok && n != "" && strings.Trim(n, "0123456789") == "" {
+		if n = strings.TrimLeft(n, "0"); n == "" {
+			return false, "", fmt.Errorf("AS0 is not a real autonomous system")
+		}
+		return true, "AS" + n, nil
 	}
 	if _, n, e := net.ParseCIDR(s); e == nil {
 		if n.IP.To4() == nil {
@@ -31,6 +38,9 @@ func NormalizeRule(s string) (isNet bool, val string, err error) {
 	}
 	return false, s, nil
 }
+
+// IsAS reports whether a network rule is an autonomous system ("AS49675").
+func IsAS(rule string) bool { return strings.HasPrefix(rule, "AS") }
 
 // AddUnique appends v unless it is already present.
 func AddUnique(list []string, v string) []string {

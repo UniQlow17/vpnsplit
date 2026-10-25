@@ -16,24 +16,30 @@ import (
 	"github.com/UniQlow17/vpnsplit/internal/tui"
 )
 
-const usage = `vpnsplit - route part of traffic through corp VPN, the rest through home VPN
+const usage = `vpnsplit - corp traffic through the corp VPN, chosen sites past every VPN, the rest through the home VPN
 
   vpnsplit [menu]                interactive menu (default)
-  vpnsplit list                  show network adapters and detected VPNs
-  vpnsplit init                  choose corp / home adapters interactively
-  vpnsplit add <cidr|ip|domain>...     send these to the corp VPN
-  vpnsplit remove <cidr|ip|domain>...
+  vpnsplit list                  show network adapters and the VPN clients behind them
+  vpnsplit init                  choose corp / home VPN (default: detect automatically)
+  vpnsplit add <cidr|ip|domain|AS>...        send these to the corp VPN
+                                 (AS49675 = every network the AS announces, from RIPE)
+  vpnsplit add --direct <cidr|ip|domain>...  send these past every VPN (Wi-Fi/Ethernet)
+  vpnsplit remove [--direct] <cidr|ip|domain>...
   vpnsplit rules                 show current rules
-  vpnsplit set <key> <value>     corp-dns | corp-gateway | home-default (true/false); "none" clears
+  vpnsplit import <file>         add the rules of a rules file (from export or someone else)
+  vpnsplit export [file]         write the rules as a rules file (stdout by default)
+  vpnsplit set <key> <value>     corp | home (auto, client or adapter name),
+                                 corp-dns | corp-gateway ("none" clears),
+                                 home-default | split-dns (true/false)
   vpnsplit apply                 add routes (needs admin/root)
-  vpnsplit watch                 keep routes in sync when VPNs connect/disconnect
-  vpnsplit status                show config and routes owned by this tool
+  vpnsplit watch                 keep routes in sync when VPNs connect, switch or disconnect
+  vpnsplit status                show what is connected and what vpnsplit added
   vpnsplit reset [--purge]       remove ALL routes added by this tool and
                                  restore original routing (--purge also deletes config)
   vpnsplit version
 
-Only routes created by vpnsplit are ever touched; the system default route,
-DNS and VPN clients are never modified.`
+Only routes created by vpnsplit are ever touched; the system default route
+and the VPN clients' own routes are never modified.`
 
 // Run executes the command line and returns the process exit code.
 func Run(args []string, version string) int {
@@ -60,6 +66,10 @@ func run(args []string, version string) error {
 		return cmdRules(cmd, rest)
 	case "rules":
 		return cmdRulesShow()
+	case "import":
+		return cmdImport(rest)
+	case "export":
+		return cmdExport(rest)
 	case "set":
 		return cmdSet(rest)
 	case "apply":
@@ -105,10 +115,22 @@ func cmdList(w io.Writer) error {
 		if i.Up {
 			state = "up"
 		}
-		fmt.Fprintf(w, "%-30s %-5s %-9s %-16s %s\n", i.Name, state, i.Kind, strings.Join(i.Addrs, ","), i.Desc)
+		fmt.Fprintf(w, "%-12s %-5s %-9s %-20s %-16s %s\n", i.Name, state, i.Kind, i.Provider, strings.Join(i.Addrs, ","), i.Desc)
 	}
-	fmt.Fprintln(w, "\nkind: corp? = looks like the corporate VPN adapter, vpn = tunnel adapter")
+	fmt.Fprintln(w, "\nkind: corp? = corporate VPN, vpn = other tunnel; the client name is detected from the app behind the adapter")
+	if !router.IsPrivileged() {
+		fmt.Fprintln(w, "tip: some VPN clients are recognised reliably only with admin rights (", router.PrivHint, ")")
+	}
 	return nil
+}
+
+// selector is what gets saved for an adapter: the VPN client name when it is
+// known (it survives reconnects onto another adapter), else the adapter name.
+func selector(i netif.Info) string {
+	if i.Provider != "" {
+		return i.Provider
+	}
+	return i.Name
 }
 
 func cmdInit(r io.Reader, w io.Writer) error {
@@ -116,28 +138,31 @@ func cmdInit(r io.Reader, w io.Writer) error {
 	if err != nil {
 		return err
 	}
+	var vpns []netif.Info
+	for _, i := range ifs {
+		if i.Connected() && (i.Kind == netif.KindCorp || i.Kind == netif.KindVPN) {
+			vpns = append(vpns, i)
+		}
+	}
 	in := bufio.NewReader(r)
 	pick := func(title string, hint netif.Kind) (string, error) {
 		fmt.Fprintf(w, "\n%s\n", title)
-		for n, i := range ifs {
+		fmt.Fprintf(w, "    0) auto: detect the connected VPN every time (recommended)\n")
+		for n, i := range vpns {
 			mark := " "
 			if i.Kind == hint {
 				mark = "*"
 			}
-			st := "down"
-			if i.Up {
-				st = "up"
-			}
-			fmt.Fprintf(w, " %s %2d) %-28s %-5s %-8s %s %s\n", mark, n+1, i.Name, st, i.Kind, strings.Join(i.Addrs, ","), i.Desc)
+			fmt.Fprintf(w, " %s %2d) %-28s %s\n", mark, n+1, i.Label(), strings.Join(i.Addrs, ","))
 		}
-		fmt.Fprint(w, "number or exact adapter name (can be one that is not connected yet): ")
+		fmt.Fprint(w, "number, VPN client or adapter name [0]: ")
 		line, _ := in.ReadString('\n')
 		line = strings.TrimSpace(line)
-		if n, e := strconv.Atoi(line); e == nil && n >= 1 && n <= len(ifs) {
-			return ifs[n-1].Name, nil
+		if n, e := strconv.Atoi(line); e == nil && n >= 1 && n <= len(vpns) {
+			return selector(vpns[n-1]), nil
 		}
-		if line == "" {
-			return "", fmt.Errorf("nothing selected")
+		if line == "" || line == "0" {
+			return netif.Auto, nil
 		}
 		return line, nil
 	}
@@ -145,19 +170,19 @@ func cmdInit(r io.Reader, w io.Writer) error {
 	if err != nil {
 		cfg = config.New()
 	}
-	if cfg.Corp, err = pick("Select CORPORATE VPN adapter, * = suggested:", netif.KindCorp); err != nil {
+	if cfg.Corp, err = pick("CORPORATE VPN, * = looks corporate:", netif.KindCorp); err != nil {
 		return err
 	}
-	if cfg.Home, err = pick("Select HOME VPN adapter, * = suggested:", netif.KindVPN); err != nil {
+	if cfg.Home, err = pick("HOME VPN, * = looks like a home VPN:", netif.KindVPN); err != nil {
 		return err
 	}
-	if cfg.Corp == cfg.Home {
-		return fmt.Errorf("corp and home adapters must differ")
+	if cfg.Corp == cfg.Home && !netif.IsAuto(cfg.Corp) {
+		return fmt.Errorf("corp and home VPN must differ")
 	}
 	if err := config.Save(cfg); err != nil {
 		return err
 	}
-	fmt.Fprintln(w, "\nsaved. Next: vpnsplit add 10.0.0.0/8 corp.example.com ; vpnsplit apply")
+	fmt.Fprintln(w, "\nsaved. Next: vpnsplit add 10.0.0.0/8 corp.example.com ; vpnsplit add --direct bank.example.ru ; sudo vpnsplit apply")
 	return nil
 }
 
@@ -166,17 +191,22 @@ func cmdRules(op string, items []string) error {
 	if err != nil {
 		return err
 	}
-	if len(items) == 0 {
-		return fmt.Errorf("usage: vpnsplit %s <cidr|ip|domain>...", op)
+	direct := len(items) > 0 && items[0] == "--direct"
+	if direct {
+		items = items[1:]
 	}
+	if len(items) == 0 {
+		return fmt.Errorf("usage: vpnsplit %s [--direct] <cidr|ip|domain>...", op)
+	}
+	nets, domains := cfg.Lists(direct)
 	for _, it := range items {
 		isNet, v, err := config.NormalizeRule(it)
 		if err != nil {
 			return err
 		}
-		list := &cfg.Domains
+		list := domains
 		if isNet {
-			list = &cfg.Networks
+			list = nets
 		}
 		if op == "add" {
 			*list = config.AddUnique(*list, v)
@@ -190,7 +220,7 @@ func cmdRules(op string, items []string) error {
 	if err := config.Save(cfg); err != nil {
 		return err
 	}
-	fmt.Println("saved. Run `vpnsplit apply` to activate.")
+	fmt.Println("saved. Run `vpnsplit apply` to activate (watch and the menu's auto mode pick it up by themselves).")
 	return nil
 }
 
@@ -199,14 +229,51 @@ func cmdRulesShow() error {
 	if err != nil {
 		return err
 	}
-	fmt.Println("networks:", strings.Join(cfg.Networks, ", "))
-	fmt.Println("domains: ", strings.Join(cfg.Domains, ", "))
+	fmt.Println("corp networks:  ", strings.Join(cfg.Networks, ", "))
+	fmt.Println("corp domains:   ", strings.Join(cfg.Domains, ", "))
+	fmt.Println("direct networks:", strings.Join(cfg.DirectNetworks, ", "))
+	fmt.Println("direct domains: ", strings.Join(cfg.DirectDomains, ", "))
 	return nil
+}
+
+func cmdImport(a []string) error {
+	if len(a) != 1 {
+		return fmt.Errorf("usage: vpnsplit import <file>")
+	}
+	cfg, err := config.Load()
+	if err != nil {
+		return err
+	}
+	b, err := os.ReadFile(a[0])
+	if err != nil {
+		return err
+	}
+	added, errs := cfg.ImportRules(string(b))
+	for _, e := range errs {
+		fmt.Println("  skipped:", e)
+	}
+	if err := config.Save(cfg); err != nil {
+		return err
+	}
+	fmt.Printf("imported %d new rules. Run `vpnsplit apply` to activate (watch and the menu's auto mode pick it up by themselves).\n", added)
+	return nil
+}
+
+func cmdExport(a []string) error {
+	cfg, err := config.Load()
+	if err != nil {
+		return err
+	}
+	if len(a) == 0 {
+		fmt.Print(cfg.ExportRules())
+		return nil
+	}
+	return config.WriteUserFile(a[0], []byte(cfg.ExportRules()))
 }
 
 func cmdSet(a []string) error {
 	if len(a) != 2 {
-		return fmt.Errorf("usage: vpnsplit set <corp-dns|corp-gateway|home-default> <value>")
+		return fmt.Errorf("usage: vpnsplit set <corp|home|corp-dns|corp-gateway|home-default|split-dns> <value>")
 	}
 	cfg, err := config.Load()
 	if err != nil {
@@ -217,12 +284,18 @@ func cmdSet(a []string) error {
 		val = ""
 	}
 	switch a[0] {
+	case "corp":
+		cfg.Corp = val
+	case "home":
+		cfg.Home = val
 	case "corp-dns":
 		cfg.CorpDNS = val
 	case "corp-gateway":
 		cfg.CorpGateway = val
 	case "home-default":
 		cfg.HomeDefault = val == "true"
+	case "split-dns":
+		cfg.SplitDNS = val == "true"
 	default:
 		return fmt.Errorf("unknown key %q", a[0])
 	}
@@ -234,20 +307,39 @@ func cmdStatus() error {
 	if err != nil {
 		return err
 	}
-	fmt.Printf("corp: %-24s connected=%v\n", cfg.Corp, netif.Up(cfg.Corp))
-	fmt.Printf("home: %-24s connected=%v\n", cfg.Home, netif.Up(cfg.Home))
-	fmt.Printf("corp-dns=%q corp-gateway=%q home-default=%v\n", cfg.CorpDNS, cfg.CorpGateway, cfg.HomeDefault)
+	e := router.Detect(cfg)
+	line := func(role, sel string, ok bool, i netif.Info) {
+		got := "not connected"
+		if ok {
+			got = i.Label()
+		}
+		fmt.Printf("%s: %-14s -> %s\n", role, sel, got)
+	}
+	line("corp", cfg.Corp, e.CorpOK, e.Corp)
+	line("home", cfg.Home, e.HomeOK, e.Home)
+	if e.GWOK {
+		fmt.Printf("direct: %s via %s\n", e.GW.Iface, e.GW.Router)
+	} else {
+		fmt.Println("direct: no Wi-Fi/Ethernet gateway found")
+	}
+	fmt.Printf("corp-dns=%q corp-gateway=%q home-default=%v split-dns=%v\n", cfg.CorpDNS, cfg.CorpGateway, cfg.HomeDefault, cfg.SplitDNS)
 	st := config.LoadState()
 	fmt.Printf("routes owned by vpnsplit: %d\n", len(st.Routes))
 	for _, r := range st.Routes {
-		fmt.Printf("  %-18s -> %s\n", r.Dest, r.Iface)
+		fmt.Printf("  %-18s -> %-6s %s\n", r.Dest, r.Via, r.Iface)
+	}
+	for _, p := range st.Resolvers {
+		fmt.Printf("  dns file %s\n", p)
+	}
+	if apply, _ := router.Sync(cfg, e, st); apply && !st.Empty() {
+		fmt.Println("connections or rules changed since the last apply: run apply again (or use watch)")
 	}
 	return nil
 }
 
 func cmdReset(purge bool) error {
 	n, errs := router.Reset()
-	fmt.Printf("removed %d routes\n", n)
+	fmt.Printf("removed %d routes and DNS entries\n", n)
 	for _, e := range errs {
 		fmt.Println("  !", e)
 	}
@@ -257,34 +349,30 @@ func cmdReset(purge bool) error {
 		}
 	}
 	if len(errs) > 0 {
-		return fmt.Errorf("%d routes could not be removed; journal kept, run reset again", len(errs))
+		return fmt.Errorf("%d entries could not be removed; journal kept, run reset again", len(errs))
 	}
 	fmt.Println("routing is back to what your VPN clients and OS set up. Reconnect the VPNs if something still looks off.")
 	return nil
 }
 
 func cmdWatch() error {
-	cfg, err := config.Load()
-	if err != nil {
-		return err
-	}
 	fmt.Println("watching (Ctrl+C to stop; run `vpnsplit reset` to clean up)...")
-	applied := len(config.LoadState().Routes) > 0
 	for {
-		both := netif.Up(cfg.Corp) && netif.Up(cfg.Home)
-		switch {
-		case both && !applied:
-			fmt.Println(time.Now().Format("15:04:05"), "both VPNs up, applying")
+		cfg, err := config.Load()
+		if err != nil {
+			return err
+		}
+		e := router.Detect(cfg)
+		switch apply, reset := router.Sync(cfg, e, config.LoadState()); {
+		case apply:
+			fmt.Println(time.Now().Format("15:04:05"), "VPNs or rules changed, applying")
 			if err := router.Apply(cfg, os.Stdout); err != nil {
 				fmt.Println("  !", err)
-			} else {
-				applied = true
 			}
-		case !both && applied:
-			fmt.Println(time.Now().Format("15:04:05"), "a VPN went down, removing routes")
+		case reset:
+			fmt.Println(time.Now().Format("15:04:05"), "no VPN connected, removing routes")
 			router.Reset()
-			applied = false
 		}
-		time.Sleep(10 * time.Second)
+		time.Sleep(5 * time.Second)
 	}
 }

@@ -26,7 +26,8 @@ func ipCmd(args ...string) error {
 }
 
 func addRoute(r config.Route) error {
-	args := []string{"route", "replace", r.Dest}
+	// "add", not "replace": a route the VPN client already set up must stay its own
+	args := []string{"route", "add", r.Dest}
 	if r.Gateway != "" {
 		args = append(args, "via", r.Gateway)
 	}
@@ -34,9 +35,19 @@ func addRoute(r config.Route) error {
 }
 
 func delRoute(r config.Route) error {
-	err := ipCmd("route", "del", r.Dest, "dev", r.Iface)
+	// the metric picks our route, not a VPN client's own one to the same place
+	err := ipCmd("route", "del", r.Dest, "dev", r.Iface, "metric", "1")
 	if err != nil && (strings.Contains(err.Error(), "No such") || strings.Contains(err.Error(), "Cannot find device")) {
 		return nil
 	}
 	return err
+}
+
+// physicalGateway is the default route of a non-VPN adapter.
+func physicalGateway() (Gateway, bool) {
+	out, err := exec.Command("ip", "-4", "route", "show", "default").Output()
+	if err != nil {
+		return Gateway{}, false
+	}
+	return parseDefaultGW(string(out))
 }

@@ -1,6 +1,9 @@
 package config
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestNormalizeRule(t *testing.T) {
 	tests := []struct {
@@ -19,6 +22,10 @@ func TestNormalizeRule(t *testing.T) {
 		{"localhost", false, "", true},
 		{"a b.com", false, "", true},
 		{"", false, "", true},
+		{"AS15632", true, "AS15632", false},
+		{" as049675 ", true, "AS49675", false},
+		{"as", false, "", true},
+		{"asdf.example.com", false, "asdf.example.com", false},
 	}
 	for _, tt := range tests {
 		isNet, got, err := NormalizeRule(tt.in)
@@ -45,5 +52,34 @@ func TestAddRemove(t *testing.T) {
 	}
 	if _, ok := RemoveVal(l, "zzz"); ok {
 		t.Fatal("RemoveVal reported a missing value as found")
+	}
+}
+
+func TestImportExportRules(t *testing.T) {
+	c := New()
+	c.DirectNetworks = []string{"46.17.200.0/21"}
+	added, errs := c.ImportRules(`# shared list
+10.0.0.0/8            # no section yet: corp
+[DIRECT]
+46.17.200.0/21        # already there
+217.12.104.0/23
+telework.example.ru
+not a rule
+[corp]
+intranet.example.com
+`)
+	if added != 4 {
+		t.Errorf("added %d, want 4", added)
+	}
+	if len(errs) != 1 || !strings.Contains(errs[0].Error(), "line 7") {
+		t.Errorf("errs %v, want one for line 7", errs)
+	}
+	if len(c.Networks) != 1 || len(c.Domains) != 1 || len(c.DirectNetworks) != 2 || len(c.DirectDomains) != 1 {
+		t.Errorf("got corp %v %v direct %v %v", c.Networks, c.Domains, c.DirectNetworks, c.DirectDomains)
+	}
+
+	again := New()
+	if n, errs := again.ImportRules(c.ExportRules()); n != 5 || len(errs) != 0 {
+		t.Errorf("round trip: %d rules, errs %v", n, errs)
 	}
 }
