@@ -1,0 +1,15 @@
+# build output
+/vpnsplit
+/vpnsplit.exe
+/dist/
+
+# go
+*.test
+*.out
+coverage.*
+
+# editors / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
