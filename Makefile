@@ -1,10 +1,11 @@
 VERSION ?= dev
 LDFLAGS := -s -w -X main.version=$(VERSION)
+GOEXE := $(shell go env GOEXE)
 
 .PHONY: build test vet fmt snapshot clean
 
 build:
-	CGO_ENABLED=0 go build -trimpath -ldflags "$(LDFLAGS)" -o vpnsplit ./cmd/vpnsplit
+	CGO_ENABLED=0 go build -trimpath -ldflags "$(LDFLAGS)" -o vpnsplit$(GOEXE) ./cmd/vpnsplit
 
 test:
 	go test ./...

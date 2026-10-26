@@ -64,10 +64,12 @@ func delRoute(r config.Route) error {
 	}
 	script := fmt.Sprintf("Remove-NetRoute -DestinationPrefix '%s' -InterfaceIndex %d -NextHop '%s' -RouteMetric 1 -Confirm:$false -ErrorAction Stop",
 		n.String(), ifi.Index, hop)
-	out, err := exec.Command("powershell", "-NoProfile", "-Command", script).CombinedOutput()
+	out, err := exec.Command("powershell", "-NoProfile", "-Command",
+		"[Console]::OutputEncoding=[Text.UTF8Encoding]::new(); "+script).CombinedOutput()
 	if err != nil {
 		s := strings.TrimSpace(string(out))
-		if strings.Contains(s, "No matching") || strings.Contains(strings.ToLower(s), "not found") {
+		low := strings.ToLower(s)
+		if strings.Contains(s, "No matching") || strings.Contains(low, "not found") || strings.Contains(low, "notfound") {
 			return nil
 		}
 		return fmt.Errorf("remove route %s: %s", r.Dest, s)
@@ -78,7 +80,8 @@ func delRoute(r config.Route) error {
 // physicalGateway is the lowest-metric default route of a non-VPN adapter.
 func physicalGateway() (Gateway, bool) {
 	out, err := exec.Command("powershell", "-NoProfile", "-Command",
-		"Get-NetRoute -AddressFamily IPv4 -DestinationPrefix 0.0.0.0/0 | Sort-Object RouteMetric | "+
+		"[Console]::OutputEncoding=[Text.UTF8Encoding]::new(); "+
+			"Get-NetRoute -AddressFamily IPv4 -DestinationPrefix 0.0.0.0/0 | Sort-Object RouteMetric | "+
 			"Select-Object InterfaceAlias,NextHop | ConvertTo-Json -Compress").Output()
 	if err != nil {
 		return Gateway{}, false

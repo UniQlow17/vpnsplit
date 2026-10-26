@@ -10,7 +10,8 @@ import (
 )
 
 func ps(script string) ([]byte, error) {
-	out, err := exec.Command("powershell", "-NoProfile", "-Command", script).CombinedOutput()
+	out, err := exec.Command("powershell", "-NoProfile", "-Command",
+		"[Console]::OutputEncoding=[Text.UTF8Encoding]::new(); "+script).CombinedOutput()
 	if err != nil {
 		return out, fmt.Errorf("%s", strings.TrimSpace(string(out)))
 	}
