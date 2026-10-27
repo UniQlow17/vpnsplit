@@ -13,7 +13,8 @@ import (
 // Elevated processes hide their path from a normal user; their name is used then.
 func owners([]Info) (map[string]string, []string) {
 	out, err := exec.Command("powershell", "-NoProfile", "-Command",
-		"Get-Process | ForEach-Object { if ($_.Path) { $_.Path } else { $_.ProcessName } }").Output()
+		"[Console]::OutputEncoding=[Text.UTF8Encoding]::new(); "+
+			"Get-Process | ForEach-Object { if ($_.Path) { $_.Path } else { $_.ProcessName } }").Output()
 	if err != nil {
 		return nil, nil
 	}

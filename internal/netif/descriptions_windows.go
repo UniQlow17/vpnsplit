@@ -12,7 +12,8 @@ import (
 func descriptions() map[string]string {
 	m := map[string]string{}
 	out, err := exec.Command("powershell", "-NoProfile", "-Command",
-		"Get-NetAdapter | Select-Object Name,InterfaceDescription | ConvertTo-Json -Compress").Output()
+		"[Console]::OutputEncoding=[Text.UTF8Encoding]::new(); "+
+			"Get-NetAdapter | Select-Object Name,InterfaceDescription | ConvertTo-Json -Compress").Output()
 	if err != nil {
 		return m
 	}
