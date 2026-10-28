@@ -14,12 +14,20 @@ import (
 	"github.com/UniQlow17/vpnsplit/internal/sysexec"
 )
 
+// psStop starts every script: an error stops it and fails the call instead of
+// being printed and forgotten (the exit code is then non-zero).
+const psStop = "$ErrorActionPreference='Stop'; "
+
+// nrptHas is the filter on the namespace $z of a rule: a rule is written as
+// ".zone" (what we create) but read back as either form, so both are compared.
+const nrptHas = "($_.Namespace -contains ('.'+$z) -or $_.Namespace -contains $z)"
+
 // ps runs a PowerShell script (see sysexec.PowerShell: system binary, minimal
 // environment). The script text is always a constant: every value reaches it
 // through an environment variable ($env:VS_...), so no data can ever be
 // parsed as PowerShell code, whatever quotes it contains.
 func ps(env map[string]string, script string) ([]byte, error) {
-	cmd := sysexec.PowerShell(script, env)
+	cmd := sysexec.PowerShell(psStop+script, env)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
 	if err := cmd.Run(); err != nil {
@@ -73,14 +81,14 @@ func addResolver(zone string, servers []string) error {
 	env := map[string]string{"ZONE": zone, "SERVERS": strings.Join(servers, ",")}
 	// a rule of somebody else stays; a rule with our comment is a leftover of
 	// ours (the journal was lost) and is replaced, not left behind for ever
-	out, err := ps(env, "$z=$env:VS_ZONE; @(Get-DnsClientNrptRule | Where-Object { $_.Namespace -contains ('.'+$z) -and $_.Comment -ne 'vpnsplit' }).Count")
+	out, err := ps(env, "$z=$env:VS_ZONE; @(Get-DnsClientNrptRule | Where-Object { "+nrptHas+" -and $_.Comment -ne 'vpnsplit' }).Count")
 	if err != nil {
 		return err
 	}
 	if strings.TrimSpace(string(out)) != "0" {
 		return fmt.Errorf("%w: an NRPT rule for %s exists, left as is", errResolverExists, zone)
 	}
-	_, err = ps(env, "$z=$env:VS_ZONE; Get-DnsClientNrptRule | Where-Object { $_.Comment -eq 'vpnsplit' -and $_.Namespace -contains ('.'+$z) } | "+
+	_, err = ps(env, "$z=$env:VS_ZONE; Get-DnsClientNrptRule | Where-Object { $_.Comment -eq 'vpnsplit' -and "+nrptHas+" } | "+
 		"Remove-DnsClientNrptRule -Force; "+
 		"Add-DnsClientNrptRule -Namespace ('.'+$z),$z -NameServers ($env:VS_SERVERS -split ',') -Comment 'vpnsplit'")
 	return err
@@ -91,8 +99,23 @@ func delResolver(zone string) error {
 		return fmt.Errorf("invalid DNS zone %q", zone)
 	}
 	_, err := ps(map[string]string{"ZONE": zone},
-		"$z=$env:VS_ZONE; Get-DnsClientNrptRule | Where-Object { $_.Comment -eq 'vpnsplit' -and $_.Namespace -contains ('.'+$z) } | "+
+		"$z=$env:VS_ZONE; Get-DnsClientNrptRule | Where-Object { $_.Comment -eq 'vpnsplit' -and "+nrptHas+" } | "+
 			"Remove-DnsClientNrptRule -Force")
+	return err
+}
+
+// DelResolvers removes every NRPT rule with our comment in one PowerShell call
+// (a process per zone takes about a second each, which a cleanup with a few
+// seconds to live cannot afford). The rules with our comment are all ours
+// whatever the journal lists, and a rule without it is never touched. ids are
+// only checked: an entry that would not be valid is an error, as in delResolver.
+func (osBackend) DelResolvers(ids []string) error {
+	for _, id := range ids {
+		if !config.ValidZone(id) {
+			return fmt.Errorf("invalid DNS zone %q", id)
+		}
+	}
+	_, err := ps(nil, "Get-DnsClientNrptRule | Where-Object { $_.Comment -eq 'vpnsplit' } | Remove-DnsClientNrptRule -Force")
 	return err
 }
 

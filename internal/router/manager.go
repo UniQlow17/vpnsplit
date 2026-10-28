@@ -5,8 +5,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/netip"
 	"runtime"
 	"runtime/debug"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -19,6 +21,9 @@ import (
 const (
 	recoverBudget = 60 * time.Second
 	removeWorkers = 4
+	// dnsShare is the part of the time left for a cleanup that the DNS entries
+	// may take at most, so that the routes (the last step) always get to start.
+	dnsShare = 0.4
 )
 
 // ModeSessionAsk is a mode for Acquire (never written to the journal) for the
@@ -173,6 +178,7 @@ type Report struct {
 	Routes, Resolvers int
 	Rules             int
 	Forgotten         int       // journal routes dropped without removal: gone with a reboot
+	Left              []string  // journal routes found in the table but not removed because they are not ours (or may not be); dropped from the journal
 	FullTunnel        bool      // 0.0.0.0/1 and 128.0.0.0/1 of the home VPN were removed
 	Base              *Baseline // the system compared with the state before the start; nil: not done
 }
@@ -182,7 +188,7 @@ func (r Report) Total() int { return r.Routes + r.Resolvers + r.Rules }
 
 // Describe tells what was removed, in English or Russian.
 func (r Report) Describe(ru bool) string {
-	if r.Total() == 0 && r.Forgotten == 0 {
+	if r.Total() == 0 && r.Forgotten == 0 && len(r.Left) == 0 {
 		if ru {
 			return "ничего снимать не пришлось"
 		}
@@ -200,6 +206,9 @@ func (r Report) Describe(ru bool) string {
 		if r.Forgotten > 0 {
 			s += fmt.Sprintf("; после перезагрузки забыто маршрутов: %d", r.Forgotten)
 		}
+		if len(r.Left) > 0 {
+			s += fmt.Sprintf("; оставлено (не похоже на наше): %d (%s)", len(r.Left), leftList(r.Left))
+		}
 		return s
 	}
 	s = fmt.Sprintf("removed: %d routes, %d DNS entries", r.Routes, r.Resolvers)
@@ -212,7 +221,19 @@ func (r Report) Describe(ru bool) string {
 	if r.Forgotten > 0 {
 		s += fmt.Sprintf("; routes forgotten after a reboot: %d", r.Forgotten)
 	}
+	if len(r.Left) > 0 {
+		s += fmt.Sprintf("; left (do not look like ours): %d (%s)", len(r.Left), leftList(r.Left))
+	}
 	return s
+}
+
+// leftList names the first routes of Report.Left.
+func leftList(l []string) string {
+	const show = 5
+	if len(l) <= show {
+		return strings.Join(l, ", ")
+	}
+	return fmt.Sprintf("%s and %d more", strings.Join(l[:show], ", "), len(l)-show)
 }
 
 // Notice is what the user must know after the full tunnel of the home VPN was
@@ -232,6 +253,7 @@ func (r *Report) add(o Report) {
 	r.Resolvers += o.Resolvers
 	r.Rules += o.Rules
 	r.Forgotten += o.Forgotten
+	r.Left = append(r.Left, o.Left...)
 	r.FullTunnel = r.FullTunnel || o.FullTunnel
 }
 
@@ -271,7 +293,7 @@ func (m *Manager) Acquire(ctx context.Context, mode string, w io.Writer) (*Sessi
 		}
 		return nil, info, err
 	}
-	st, warns, status := m.store.Load()
+	st, warns, status := m.loadLocked()
 	info.Warns = warns
 	if err := statusErr(status); err != nil {
 		return fail(err)
@@ -322,6 +344,18 @@ func (m *Manager) Acquire(ctx context.Context, mode string, w io.Writer) (*Sessi
 		info.Baseline = m.acquireSnapshot(rctx, st, self, w)
 	}
 	return &Session{m: m, release: release}, info, nil
+}
+
+// loadLocked reads the journal while the lock is held, which is the only time
+// an old journal of the user's directory may be taken over into it (everything
+// else only reads).
+func (m *Manager) loadLocked() (*config.State, []string, config.JournalStatus) {
+	if ms, ok := m.store.(interface {
+		LoadMigrate() (*config.State, []string, config.JournalStatus)
+	}); ok {
+		return ms.LoadMigrate()
+	}
+	return m.store.Load()
 }
 
 // busy builds the error for a lock held by somebody else.
@@ -498,13 +532,30 @@ func (m *Manager) removeEntries(ctx context.Context, st *config.State, progress 
 		done++
 		progress(done, total)
 	}
-	dnsErrs := runAll(ctx, st.Resolvers, removeWorkers, func(id string) error {
-		defer step()
-		if !config.ValidResolverEntry(id) {
-			return fmt.Errorf("invalid DNS entry %q", id)
+	dctx, dcancel := dnsContext(ctx)
+	defer dcancel()
+	var dnsErrs []error
+	if bulk, ok := m.b.(resolverBulkDeleter); ok && len(st.Resolvers) > 0 {
+		// one call for all of them, see DelResolvers
+		err := runAll(dctx, []struct{}{{}}, 1, func(struct{}) error { return bulk.DelResolvers(st.Resolvers) })[0]
+		dnsErrs = make([]error, len(st.Resolvers))
+		for i, id := range st.Resolvers {
+			if !config.ValidResolverEntry(id) {
+				dnsErrs[i] = fmt.Errorf("invalid DNS entry %q", id)
+			} else {
+				dnsErrs[i] = err
+			}
+			step()
 		}
-		return m.b.DelResolver(id)
-	})
+	} else {
+		dnsErrs = runAll(dctx, st.Resolvers, removeWorkers, func(id string) error {
+			defer step()
+			if !config.ValidResolverEntry(id) {
+				return fmt.Errorf("invalid DNS entry %q", id)
+			}
+			return m.b.DelResolver(id)
+		})
+	}
 	for i, id := range st.Resolvers {
 		if err := dnsErrs[i]; err != nil {
 			errs = append(errs, entryErr("DNS "+id, err))
@@ -528,16 +579,25 @@ func (m *Manager) removeEntries(ctx context.Context, st *config.State, progress 
 		}
 		rep.Rules++
 	}
+	skip := m.legacySkips(ctx, st.Routes)
 	routeErrs := runAll(ctx, st.Routes, removeWorkers, func(r config.Route) error {
 		defer step()
 		if err := config.ValidateRoute(r); err != nil {
 			return err
 		}
+		if why, ok := skip[r]; ok {
+			return fmt.Errorf("%w: %s", errNotOurs, why)
+		}
 		return m.b.DelRoute(r)
 	})
 	gone := map[string]bool{}
 	for i, r := range st.Routes {
-		if err := routeErrs[i]; err != nil {
+		if err := routeErrs[i]; errors.Is(err, errNotOurs) {
+			// Not removed, and not counted as removed. The entry leaves the journal:
+			// it would be found "not ours" again at every start.
+			rep.Left = append(rep.Left, fmt.Sprintf("%s on %s: %v", r.Dest, r.Iface, err))
+			continue
+		} else if err != nil {
 			errs = append(errs, entryErr("route "+r.Dest, err))
 			keep.Routes = append(keep.Routes, r)
 			continue
@@ -548,10 +608,53 @@ func (m *Manager) removeEntries(ctx context.Context, st *config.State, progress 
 		}
 	}
 	rep.FullTunnel = gone["0.0.0.0/1"] && gone["128.0.0.0/1"]
-	if len(st.Resolvers) > 0 && ctx.Err() == nil {
-		runAll(ctx, []struct{}{{}}, 1, func(struct{}) error { m.b.FlushDNS(); return nil })
+	if len(st.Resolvers) > 0 && dctx.Err() == nil && ctx.Err() == nil {
+		runAll(dctx, []struct{}{{}}, 1, func(struct{}) error { m.b.FlushDNS(); return nil })
 	}
 	return rep, keep, errs
+}
+
+// dnsContext limits the removal of DNS entries to a share of the time left
+// (the routes come after them and must get to start); without a deadline there
+// is no limit.
+func dnsContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	dl, ok := ctx.Deadline()
+	if !ok {
+		return context.WithCancel(ctx)
+	}
+	return context.WithDeadline(ctx, time.Now().Add(time.Duration(float64(time.Until(dl))*dnsShare)))
+}
+
+// legacySkips lists the routes of the journal that came from an old journal in
+// the user's directory (an untrusted file) and must stay in the table: the
+// same exceptions as for a route that is not in the journal at all (see
+// addExtraRoute) - the adapter belongs to a recognized VPN client, or the
+// prefix is /1 or shorter (the halves of a full tunnel). The value says why.
+func (m *Manager) legacySkips(ctx context.Context, routes []config.Route) map[config.Route]string {
+	var skip map[config.Route]string
+	var prov map[string]string
+	provRead := false
+	for _, r := range routes {
+		if !r.FromLegacy {
+			continue
+		}
+		if skip == nil {
+			skip = map[config.Route]string{}
+		}
+		p, err := netip.ParsePrefix(r.Dest)
+		if err != nil || p.Bits() <= 1 {
+			skip[r] = "from an old journal and as wide as the halves of a full tunnel: not removed"
+			continue
+		}
+		if !provRead && m.providerOf != nil {
+			prov, _ = within(ctx, func() (map[string]string, error) { return m.providerOf(), nil })
+			provRead = true
+		}
+		if name := prov[r.Iface]; name != "" {
+			skip[r] = "from an old journal and the adapter belongs to the VPN client " + name + ": not removed"
+		}
+	}
+	return skip
 }
 
 // entryErr names the entry when the error says only that time ran out.
@@ -641,7 +744,7 @@ func (m *Manager) ResetReport() (Report, []error) {
 }
 
 func (m *Manager) resetLocked(ctx context.Context) (Report, []error) {
-	st, _, status := m.store.Load()
+	st, _, status := m.loadLocked()
 	if err := statusErr(status); err != nil {
 		return Report{}, []error{err}
 	}

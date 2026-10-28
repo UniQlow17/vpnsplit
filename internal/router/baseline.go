@@ -700,7 +700,7 @@ func (m *Manager) sweep(ctx context.Context, snap *config.Snapshot, st *config.S
 				if err := config.ValidateRoute(it.route); err != nil {
 					return err
 				}
-				return m.b.DelRoute(it.route)
+				return ignoreNotOurs(m.b.DelRoute(it.route))
 			case "rule":
 				return m.b.DelRule(it.rule)
 			}

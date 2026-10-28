@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"strings"
@@ -70,7 +71,18 @@ func LoadStateChecked() (*State, []string) {
 // it described are then no longer known to vpnsplit.
 func LoadStateStatus() (*State, []string, JournalStatus) { return realStateEnv().load() }
 
-func (e stateEnv) load() (*State, []string, JournalStatus) {
+func (e stateEnv) load() (*State, []string, JournalStatus) { return e.read(false) }
+
+// LoadStateMigrate is LoadStateStatus for a process that holds the lock of the
+// journal (Acquire, reset): with administrator rights it also takes the old
+// journal over into the protected one and deletes it. Everywhere else
+// (status, list, the polling of the TUI) the journal is only read, so that two
+// processes never write it without the lock.
+func LoadStateMigrate() (*State, []string, JournalStatus) { return realStateEnv().read(true) }
+
+// read loads the journal; migrate allows writing (the transfer of old
+// journals), and must be set only while the lock is held.
+func (e stateEnv) read(migrate bool) (*State, []string, JournalStatus) {
 	s := &State{}
 	var warns []string
 	status := JournalOK
@@ -138,7 +150,7 @@ func (e stateEnv) load() (*State, []string, JournalStatus) {
 		s.merge(old)
 		migrated = append(migrated, p)
 	}
-	if len(migrated) > 0 && e.elevated {
+	if len(migrated) > 0 && e.elevated && migrate {
 		switch {
 		case !canWrite:
 			warns = append(warns, "old journal not moved: the protected journal could not be read, it is left untouched")
@@ -221,7 +233,14 @@ func legacyNoteOf(l []LegacyInfo, ru bool) string {
 		}
 		parts = append(parts, fmt.Sprintf("old journal found but not transferred: %s (%s): %s", clip(li.Path), what, li.Reason))
 	}
-	return strings.Join(parts, "; ")
+	if len(parts) == 0 {
+		return ""
+	}
+	// the old journal is looked for in the profile of the account that runs vpnsplit only
+	if ru {
+		return strings.Join(parts, "; ") + ". Старый журнал ищется только в профиле текущей учётной записи: при запуске от имени другого администратора (UAC с другими учётными данными) он не найдётся."
+	}
+	return strings.Join(parts, "; ") + ". The old journal is looked for in the profile of the current account only: when started as another administrator (UAC with other credentials) it is not found."
 }
 
 func legacyReasonRu(r string) string {
@@ -240,22 +259,43 @@ func legacyReasonRu(r string) string {
 
 // trustLegacy drops what an old journal, a file any process of the user could
 // have written, must not be believed about. Its routes are removed with
-// administrator rights, so only the kind of route this tool really adds is
-// kept: not a default route (/0), which would cut the host off. Every route
-// of this tool was added with metric 1, but those journals never recorded a
-// metric (Route.Legacy), so that cannot be checked here; removal matches on
-// it instead (see delRoute). "dns <link>" entries (Linux) are always dropped: they would
-// clear the DNS servers of any link the file names.
+// administrator rights, so only what an older version could have written is
+// kept: an IPv4 route of /2 or longer (a /0 would cut the host off, a /1 is how
+// a VPN client takes all traffic), with no metric and no table (those versions
+// recorded neither; every route of theirs had metric 1, which removal checks
+// against the OS, see delRoute). Rules are dropped whole: those versions had
+// none. "dns <link>" entries (Linux) are dropped too: they would clear the DNS
+// servers of any link the file names. What is kept is marked FromLegacy, the
+// mark is set here and nowhere else (whatever the file says about it is
+// overwritten), and removal treats such routes with extra care.
 func (s *State) trustLegacy() (warnings []string) {
 	var routes []Route
 	for _, r := range s.Routes {
-		if p, err := ParseCIDR4(r.Dest); err != nil || strings.HasSuffix(p, "/0") {
+		p, err := ParseCIDR4(r.Dest)
+		var bits int
+		if err == nil {
+			if pf, perr := netip.ParsePrefix(p); perr == nil {
+				bits = pf.Bits()
+			} else {
+				err = perr
+			}
+		}
+		switch {
+		case err != nil || bits < 2:
 			warnings = append(warnings, fmt.Sprintf("old journal: route %s dropped: not a route of this tool", clip(r.Dest)))
 			continue
+		case r.Metric != 0 || r.Table != 0:
+			warnings = append(warnings, fmt.Sprintf("old journal: route %s dropped: it has a metric or a table that old versions never wrote", clip(r.Dest)))
+			continue
 		}
+		r.FromLegacy = true
 		routes = append(routes, r)
 	}
 	s.Routes = routes
+	if n := len(s.Rules); n > 0 {
+		warnings = append(warnings, fmt.Sprintf("old journal: %d policy rules dropped: old versions had none", n))
+	}
+	s.Rules = nil
 	var res []string
 	for _, id := range s.Resolvers {
 		if strings.HasPrefix(id, "dns ") {

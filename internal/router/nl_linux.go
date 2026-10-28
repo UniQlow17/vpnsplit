@@ -90,7 +90,7 @@ func routeSpecOf(r config.Route) (s routeSpec, gone bool, err error) {
 	}
 	s = routeSpec{dest: p.Masked(), gw: addrOrZero(r.Gateway), metric: r.EffMetric(), proto: routeProto, table: r.Table}
 	if r.Legacy() {
-		s.proto = 0 // routes of older versions carry no tag
+		s.proto = 0 // routes of older versions carry no tag (delRoute narrows it down for FromLegacy)
 	}
 	idx, found, err := ifaceByName(r.Iface)
 	if err != nil {
@@ -167,7 +167,7 @@ func (osBackend) ReplaceRoute(old, next config.Route) error {
 	if err := sendAddRoute(next, s); err != nil {
 		return err
 	}
-	return delRoute(old)
+	return ignoreNotOurs(delRoute(old))
 }
 
 // delRoute removes only our route: same destination, adapter, next hop,
@@ -184,6 +184,26 @@ func delRoute(r config.Route) error {
 	}
 	if gone {
 		return nil // the adapter is gone, and so are its routes
+	}
+	if r.FromLegacy {
+		// The journal came from a file the user can edit and the route has no tag,
+		// so a delete with "any protocol" could take a route of somebody else. The
+		// table is read, and only a route with exactly this destination, adapter,
+		// next hop, metric and table is deleted, with the protocol it has.
+		routes, lerr := listRoutes()
+		if lerr != nil {
+			return lerr
+		}
+		found := false
+		for _, o := range routes {
+			if o.key() == keyOf(r) {
+				s.proto, found = uint8(o.Proto), true
+				break
+			}
+		}
+		if !found {
+			return nil // already gone
+		}
 	}
 	_, err = nlRun(func(seq uint32) []byte { return buildDelRoute(seq, s) })
 	if errors.Is(err, unix.ESRCH) || errors.Is(err, unix.ENOENT) || errors.Is(err, unix.ENODEV) {

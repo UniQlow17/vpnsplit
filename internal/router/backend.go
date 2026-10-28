@@ -56,7 +56,20 @@ type fileStore struct{}
 func (fileStore) Load() (*config.State, []string, config.JournalStatus) {
 	return config.LoadStateStatus()
 }
+
+// LoadMigrate is Load for a process that holds the lock: it also takes the
+// journal of an older version over (see config.LoadStateMigrate).
+func (fileStore) LoadMigrate() (*config.State, []string, config.JournalStatus) {
+	return config.LoadStateMigrate()
+}
 func (fileStore) Save(s *config.State) error { return config.SaveState(s) }
+
+// resolverBulkDeleter is implemented by a Backend that removes all the DNS
+// entries of the journal in one go (Windows: one PowerShell call instead of one
+// per zone).
+type resolverBulkDeleter interface {
+	DelResolvers(ids []string) error
+}
 
 // Procs tells who is running and which boot it is.
 type Procs interface {

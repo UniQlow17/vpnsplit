@@ -79,13 +79,11 @@ func addRoute(r config.Route) error {
 	err = createForwardEntry(row)
 	switch {
 	case errors.Is(err, errObjectAlreadyExists):
-		// The key of a Windows route is prefix + adapter + next hop. If the row
-		// there is exactly what we create (our metric, protocol and origin) it is a
-		// route of ours that the journal lost (a crash, a lost file): it is taken
-		// back instead of being left behind as "somebody else's" for ever.
-		if cur, kerr := keyRow(r, idx); kerr == nil && getForwardEntry(cur) == nil && rowIsOurs(cur, r) {
-			return nil
-		}
+		// The key of a Windows route is prefix + adapter + next hop: a route is
+		// there already. Whether it is ours from a run cut short (the journal
+		// lists it) is for the reconciler to say, which knows the journal: here it
+		// is never taken as ours on its looks alone, a client or the user can
+		// create the very same row.
 		return fmt.Errorf("%w: %v", errExists, err)
 	case err != nil:
 		return fmt.Errorf("add route %s on %s: %w", r.Dest, r.Iface, err)
@@ -95,7 +93,14 @@ func addRoute(r config.Route) error {
 
 // delRoute removes only our route: same prefix, adapter and next hop, and our
 // metric, protocol and origin, so a VPN client's own route to the same place
-// stays.
+// stays; for it errNotOurs is returned, and the caller reports it as left.
+//
+// A route of an older version (Route.FromLegacy) was made by route.exe, and
+// which Origin the OS gives such a row has not been checked on a live system.
+// So for it the metric must be 1 (what that version always used) and the
+// protocol NETMGMT, while the origin may be anything: prefix, adapter and next
+// hop have matched already when the row is found. Its metric is 1 whatever the
+// file said (EffMetric), which a user cannot change in the journal.
 func delRoute(r config.Route) error {
 	if err := config.ValidateRoute(r); err != nil {
 		return err
@@ -118,7 +123,7 @@ func delRoute(r config.Route) error {
 		return fmt.Errorf("look up route %s on %s: %w", r.Dest, r.Iface, err)
 	}
 	if !rowIsOurs(row, r) {
-		return nil // somebody else's route to the same place
+		return fmt.Errorf("%w: a route to %s on %s with another metric, protocol or origin is somebody else's", errNotOurs, r.Dest, r.Iface)
 	}
 	if err := deleteForwardEntry(row); err != nil && !errors.Is(err, errNotFound) && !errors.Is(err, errFileNotFound) {
 		return fmt.Errorf("remove route %s on %s: %w", r.Dest, r.Iface, err)
@@ -140,7 +145,7 @@ func (osBackend) ReplaceRoute(old, next config.Route) error {
 		if err := addRoute(next); err != nil {
 			return err
 		}
-		return delRoute(old)
+		return ignoreNotOurs(delRoute(old))
 	}
 	idx, found, err := ifaceIndex(next.Iface)
 	if err == nil && !found {
@@ -220,6 +225,9 @@ func adapterMetrics() map[int]int {
 		if err == nil {
 			res := map[int]int{}
 			for a := aa; a != nil; a = a.Next {
+				if a.IfIndex == 0 { // an adapter with no IPv4 has no index here
+					continue
+				}
 				res[int(a.IfIndex)] = int(a.Ipv4Metric)
 			}
 			return res

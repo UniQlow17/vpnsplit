@@ -24,6 +24,11 @@ type Route struct {
 	// Table is the routing table the route lives in: 0 is the main one,
 	// an own one (Linux, see Rule; OwnTable or the next free of 247-250). Routes of older journals are in main.
 	Table int `json:"table,omitempty"`
+	// FromLegacy marks a route taken over from the old journal in the user's
+	// directory, which is untrusted. It is set by trustLegacy only; removal is
+	// more careful with such a route (a VPN client's adapter, /1 and shorter
+	// stay; on Windows the OS row must be a metric-1 route of an old version).
+	FromLegacy bool `json:"from_legacy,omitempty"`
 }
 
 // OwnTable is the routing table (Linux) in which routes live that must be seen

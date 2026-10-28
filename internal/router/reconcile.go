@@ -213,14 +213,14 @@ func (m *Manager) replaceRoute(old, next config.Route) (added bool, err error) {
 	}
 	err = m.b.AddRoute(next)
 	if err == nil {
-		return true, m.b.DelRoute(old)
+		return true, ignoreNotOurs(m.b.DelRoute(old))
 	}
 	if !errors.Is(err, errExists) {
 		return false, err
 	}
 	// The OS keeps one route per slot, and ours is in the way: it goes first
 	// and comes back if the new one still cannot be created.
-	if derr := m.b.DelRoute(old); derr != nil {
+	if derr := ignoreNotOurs(m.b.DelRoute(old)); derr != nil {
 		return false, err
 	}
 	if aerr := m.b.AddRoute(next); aerr != nil {
@@ -436,7 +436,7 @@ func (m *Manager) reconcile(st *config.State, p *plan, tbl *table, rs *ruleSet, 
 			failedDel = append(failedDel, r)
 			continue
 		}
-		if err := m.b.DelRoute(r); err != nil {
+		if err := ignoreNotOurs(m.b.DelRoute(r)); err != nil {
 			fmt.Fprintf(w, "  ! remove %s: %v\n", r.Dest, err)
 			failedDel = append(failedDel, r)
 			sum.failed++

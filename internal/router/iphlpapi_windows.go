@@ -116,9 +116,16 @@ func rowCreatedLikeOurs(row *mibIPForwardRow2) bool {
 
 // rowIsOurs reports whether the row that the key of r found is the route we
 // created for r, and not somebody else's with the same prefix, adapter and next
-// hop: the metric, protocol and origin all have to be ours.
+// hop: the metric, protocol and origin all have to be ours. For a route of an
+// older version (FromLegacy) the origin is not checked, see delRoute.
 func rowIsOurs(row *mibIPForwardRow2, r config.Route) bool {
-	return int(row.Metric) == r.EffMetric() && rowCreatedLikeOurs(row)
+	if int(row.Metric) != r.EffMetric() {
+		return false
+	}
+	if r.FromLegacy {
+		return row.Protocol == mibIPProtoNetMgmt
+	}
+	return rowCreatedLikeOurs(row)
 }
 
 func initForwardRow(row *mibIPForwardRow2) {

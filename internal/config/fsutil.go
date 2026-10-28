@@ -87,20 +87,53 @@ func relInside(home, dir string) (string, error) {
 
 // removeRegular deletes dir/name if it is a regular file; a missing file is
 // not an error. Nothing is followed: a symlink (or junction) at name or as
-// dir is refused, and the deletion goes through a handle of dir (os.Root),
-// so replacing dir by a link meanwhile does not redirect it.
+// dir is refused. dir may be a directory of the user's profile that the user
+// can swap for a junction to a protected one at any moment, so it is not opened
+// by its path: its parent is opened (os.Root), dir is looked at through that
+// handle (Lstat: not a link, not a reparse point) and opened through it again,
+// and the opened directory must be the very one that was looked at. A swap
+// between the look and the open is seen as a different file; after the open the
+// handle cannot be redirected. What remains is the parent itself being
+// replaced, which needs the user to own the parent of dir (the profile) and
+// changes only which directory named like dir is looked at, never lets a link
+// be followed below it.
 func removeRegular(dir, name string) error {
-	if err := checkDir(dir); err != nil {
+	dir = filepath.Clean(dir)
+	parentPath, base := filepath.Split(dir)
+	if base == "" || parentPath == "" {
+		return fmt.Errorf("%s: cannot be deleted from here", dir)
+	}
+	parent, err := os.OpenRoot(filepath.Clean(parentPath))
+	if err != nil {
 		if os.IsNotExist(err) {
 			return nil
 		}
 		return err
 	}
-	root, err := os.OpenRoot(dir)
+	defer parent.Close()
+	want, err := parent.Lstat(base)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	if want.Mode()&(os.ModeSymlink|os.ModeIrregular) != 0 || !want.IsDir() {
+		return fmt.Errorf("%s is not a plain directory (symbolic link?)", dir)
+	}
+	root, err := parent.OpenRoot(base)
 	if err != nil {
 		return err
 	}
 	defer root.Close()
+	dirf, err := root.Open(".")
+	if err != nil {
+		return err
+	}
+	defer dirf.Close()
+	if got, err := dirf.Stat(); err != nil || !os.SameFile(want, got) {
+		return fmt.Errorf("%s changed while it was opened, not deleting from it", dir)
+	}
 	fi, err := root.Lstat(name)
 	if os.IsNotExist(err) {
 		return nil

@@ -227,6 +227,15 @@ func TestRowOwnership(t *testing.T) {
 	if !rowIsOurs(row(1, mibIPProtoNetMgmt, nlroManual), legacy) || rowIsOurs(row(ownMetric, mibIPProtoNetMgmt, nlroManual), legacy) {
 		t.Error("a route of an older version has metric 1")
 	}
+	// from the untrusted old journal: metric 1 and NETMGMT, whatever the origin
+	// route.exe gives (not checked on a live system); never another metric or protocol
+	fromOld := config.Route{Dest: "10.10.0.0/16", Iface: "wgcorp", FromLegacy: true}
+	if !rowIsOurs(row(1, mibIPProtoNetMgmt, nlroManual), fromOld) || !rowIsOurs(row(1, mibIPProtoNetMgmt, 2), fromOld) {
+		t.Error("an old route: metric 1, NETMGMT, any origin")
+	}
+	if rowIsOurs(row(ownMetric, mibIPProtoNetMgmt, nlroManual), fromOld) || rowIsOurs(row(1, 2, nlroManual), fromOld) {
+		t.Error("an old route has metric 1 and protocol NETMGMT")
+	}
 }
 
 // What listRoutes reports as not ours makes the table not find it as ours.

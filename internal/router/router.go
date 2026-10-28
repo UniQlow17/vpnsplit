@@ -33,6 +33,21 @@ const (
 // localized command output where the OS allows it.
 var errExists = errors.New("route already exists")
 
+// errNotOurs is returned by DelRoute for a route that is in the table but does
+// not look like the one the journal describes (somebody else's route to the
+// same place). It stays; the entry is dropped from the journal and the report
+// says so (Report.Left). Callers that only want the route gone ignore it.
+var errNotOurs = errors.New("not ours")
+
+// ignoreNotOurs: for callers that only want the route gone, a route that is not
+// ours is not theirs to remove, and that is all right.
+func ignoreNotOurs(err error) error {
+	if errors.Is(err, errNotOurs) {
+		return nil
+	}
+	return err
+}
+
 // errResolverExists is returned by addResolver when a DNS entry for the zone
 // is already there and is not ours: it stays as it is, which is no failure.
 var errResolverExists = errors.New("DNS entry already exists")

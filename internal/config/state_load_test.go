@@ -54,7 +54,17 @@ func TestLoadMigratesLegacyIntoProtectedJournal(t *testing.T) {
 	write(t, journal, stateFile, `{"routes":[`+goodRoute+`]}`)
 	lp := write(t, legacy, stateFile, legacyState)
 
-	s, warns, status := e.load()
+	// only under the lock (read(true)) the old file is taken over
+	if s, _, _ := e.load(); len(s.Routes) != 2 {
+		t.Fatalf("a plain read includes the old entries: %+v", s.Routes)
+	}
+	if _, err := os.Lstat(lp); err != nil {
+		t.Fatalf("a plain read must not delete the old file: %v", err)
+	}
+	if got := readStr(t, filepath.Join(journal, stateFile)); strings.Contains(got, "172.16.0.0/12") {
+		t.Fatalf("a plain read must not write the journal: %s", got)
+	}
+	s, warns, status := e.read(true)
 	if status != JournalOK {
 		t.Fatalf("status %v", status)
 	}
@@ -80,7 +90,7 @@ func TestLoadBrokenProtectedJournalIsKept(t *testing.T) {
 	write(t, journal, stateFile, broken)
 	write(t, legacy, stateFile, legacyState)
 
-	s, warns, status := e.load()
+	s, warns, status := e.read(true)
 	if status != JournalOK || len(s.Routes) != 1 {
 		t.Fatalf("status %v state %+v", status, s)
 	}
@@ -178,20 +188,74 @@ func TestTrustLegacy(t *testing.T) {
 	s := &State{
 		Routes: []Route{
 			{Dest: "10.0.0.0/8", Iface: "e"},
+			{Dest: "10.1.0.0/16", Iface: "e", FromLegacy: false},
 			{Dest: "0.0.0.0/0", Iface: "e"},
 			{Dest: "0.0.0.0/1", Iface: "e", Via: "home"},
 			{Dest: "128.0.0.0/1", Iface: "e", Via: "home"},
+			{Dest: "192.168.0.0/16", Iface: "e", Metric: 3},          // old versions wrote no metric
+			{Dest: "192.169.0.0/16", Iface: "e", Table: 247},         // nor a table
+			{Dest: "2001:db8::/32", Iface: "e"},                      // IPv4 only
+			{Dest: "10.2.0.0/16", Iface: "e", Metric: 1, Table: 254}, // both
+			{Dest: "172.16.0.0/12", Iface: "e", FromLegacy: true},    // the mark is set by the code, the file says nothing
 		},
+		Rules:     []Rule{{Table: 247, Pref: 100}},
 		Resolvers: []string{"dns tun0", "domain tun0 corp.example.com", "corp.example.com"},
 	}
 	warns := s.trustLegacy()
-	if len(s.Routes) != 3 || len(s.Resolvers) != 2 || len(warns) != 2 {
+	var kept []string
+	for _, r := range s.Routes {
+		kept = append(kept, r.Dest)
+		if !r.FromLegacy {
+			t.Errorf("a kept route has no mark: %+v", r)
+		}
+	}
+	if strings.Join(kept, " ") != "10.0.0.0/8 10.1.0.0/16 172.16.0.0/12" {
+		t.Errorf("kept %v", kept)
+	}
+	if len(s.Rules) != 0 {
+		t.Errorf("rules kept: %+v", s.Rules)
+	}
+	if len(s.Resolvers) != 2 || len(warns) != 9 {
 		t.Errorf("%+v %q", s, warns)
 	}
 	for _, r := range s.Resolvers {
 		if strings.HasPrefix(r, "dns ") {
 			t.Errorf("dns entry kept: %q", r)
 		}
+	}
+}
+
+// The mark FromLegacy in the old file is not read: a file that claims it for
+// routes it does not have can do nothing, and the transfer sets it itself.
+func TestLegacyMarkComesFromTheTransferOnly(t *testing.T) {
+	e, journal, legacy := testStateEnv(t, true)
+	write(t, legacy, stateFile, `{"routes":[{"dest":"0.0.0.0/1","iface":"e","from_legacy":true},{"dest":"10.0.0.0/8","iface":"e","from_legacy":false}]}`)
+	s, _, _ := e.read(true)
+	if len(s.Routes) != 1 || !s.Routes[0].FromLegacy {
+		t.Fatalf("%+v", s.Routes)
+	}
+	// and it is kept in the protected journal
+	if got := readStr(t, filepath.Join(journal, stateFile)); !strings.Contains(got, "from_legacy") {
+		t.Errorf("%s", got)
+	}
+	again, _, _ := e.load()
+	if len(again.Routes) != 1 || !again.Routes[0].FromLegacy {
+		t.Errorf("%+v", again.Routes)
+	}
+}
+
+// Without the lock (read) even an elevated process only reads.
+func TestLoadElevatedButUnlockedDoesNotWrite(t *testing.T) {
+	e, journal, legacy := testStateEnv(t, true)
+	lp := write(t, legacy, stateFile, legacyState)
+	if s, _, _ := e.load(); len(s.Routes) != 1 {
+		t.Errorf("%+v", s.Routes)
+	}
+	if _, err := os.Lstat(lp); err != nil {
+		t.Errorf("old file touched: %v", err)
+	}
+	if _, err := os.Lstat(filepath.Join(journal, stateFile)); !os.IsNotExist(err) {
+		t.Errorf("journal written: %v", err)
 	}
 }
 
@@ -308,8 +372,8 @@ func TestLegacyJournalEncodings(t *testing.T) {
 			if err := os.WriteFile(lp, c.data, 0o600); err != nil {
 				t.Fatal(err)
 			}
-			s, warns, status := e.load()
-			if status != JournalOK || len(s.Routes) != 5 || s.Routes[0].Iface != "Беспроводная сеть" || s.Sig == "" {
+			s, warns, status := e.read(true)
+			if status != JournalOK || len(s.Routes) != 3 || s.Routes[0].Iface != "Беспроводная сеть" || s.Sig == "" {
 				t.Fatalf("%v %+v %q", status, s, warns)
 			}
 			for _, r := range s.Routes {
@@ -336,17 +400,17 @@ func TestLegacyPendingSaysWhy(t *testing.T) {
 	e, _, legacy := testStateEnv(t, false)
 	write(t, legacy, stateFile, realLegacyJournal)
 	p := e.legacyPending()
-	if len(p) != 1 || p[0].Routes != 5 || !strings.Contains(p[0].Reason, "administrator") {
+	if len(p) != 1 || p[0].Routes != 3 || !strings.Contains(p[0].Reason, "administrator") {
 		t.Fatalf("%+v", p)
 	}
 	ru, en := legacyNoteOf(p, true), legacyNoteOf(p, false)
-	if !strings.Contains(ru, "старый журнал найден, но не перенесён") || !strings.Contains(ru, "маршрутов: 5") || !strings.Contains(ru, "без прав администратора") {
+	if !strings.Contains(ru, "старый журнал найден, но не перенесён") || !strings.Contains(ru, "маршрутов: 3") || !strings.Contains(ru, "без прав администратора") {
 		t.Errorf("%q", ru)
 	}
-	if !strings.Contains(en, "found but not transferred") || !strings.Contains(en, "5 routes") {
+	if !strings.Contains(en, "found but not transferred") || !strings.Contains(en, "3 routes") {
 		t.Errorf("%q", en)
 	}
-	if s, warns, _ := e.load(); len(s.Routes) != 5 || len(warns) != 0 {
+	if s, warns, _ := e.load(); len(s.Routes) != 3 || len(warns) != 2 {
 		t.Errorf("without rights the entries are included but not moved: %+v %q", s, warns)
 	}
 
