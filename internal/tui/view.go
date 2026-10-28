@@ -86,6 +86,9 @@ func (m model) statusRows() []string {
 	if !m.admin {
 		parts = append(parts, sRed.Render("нет прав администратора"))
 	}
+	if m.foreign() {
+		parts = append(parts, sYel.Render(foreignNote))
+	}
 	var lines []string
 	for _, l := range wrapLines(joinFit(aw, "  ", parts...), aw) {
 		lines = append(lines, strings.Repeat(" ", textIndent)+l)

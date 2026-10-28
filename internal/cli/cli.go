@@ -8,7 +8,6 @@ import (
 	"os"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/UniQlow17/vpnsplit/internal/config"
 	"github.com/UniQlow17/vpnsplit/internal/netif"
@@ -31,11 +30,18 @@ const usage = `vpnsplit - corp traffic through the corp VPN, chosen sites past e
   vpnsplit set <key> <value>     corp | home (auto, client or adapter name),
                                  corp-dns | corp-gateway ("none" clears),
                                  home-default | split-dns (yes/no, true/false, 1/0, on/off, да/нет)
-  vpnsplit apply                 add routes (needs admin/root)
-  vpnsplit watch                 keep routes in sync when VPNs connect, switch or disconnect
+  vpnsplit apply                 add routes and leave them in place (needs admin/root)
+  vpnsplit watch                 keep routes in sync when VPNs connect, switch or disconnect;
+                                 routes stay after Ctrl+C
+  vpnsplit run                   like watch, but a session: everything is removed when it ends
+                                 (SIGINT/SIGTERM/SIGHUP, console closed), or by the next start
+                                 if it was killed; for scripts and services
   vpnsplit status                show what is connected and what vpnsplit added
-  vpnsplit reset [--purge]       remove ALL routes added by this tool and
-                                 restore original routing (--purge also deletes config)
+  vpnsplit reset [--purge] [--force]
+                                 remove ALL routes added by this tool and restore original
+                                 routing (--purge also deletes config.json; --force removes
+                                 the journal's routes even if it thinks the computer was
+                                 restarted since)
   vpnsplit version
 
 Only routes created by vpnsplit are ever touched; the system default route
@@ -73,19 +79,19 @@ func run(args []string, version string) error {
 	case "set":
 		return cmdSet(rest)
 	case "apply":
-		return needAdmin(func() error {
-			cfg, err := loadConfig()
-			if err != nil {
-				return err
-			}
-			return router.Apply(cfg, os.Stdout)
-		})
+		return needAdmin(cmdApply)
 	case "watch":
-		return needAdmin(cmdWatch)
+		return needAdmin(func() error { return cmdSync(config.ModePersistent) })
+	case "run":
+		return needAdmin(func() error { return cmdSync(config.ModeSession) })
 	case "status":
 		return cmdStatus()
 	case "reset":
-		return needAdmin(func() error { return cmdReset(len(rest) > 0 && rest[0] == "--purge") })
+		o, err := parseReset(rest)
+		if err != nil {
+			return err
+		}
+		return needAdmin(func() error { return cmdReset(router.NewManager(), o, os.Stdout) })
 	case "version", "--version", "-v":
 		fmt.Println("vpnsplit", version)
 		return nil
@@ -366,6 +372,8 @@ func cmdStatus() error {
 		fmt.Println("journal of applied routes: cannot be read (see the warnings above); what is applied is unknown")
 		return nil
 	}
+	printOwner(os.Stdout, st)
+	printLastSession(os.Stdout)
 	fmt.Printf("routes owned by vpnsplit: %d\n", len(st.Routes))
 	for _, r := range st.Routes {
 		fmt.Printf("  %-18s -> %-6s %s\n", r.Dest, r.Via, r.Iface)
@@ -379,47 +387,18 @@ func cmdStatus() error {
 	return nil
 }
 
-func cmdReset(purge bool) error {
-	_, warns := config.LoadStateChecked()
-	printWarnings(warns)
-	n, errs := router.Reset()
-	fmt.Printf("removed %d routes and DNS entries\n", n)
-	for _, e := range errs {
-		fmt.Println("  !", e)
-	}
-	if purge {
-		if err := config.Remove(); err == nil {
-			fmt.Println("config deleted")
+// parseReset reads the flags of `reset`.
+func parseReset(args []string) (resetOpts, error) {
+	var o resetOpts
+	for _, a := range args {
+		switch a {
+		case "--purge":
+			o.purge = true
+		case "--force":
+			o.force = true
+		default:
+			return o, fmt.Errorf("usage: vpnsplit reset [--purge] [--force] (unknown argument %q)", a)
 		}
 	}
-	if len(errs) > 0 {
-		return fmt.Errorf("%d entries could not be removed; journal kept, run reset again", len(errs))
-	}
-	fmt.Println("routing is back to what your VPN clients and OS set up. Reconnect the VPNs if something still looks off.")
-	return nil
-}
-
-func cmdWatch() error {
-	if _, err := loadConfig(); err != nil {
-		return err
-	}
-	fmt.Println("watching (Ctrl+C to stop; run `vpnsplit reset` to clean up)...")
-	for {
-		cfg, err := config.Load()
-		if err != nil {
-			return err
-		}
-		e := router.Detect(cfg)
-		switch apply, reset := router.Sync(cfg, e, config.LoadState()); {
-		case apply:
-			fmt.Println(time.Now().Format("15:04:05"), "VPNs or rules changed, applying")
-			if err := router.Apply(cfg, os.Stdout); err != nil {
-				fmt.Println("  !", err)
-			}
-		case reset:
-			fmt.Println(time.Now().Format("15:04:05"), "no VPN connected, removing routes")
-			router.Reset()
-		}
-		time.Sleep(5 * time.Second)
-	}
+	return o, nil
 }

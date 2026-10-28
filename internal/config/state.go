@@ -18,9 +18,33 @@ type Route struct {
 	Via     string `json:"via,omitempty"` // corp, home or direct; for display
 }
 
+// How the journal's owner treats what it applied when it exits.
+const (
+	// ModeSession: everything is removed when the owner exits, and by the
+	// next start if the owner died without doing it.
+	ModeSession = "session"
+	// ModePersistent: what was applied stays after the owner exits (the
+	// one-shot `apply`, `watch`); only `reset` or a session removes it.
+	ModePersistent = "persistent"
+)
+
+// JournalVersion is the format written by this version. Version 0 (no
+// header) is the journal of older versions, which only had the entries.
+const JournalVersion = 2
+
+// Owner identifies the process that applied what the journal lists.
+type Owner struct {
+	PID   int    `json:"pid"`
+	Start int64  `json:"start,omitempty"` // process start time (OS unit): a reused PID has another
+	Boot  string `json:"boot,omitempty"`  // boot id: entries that live in memory are gone after a reboot
+}
+
 // State is the journal of what we own. Each entry is written BEFORE it is
 // created, so a reset can always undo it, even after a crash.
 type State struct {
+	Version   int      `json:"version,omitempty"`
+	Owner     *Owner   `json:"owner,omitempty"` // nil: journal of an older version
+	Mode      string   `json:"mode,omitempty"`  // ModeSession or ModePersistent; "" with no owner
 	Routes    []Route  `json:"routes"`
 	Resolvers []string `json:"resolvers,omitempty"` // per-domain DNS entries we created
 	Sig       string   `json:"sig,omitempty"`       // what was connected when applied
@@ -78,6 +102,16 @@ func (s *State) Sanitize() (warnings []string) {
 	s.Resolvers = res
 	if len(s.Sig) > 1024 || clip(s.Sig) != s.Sig {
 		s.Sig = ""
+	}
+	if s.Mode != ModeSession && s.Mode != ModePersistent {
+		s.Mode = ""
+	}
+	if o := s.Owner; o != nil {
+		if o.PID <= 0 || o.Start < 0 {
+			s.Owner = nil
+		} else if len(o.Boot) > 64 || clip(o.Boot) != o.Boot {
+			o.Boot = ""
+		}
 	}
 	return warnings
 }
