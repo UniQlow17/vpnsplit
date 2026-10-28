@@ -3,8 +3,9 @@
 package netif
 
 import (
-	"os/exec"
 	"strings"
+
+	"github.com/UniQlow17/vpnsplit/internal/sysexec"
 )
 
 // owners: wintun/TAP adapters do not tell which process created them, and the
@@ -12,9 +13,8 @@ import (
 // Network Adapter"), so only the running processes are returned for guessing.
 // Elevated processes hide their path from a normal user; their name is used then.
 func owners([]Info) (map[string]string, []string) {
-	out, err := exec.Command("powershell", "-NoProfile", "-Command",
-		"[Console]::OutputEncoding=[Text.UTF8Encoding]::new(); "+
-			"Get-Process | ForEach-Object { if ($_.Path) { $_.Path } else { $_.ProcessName } }").Output()
+	out, err := sysexec.PowerShell(
+		"Get-Process | ForEach-Object { if ($_.Path) { $_.Path } else { $_.ProcessName } }", nil).Output()
 	if err != nil {
 		return nil, nil
 	}

@@ -6,10 +6,10 @@ import (
 	"fmt"
 	"net"
 	"os"
-	"os/exec"
 	"strings"
 
 	"github.com/UniQlow17/vpnsplit/internal/config"
+	"github.com/UniQlow17/vpnsplit/internal/sysexec"
 )
 
 // corpDNS: systemd-resolved knows the DNS servers and domains of each link,
@@ -39,7 +39,7 @@ func corpDNS(iface string) (servers, zones []string) {
 }
 
 func ifaceFor(ip string) string {
-	out, _ := exec.Command("ip", "-4", "route", "get", ip).Output()
+	out, _ := sysexec.Command("ip", "-4", "route", "get", ip).Output()
 	f := strings.Fields(string(out))
 	for i := 0; i+1 < len(f); i++ {
 		if f[i] == "dev" {
@@ -50,12 +50,12 @@ func ifaceFor(ip string) string {
 }
 
 func hasResolved() bool {
-	_, err := exec.LookPath("resolvectl")
-	return err == nil && exec.Command("resolvectl", "status").Run() == nil
+	_, err := sysexec.LookPath("resolvectl")
+	return err == nil && sysexec.Command("resolvectl", "status").Run() == nil
 }
 
 func resolvectl(args ...string) error {
-	out, err := exec.Command("resolvectl", args...).CombinedOutput()
+	out, err := sysexec.Command("resolvectl", args...).CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("resolvectl %s: %s", strings.Join(args, " "), strings.TrimSpace(string(out)))
 	}
@@ -63,7 +63,7 @@ func resolvectl(args ...string) error {
 }
 
 func resolvectlList(what, iface string) []string {
-	out, err := exec.Command("resolvectl", what, iface).Output()
+	out, err := sysexec.Command("resolvectl", what, iface).Output()
 	if err != nil {
 		return nil
 	}
@@ -88,6 +88,12 @@ func resolverPlan(iface string, _, zones []string) []string {
 }
 
 func addResolver(id string, servers []string) error {
+	if !config.ValidResolverEntry(id) {
+		return fmt.Errorf("invalid DNS entry %q", id)
+	}
+	if err := config.ValidateServers(servers); err != nil {
+		return err
+	}
 	f := strings.Fields(id)
 	switch {
 	case len(f) == 2 && f[0] == "dns":
@@ -105,6 +111,9 @@ func addResolver(id string, servers []string) error {
 }
 
 func delResolver(id string) error {
+	if !config.ValidResolverEntry(id) {
+		return fmt.Errorf("invalid DNS entry %q", id)
+	}
 	f := strings.Fields(id)
 	if len(f) < 2 {
 		return nil
@@ -130,4 +139,4 @@ func delResolver(id string) error {
 	return nil
 }
 
-func flushDNS() { _ = exec.Command("resolvectl", "flush-caches").Run() }
+func flushDNS() { _ = sysexec.Command("resolvectl", "flush-caches").Run() }

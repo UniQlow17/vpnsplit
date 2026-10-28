@@ -32,8 +32,12 @@ type entry struct {
 // answer is used however old, and fetched tells when it was received.
 func Prefixes(as string) (nets []string, fetched time.Time, err error) {
 	as = strings.ToUpper(as)
+	if !config.ValidAS(as) {
+		return nil, time.Time{}, fmt.Errorf("RIPE: %q is not an AS number", as)
+	}
 	cache := map[string]entry{}
 	_ = config.LoadJSON("ripe-cache.json", &cache)
+	cache = sanitizeCache(cache)
 	old, cached := cache[as]
 	if cached && time.Since(old.Fetched) < cacheTTL {
 		return old.Prefixes, old.Fetched, nil
@@ -46,8 +50,30 @@ func Prefixes(as string) (nets []string, fetched time.Time, err error) {
 		return nil, time.Time{}, err
 	}
 	cache[as] = entry{nets, time.Now()}
-	_ = config.SaveJSON("ripe-cache.json", cache)
+	_ = config.SaveCache("ripe-cache.json", cache) // best effort: the cache can be fetched again
 	return nets, time.Now(), nil
+}
+
+// sanitizeCache keeps only well-formed answers: the cache is a user-writable
+// file whose networks become routes added with administrator rights.
+func sanitizeCache(in map[string]entry) map[string]entry {
+	out := make(map[string]entry, len(in))
+	for as, e := range in {
+		if !config.ValidAS(as) {
+			continue
+		}
+		var nets []string
+		for _, p := range e.Prefixes {
+			if c, err := config.ParseCIDR4(p); err == nil {
+				nets = append(nets, c)
+			}
+		}
+		if len(nets) > 0 {
+			e.Prefixes = nets
+			out[as] = e
+		}
+	}
+	return out
 }
 
 func fetch(as string) ([]string, error) {
