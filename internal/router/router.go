@@ -82,6 +82,7 @@ type Env struct {
 	GWv6           bool           // the physical adapter has a global IPv6 address
 	GWNets         []netip.Prefix // the IPv4 networks of the physical adapter: a host in one is reached on the link
 	V6Cap          V6Cap          // whether the home VPN client takes IPv4 and IPv6 by its own policy rules (see V6Status)
+	Ifs            []netif.Info   // all the adapters, as read by Detect (for the diagnostics)
 }
 
 // Any reports whether at least one VPN is connected.
@@ -91,6 +92,7 @@ func (e Env) Any() bool { return e.CorpOK || e.HomeOK }
 func Detect(cfg *config.Config) Env {
 	var e Env
 	ifs, err := netif.List() // read once: the adapters, the VPNs and the IPv6 of the gateway come from this list
+	e.Ifs = ifs
 	if err == nil {
 		e.Corp, e.CorpOK = netif.ResolveIn(ifs, cfg.Corp, netif.KindCorp, "")
 		e.Home, e.HomeOK = netif.ResolveIn(ifs, cfg.Home, netif.KindVPN, e.Corp.Name)
@@ -168,6 +170,11 @@ func (m *Manager) applyEnv(cfg *config.Config, e Env, w io.Writer) error {
 	st, _, status := m.store.Load()
 	if err := statusErr(status); err != nil {
 		return err
+	}
+	if m.clientScan != nil {
+		// the last read of the client files, no waiting for a new one; only the
+		// clients whose adapter is up count
+		setFakeRanges(fakeRangesFor(m.clientScan(), e.Ifs))
 	}
 	m.memo = newDNSMemo()
 	defer probes.scope()()
@@ -285,7 +292,7 @@ func validServers(in []string) []string {
 		}
 		// loopback (the stub of a local resolver), link-local, multicast and the like
 		// are no server a route can be made to
-		if a, perr := netip.ParseAddr(ip); perr != nil || badAddr(a) != "" {
+		if a, perr := netip.ParseAddr(ip); perr != nil || badServer(a) != "" {
 			continue
 		}
 		out = config.AddUnique(out, ip)
@@ -376,8 +383,8 @@ func (m *Manager) resolveDomains(domains, servers []string, skip func(netip.Addr
 			continue
 		}
 		for _, ip := range ips {
-			if fakeIPNet.Contains(ip) {
-				fake = append(fake, d+"="+ip.String())
+			if isFakeIP(ip) {
+				fake = append(fake, d+"="+ip.String()+" ["+fakeRangeOf(ip)+"]")
 				continue
 			}
 			if why := badAddr(ip); why != "" {
@@ -394,7 +401,7 @@ func (m *Manager) resolveDomains(domains, servers []string, skip func(netip.Addr
 		}
 	}
 	if len(fake) > 0 {
-		fmt.Fprintf(w, "  ! fake-ip answers (198.18.0.0/15) dropped, a name behind them cannot be routed by its address: %s\n", strings.Join(fake, ", "))
+		fmt.Fprintf(w, "  ! fake-ip answers (198.18.0.0/15 and the ranges of running clients) dropped, a name behind them cannot be routed by its address: %s\n", strings.Join(fake, ", "))
 	}
 	return cidrs, dropped
 }

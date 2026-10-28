@@ -69,6 +69,7 @@ func newApplyRigOS(t *testing.T, goos string, seed func(*memBackend)) *applyRig 
 	ar := &applyRig{rig: r, mb: mb, env: testEnv()}
 	r.m.detect = func(*config.Config) Env { return *ar.env }
 	r.m.dnsOf = func(string) ([]string, []string) { return nil, nil }
+	r.m.physDNS = func(string) []string { return nil } // not the DNS of the machine the test runs on
 	ar.s, _ = acquire(t, r, config.ModeSession)
 	return ar
 }

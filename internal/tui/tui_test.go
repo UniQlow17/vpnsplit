@@ -9,6 +9,7 @@ import (
 
 	"github.com/UniQlow17/vpnsplit/internal/config"
 	"github.com/UniQlow17/vpnsplit/internal/netif"
+	"github.com/UniQlow17/vpnsplit/internal/router"
 )
 
 func testModel() model {
@@ -114,5 +115,32 @@ func TestWarningsAreFlashedOnceAndListed(t *testing.T) {
 	got := plain(m.statusLines())
 	if !strings.Contains(got, "Предупреждения") || !strings.Contains(got, "bad domain") || !strings.Contains(got, "config.json.bak") {
 		t.Errorf("warnings not listed:\n%s", got)
+	}
+}
+
+func TestStatusListsEnvironmentFindings(t *testing.T) {
+	m := testModel()
+	m.st = &config.State{}
+	if m.diagIndicator() != "" {
+		t.Error("an indicator without findings")
+	}
+	if strings.Contains(plain(m.statusLines()), "Окружение") {
+		t.Error("a section without findings")
+	}
+	m.diags = []router.Diag{
+		{Code: "GPO_NRPT", Level: router.DiagDanger, TextRU: "политика задаёт NRPT", TextEN: "x", AdviceRU: "используйте IP"},
+		{Code: "CORP_ONLINK", Level: router.DiagInfo, TextRU: "нет next hop", TextEN: "y"},
+	}
+	got := plain(m.statusLines())
+	for _, w := range []string{"Окружение: 1 опасно, 1 заметок", "[опасно] GPO_NRPT", "политика задаёт NRPT", "-> используйте IP", "[инфо] CORP_ONLINK"} {
+		if !strings.Contains(got, w) {
+			t.Errorf("no %q in:\n%s", w, got)
+		}
+	}
+	if ind := ansi.Strip(m.diagIndicator()); !strings.Contains(ind, "1 опасно") {
+		t.Errorf("indicator %q", ind)
+	}
+	if rows := plain(m.statusRows()); !strings.Contains(rows, "окружение:") {
+		t.Errorf("not in the status line: %q", rows)
 	}
 }

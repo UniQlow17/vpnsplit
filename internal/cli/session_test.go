@@ -231,3 +231,24 @@ func TestEndSaysWhetherTheSystemIsBackToWhatItWas(t *testing.T) {
 		t.Errorf("%q %q", out.String(), saved)
 	}
 }
+
+func TestPrintDiagnostics(t *testing.T) {
+	var out bytes.Buffer
+	printDiagnostics(&out, nil)
+	if out.Len() != 0 {
+		t.Errorf("printed for nothing: %q", out.String())
+	}
+	printDiagnostics(&out, []router.Diag{
+		{Code: "PROXY_ON", Level: router.DiagWarn, TextEN: "a proxy is on", TextRU: "прокси", AdviceEN: "turn it off"},
+		{Code: "CORP_ONLINK", Level: router.DiagInfo, TextEN: "no next hop"},
+	})
+	got := out.String()
+	for _, w := range []string{"diagnostics: 1 warnings, 1 notes", "[warn] PROXY_ON: a proxy is on", "-> turn it off", "[info] CORP_ONLINK: no next hop"} {
+		if !strings.Contains(got, w) {
+			t.Errorf("no %q in:\n%s", w, got)
+		}
+	}
+	if strings.Contains(got, "прокси") {
+		t.Error("the CLI prints in English")
+	}
+}

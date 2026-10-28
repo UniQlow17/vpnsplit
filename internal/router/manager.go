@@ -13,6 +13,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/UniQlow17/vpnsplit/internal/clientcfg"
 	"github.com/UniQlow17/vpnsplit/internal/config"
 )
 
@@ -81,6 +82,7 @@ type Manager struct {
 	providerOf func() map[string]string // adapter name -> VPN client behind it, for the report
 	snapOff    bool                     // see NoSnapshot
 	oneShot    bool                     // see SetOneShot
+	clientScan func() clientcfg.Result  // the client files (fake-ip ranges), last read, at the start of an apply; nil: none (tests)
 
 	mu        sync.Mutex
 	mode      string          // what Cleanup does: config.ModeSession or config.ModePersistent
@@ -95,7 +97,9 @@ type Manager struct {
 
 // NewManager returns the Manager that works on this OS.
 func NewManager() *Manager {
-	return newManager(osBackend{}, fileStore{}, osProcs{}, osLock)
+	m := newManager(osBackend{}, fileStore{}, osProcs{}, osLock)
+	m.clientScan = clientcfg.Files
+	return m
 }
 
 // NewManagerFor returns a Manager on the given parts (for tests of the

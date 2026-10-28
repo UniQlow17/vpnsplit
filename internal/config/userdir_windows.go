@@ -34,3 +34,7 @@ func isElevated() bool { return windows.GetCurrentProcessToken().IsElevated() }
 // profile, a directory a non-elevated process of the same user can swap for
 // a junction; Windows has no directory-relative rename to rule that out.
 func cacheWritable() bool { return !isElevated() }
+
+// userConfigDir is never asked on Windows (there is no sudoOwner); it only
+// keeps the code that is shared with the other OSes in one piece.
+func userConfigDir(home string) string { return filepath.Join(home, "AppData", "Roaming") }

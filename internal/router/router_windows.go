@@ -176,9 +176,11 @@ func (osBackend) ReplaceRoute(old, next config.Route) error {
 
 var _ replacer = osBackend{}
 
-// listRoutes reads the routing table (IPv4 and IPv6).
-// The metric of the adapter (adapterMetrics) is not read here: only the choice
-// of the physical gateway needs it, and the table is read for every drift check.
+// listRoutes reads the routing table (IPv4 and IPv6). IfMetric of the IPv4
+// routes is the metric of the adapter (adapterMetrics), so every reader of the
+// table (the choice of the physical gateway, the diagnostics) compares the
+// total metric the OS compares. Neither the identity of a route (rkey, routeID)
+// nor the reconciler looks at IfMetric.
 func listRoutes() ([]OSRoute, error) {
 	ifs, err := net.Interfaces()
 	if err != nil {
@@ -208,6 +210,14 @@ func listRoutes() ([]OSRoute, error) {
 			Proto: int(row.Protocol), Origin: int(row.Origin), LUID: row.InterfaceLuid,
 		})
 	})
+	if err == nil {
+		metrics := adapterMetrics()
+		for i := range out {
+			if out[i].Dest.Addr().Is4() {
+				out[i].IfMetric = metrics[out[i].IfIndex]
+			}
+		}
+	}
 	return out, err
 }
 
@@ -245,10 +255,6 @@ func physicalGateway() (Gateway, bool) {
 	rs, err := listRoutes()
 	if err != nil {
 		return Gateway{}, false
-	}
-	metrics := adapterMetrics()
-	for i := range rs {
-		rs[i].IfMetric = metrics[rs[i].IfIndex]
 	}
 	return gatewayFrom(rs)
 }

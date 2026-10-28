@@ -17,7 +17,7 @@ import (
 // which is where VPN clients (or NetworkManager for them) put the corp DNS.
 // Without it, /etc/resolv.conf servers that are reached through corp are used.
 func corpDNS(iface string) (servers, zones []string) {
-	if hasResolved() {
+	if resolverSeam.hasResolved() {
 		servers = resolvectlList("dns", iface)
 		for _, d := range resolvectlList("domain", iface) {
 			zones = config.AddUnique(zones, strings.TrimPrefix(d, "~"))
@@ -26,7 +26,7 @@ func corpDNS(iface string) (servers, zones []string) {
 			return servers, zones
 		}
 	}
-	b, _ := os.ReadFile("/etc/resolv.conf")
+	b, _ := os.ReadFile(etcResolvConf)
 	all, search := parseResolvConf(string(b))
 	for _, s := range all {
 		if ifaceFor(s) == iface {
@@ -39,8 +39,17 @@ func corpDNS(iface string) (servers, zones []string) {
 	return servers, zones
 }
 
+// The files and the tools that the DNS discovery reads and runs: variables so
+// that the tests do not depend on the machine they run on.
+var (
+	etcResolvConf      = "/etc/resolv.conf"
+	resolvedResolvConf = "/run/systemd/resolve/resolv.conf"
+	// runCmd runs a tool of the system and returns its standard output.
+	runCmd = func(name string, args ...string) ([]byte, error) { return sysexec.Command(name, args...).Output() }
+)
+
 func ifaceFor(ip string) string {
-	out, _ := sysexec.Command("ip", "-4", "route", "get", ip).Output()
+	out, _ := runCmd("ip", "-4", "route", "get", ip)
 	f := strings.Fields(string(out))
 	for i := 0; i+1 < len(f); i++ {
 		if f[i] == "dev" {
@@ -73,7 +82,7 @@ func resolvectlList(what, iface string) []string {
 
 // resolvectlGet is resolvectlList that says when it could not ask.
 func resolvectlGet(what, iface string) ([]string, error) {
-	out, err := sysexec.Command("resolvectl", what, iface).Output()
+	out, err := runCmd("resolvectl", what, iface)
 	if err != nil {
 		return nil, err
 	}
@@ -153,26 +162,53 @@ func (osBackend) MissingResolvers(ids []string) ([]string, error) {
 	return missing, nil
 }
 
+// resolverSeam is what resolverPlan asks the system; the tests replace it.
+var resolverSeam = struct {
+	hasResolved func() bool
+	ifaceByName func(name string) (idx int, found bool, err error)
+	get         func(kind, iface string) ([]string, error)
+}{hasResolved, ifaceByName, resolvectlGet}
+
 // resolverPlan: systemd-resolved sends a zone to a link's DNS when the link
 // has it as a routing domain ("~corp.example"). The journal holds
 // "domain <link> <zone> <ifindex>", plus "dns <link> <ifindex> <servers>" if the
 // link had no DNS servers. When the link or its settings cannot be read nothing
 // is planned for it: not knowing whether it has DNS servers is no reason to set
 // or to clear any.
-func resolverPlan(iface string, servers, zones []string) []string {
-	if len(zones) == 0 || !hasResolved() {
+//
+// journal is the list of DNS entries of the journal. A link whose servers are
+// the ones we set (the entry is there, with the index of the link and the
+// servers it has now) keeps being planned: otherwise the cycle after the one
+// that set them would see a link with servers, plan nothing, and the
+// reconciler would take the entry away again.
+func resolverPlan(iface string, servers, zones, journal []string) []string {
+	if len(zones) == 0 || !resolverSeam.hasResolved() {
 		return nil
 	}
-	idx, found, err := ifaceByName(iface)
+	idx, found, err := resolverSeam.ifaceByName(iface)
 	if err != nil || !found {
 		return nil
 	}
-	cur, err := resolvectlGet("dns", iface)
+	cur, err := resolverSeam.get("dns", iface)
 	if err != nil {
 		return nil
 	}
 	var ids []string
-	if srv := validServers(servers); len(cur) == 0 && len(srv) > 0 {
+	want := validServers(servers)
+	srv := want
+	if own, ok := ownDNSEntry(journal, iface, idx, cur); ok {
+		// The entry is ours and stands. It stays as it is unless the servers that
+		// are wanted now are known and differ: then the entry is planned with them
+		// (the reconciler puts the new one and takes the old one away). Keeping
+		// the old servers regardless would make the entry flip every time the DNS
+		// of the VPN changes.
+		if len(want) == 0 || sameSet(want, own.Servers) {
+			srv = own.Servers
+		}
+	} else if len(cur) != 0 {
+		srv = nil
+	}
+	if len(srv) > 0 {
 		ids = append(ids, config.FormatLinuxResolver(iface, idx, "", srv))
 	}
 	for _, z := range zones {
@@ -306,16 +342,16 @@ func physicalDNS(iface string) []string {
 			}
 		}
 	}
-	if hasResolved() {
+	if resolverSeam.hasResolved() {
 		keep(resolvectlList("dns", iface))
 	}
 	if len(out) == 0 {
-		if o, err := sysexec.Command("nmcli", "-g", "IP4.DNS", "device", "show", iface).Output(); err == nil {
+		if o, err := runCmd("nmcli", "-g", "IP4.DNS", "device", "show", iface); err == nil {
 			keep(strings.FieldsFunc(string(o), func(r rune) bool { return r == '\n' || r == ' ' || r == '|' }))
 		}
 	}
 	if len(out) == 0 {
-		for _, p := range []string{"/run/systemd/resolve/resolv.conf", "/etc/resolv.conf"} {
+		for _, p := range []string{resolvedResolvConf, etcResolvConf} {
 			b, err := os.ReadFile(p)
 			if err != nil {
 				continue

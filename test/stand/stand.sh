@@ -147,7 +147,7 @@ setup() {
     ip netns exec $n python3 $STAND/httpname.py $n >/dev/null 2>&1 &
   done
   ip netns exec inet dnsmasq --user=root --conf-file=/dev/null --no-resolv --no-hosts --bind-interfaces \
-    --listen-address=1.1.1.1 --address=/direct.example/203.0.113.12 --address=/fake.example/198.19.5.5 --pid-file=$WORK/dns-inet.pid
+    --listen-address=1.1.1.1 --address=/direct.example/203.0.113.12 --address=/fake.example/198.19.5.5 --address=/fake28.example/28.5.5.5 --pid-file=$WORK/dns-inet.pid
   ip netns exec corp dnsmasq --user=root --conf-file=/dev/null --no-resolv --no-hosts --bind-interfaces \
     --listen-address=10.200.0.1 --address=/corp.example/10.10.1.1 --pid-file=$WORK/dns-corp.pid
   mkdir -p /etc/netns/client
@@ -926,7 +926,7 @@ s_dns_paths() {
   check "the zone of the direct name is routed to the provider's DNS (domain ~direct.example on eth0)" has_dom eth0 "~direct.example"
   check "the journal lists the zone on eth0" grep -q 'domain eth0 direct.example' /var/lib/vpnsplit/state.json
   check "the provider's own DNS server of eth0 is kept" test "$(rdns eth0)" = 1.1.1.1
-  grep -q "fake-ip answers (198.18.0.0/15) dropped" "$RLOG" && ok "the report names the fake-ip answer" || bad "no fake-ip note in the output"
+  grep -q "fake-ip answers (198.18.0.0/15.*) dropped" "$RLOG" && ok "the report names the fake-ip answer" || bad "no fake-ip note in the output"
   grep -q "fake.example=198.19.5.5" "$RLOG" && ok "the report names the name and the address" || bad "name and address not in the output"
   kill -TERM "$RPID"
   reap
@@ -1243,6 +1243,270 @@ s_dns_readfail() {
   show_log
 }
 
+# ------------------------------------------------------------ stage 4: detection and warnings
+# The diagnostics only read. Each scenario puts the "client" into a state that has a finding, looks at what
+# `vpnsplit status` says about it, and checks that nothing changed in the routing table (or, in the scenarios
+# that run a session, that the end restores the snapshot).
+diag_out() { vs status 2>&1; }
+has_diag() { # level code (the output of status is in $DIAG)
+  printf '%s\n' "$DIAG" | grep -q -E "^  \[$1\] $2:"
+}
+no_diag() { ! printf '%s\n' "$DIAG" | grep -q -E "^  \[[a-z]+\] $1:"; }
+show_diag() { printf '%s\n' "$DIAG" | grep -E '^diagnostics|^  \[|^      ->' | sed 's/^/        | /'; }
+no_warn() { ! printf '%s\n' "$DIAG" | grep -q -E '^  \[(warn|danger)\]'; }
+cfg_save() { cp /root/.config/vpnsplit/config.json "$WORK/config.json.bak"; }
+cfg_back() { cp "$WORK/config.json.bak" /root/.config/vpnsplit/config.json; }
+
+# S28: the setup of the stand has nothing to warn about (the home client of variants b and c is a full tunnel
+# by its policy table, which is a note, not a warning)
+s_diag_quiet() {
+  CUR=S28
+  say "S28: nothing to warn about in the plain setup; status changes nothing"
+  fresh
+  local before
+  before=$(snap)
+  DIAG=$(diag_out)
+  show_diag
+  check "no warning or danger" no_warn
+  if [ "$VARIANT" = a ]; then
+    check "no WG finding in variant a" no_diag WG_FULL_TUNNEL
+  else
+    check "the home client's full tunnel is a note (policy table)" has_diag info WG_FULL_TUNNEL
+    printf '%s\n' "$DIAG" | grep -q "policy table" && ok "the note names the policy table" || bad "no policy table in the WG note"
+  fi
+  check "the routing table is unchanged by status" test "$(snap)" = "$before"
+  check "the routing table equals the snapshot" base_state
+}
+
+# S29: WireGuard with AllowedIPs 0.0.0.0/0 takes all the traffic (a: the client's halves in the main table)
+s_diag_wg() {
+  CUR=S29
+  say "S29: the home WireGuard is a full tunnel (wg-quick table, or the halves in the main table)"
+  fresh
+  if [ "$VARIANT" = a ]; then
+    ip -n client route add 0.0.0.0/1 dev wghome
+    ip -n client route add 128.0.0.0/1 dev wghome
+  fi
+  local before
+  before=$(snap)
+  DIAG=$(diag_out)
+  show_diag
+  check "WG_FULL_TUNNEL is reported as a note" has_diag info WG_FULL_TUNNEL
+  check "the routing table is unchanged by status" test "$(snap)" = "$before"
+  # a third WireGuard that takes everything is a warning
+  ip -n client link add wg9 type wireguard
+  ip -n client addr add 10.99.0.2/24 dev wg9
+  ip -n client link set wg9 up
+  ip -n client route add 0.0.0.0/1 dev wg9 metric 5
+  ip -n client route add 128.0.0.0/1 dev wg9 metric 5
+  DIAG=$(diag_out)
+  show_diag
+  check "a third WireGuard with a full tunnel is a warning" has_diag warn WG_FULL_TUNNEL
+  ip -n client link del wg9
+  if [ "$VARIANT" = a ]; then
+    ip -n client route del 0.0.0.0/1 dev wghome
+    ip -n client route del 128.0.0.0/1 dev wghome
+  fi
+  check "the routing table equals the snapshot" base_state
+}
+
+# S30: the corp VPN takes the whole address space
+s_diag_corp_full() {
+  CUR=S30
+  say "S30: the corp VPN in a full tunnel (0/1 + 128/1 through wgcorp) is a warning"
+  fresh
+  ip -n client route add 0.0.0.0/1 dev wgcorp
+  ip -n client route add 128.0.0.0/1 dev wgcorp
+  local before
+  before=$(snap)
+  DIAG=$(diag_out)
+  show_diag
+  check "CORP_FULL_TUNNEL is a warning" has_diag warn CORP_FULL_TUNNEL
+  printf '%s\n' "$DIAG" | grep -q "0.0.0.0/1 + 128.0.0.0/1" && ok "it names the halves" || bad "the halves are not named"
+  check "the routing table is unchanged by status" test "$(snap)" = "$before"
+  ip -n client route del 0.0.0.0/1 dev wgcorp
+  ip -n client route del 128.0.0.0/1 dev wgcorp
+  ip -n client route del default via 192.168.1.1 dev eth0
+  ip -n client route add default via 192.168.1.1 dev eth0 metric 100
+  ip -n client route add default dev wgcorp metric 50
+  DIAG=$(diag_out)
+  check "a default route with a better metric than eth0 is a warning too" has_diag warn CORP_FULL_TUNNEL
+  ip -n client route del default dev wgcorp metric 50
+  ip -n client route add default dev wgcorp metric 5000
+  DIAG=$(diag_out)
+  check "a default route that loses to eth0 is not" no_diag CORP_FULL_TUNNEL
+  ip -n client route del default dev wgcorp metric 5000
+  ip -n client route del default via 192.168.1.1 dev eth0 metric 100
+  ip -n client route add default via 192.168.1.1 dev eth0
+  check "the routing table equals the snapshot" base_state
+}
+
+# S31: rules that overlap the local network, a docker bridge, CGNAT; a session runs and ends clean
+s_diag_overlap() {
+  CUR=S31
+  say "S31: a corp rule over the LAN (192.168.0.0/16), docker (172.16.0.0/12) and CGNAT (100.64.0.0/10)"
+  cfg_save
+  fresh
+  ip -n client link add docker0 type dummy
+  ip -n client addr add 172.17.0.1/16 dev docker0
+  ip -n client link set docker0 up
+  vs add 192.168.0.0/16 >/dev/null
+  vs add 172.16.0.0/12 >/dev/null
+  vs add 100.64.0.0/10 >/dev/null
+  start_run s31 run
+  check "routes applied" wait_for 20 applied
+  DIAG=$(diag_out)
+  show_diag
+  check "the rule over the LAN of eth0" has_diag warn OVERLAP_LAN
+  check "the rule over docker0" has_diag warn OVERLAP_ADAPTER
+  printf '%s\n' "$DIAG" | grep -q "docker0" && ok "docker0 is named" || bad "docker0 not named"
+  check "the rule over CGNAT" has_diag info OVERLAP_WELLKNOWN
+  routes_ok
+  kill -TERM "$RPID"
+  reap
+  check "exit code 0 (got $RCODE)" test "$RCODE" = 0
+  ip -n client link del docker0
+  check "the routing table equals the snapshot" base_state
+  cfg_back
+  show_log
+}
+
+# S32: a corp rule that covers the address of the home VPN's server
+s_diag_endpoint() {
+  CUR=S32
+  say "S32: a corp network over the server of the home VPN is reported"
+  cfg_save
+  fresh
+  local added=0
+  if [ "$VARIANT" != a ]; then
+    ip -n client route add 198.18.2.2/32 via 192.168.1.1 dev eth0 && added=1
+  fi
+  vs add 198.18.0.0/16 >/dev/null
+  local before
+  before=$(snap)
+  DIAG=$(diag_out)
+  show_diag
+  check "ENDPOINT_COVERED is a warning" has_diag warn ENDPOINT_COVERED
+  printf '%s\n' "$DIAG" | grep -q "198.18.2.2" && ok "the server is named" || bad "the server address is not named"
+  check "the routing table is unchanged by status" test "$(snap)" = "$before"
+  [ "$added" = 1 ] && ip -n client route del 198.18.2.2/32
+  cfg_back
+  check "the routing table equals the snapshot" base_state
+}
+
+# S33: fake-ip-range of a mihomo config narrows the answers that are accepted. Control: without the file the
+# answer 28.5.5.5 gets a /32 route.
+s_diag_fakeip() {
+  CUR=S33
+  say "S33: fake-ip-range 28.0.0.0/8 from a mihomo config (client running): the answer 28.5.5.5 is dropped"
+  cfg_save
+  fresh
+  vs add --direct fake28.example >/dev/null
+  start_run s33a run
+  check "routes applied" wait_for 20 applied
+  check "control: without the config the answer 28.5.5.5 gets a route" bash -c "ip -n client -4 route show table all | grep -q -E '^28\.5\.5\.5 '"
+  kill -TERM "$RPID"
+  reap
+  check "exit code 0 (got $RCODE)" test "$RCODE" = 0
+  check "the routing table equals the snapshot" base_state
+
+  mkdir -p /root/.config/mihomo
+  printf '%s\n' 'mixed-port: 7890' 'tun:' '  enable: true' '  stack: mixed' '  strict-route: true' \
+    'dns:' '  enable: true' '  enhanced-mode: fake-ip' '  fake-ip-range: 28.0.0.1/8' > /root/.config/mihomo/config.yaml
+  # the config of a client that is not running (no adapter of it) says nothing about the DNS: the answer is routed
+  start_run s33n run
+  check "routes applied" wait_for 20 applied
+  check "no mihomo adapter: the config is not used (28.5.5.5 gets a route)" bash -c "ip -n client -4 route show table all | grep -q -E '^28\.5\.5\.5 '"
+  kill -TERM "$RPID"
+  reap
+  check "exit code 0 (got $RCODE)" test "$RCODE" = 0
+  check "the routing table equals the snapshot" base_state
+
+  # the adapter of the client is up: its fake-ip range counts (the adapter and its route are taken
+  # away before the table is compared with the snapshot: they are not ours)
+  mihomo_up() { ip -n client link add mihomo0 type dummy && ip -n client addr add 172.19.0.1/30 dev mihomo0 && ip -n client link set mihomo0 up; }
+  mihomo_up
+  start_run s33b run
+  check "routes applied" wait_for 20 applied
+  check "the answer 28.5.5.5 got no route" bash -c "! ip -n client -4 route show table all | grep -q -E '^28\.5\.5\.5'"
+  grep -q "fake28.example=28.5.5.5" "$RLOG" && ok "the report names the dropped answer" || bad "the dropped answer is not in the output"
+  routes_ok
+  DIAG=$(diag_out)
+  show_diag
+  check "FAKE_IP is reported" has_diag warn FAKE_IP
+  printf '%s\n' "$DIAG" | grep -q "28.0.0.0/8" && ok "the range of the config is named" || bad "the range is not named"
+  check "STRICT_ROUTE is reported" has_diag warn STRICT_ROUTE
+  kill -TERM "$RPID"
+  reap
+  check "exit code 0 (got $RCODE)" test "$RCODE" = 0
+  ip -n client link del mihomo0
+  check "the routing table equals the snapshot" base_state
+
+  # a range that is not allowed (too wide) is not taken: the answer is routed as before
+  sed -i 's#fake-ip-range: .*#fake-ip-range: 0.0.0.0/1#' /root/.config/mihomo/config.yaml
+  mihomo_up
+  start_run s33c run
+  check "routes applied" wait_for 20 applied
+  check "a too wide range is not taken (28.5.5.5 gets a route again)" bash -c "ip -n client -4 route show table all | grep -q -E '^28\.5\.5\.5 '"
+  kill -TERM "$RPID"
+  reap
+  rm -rf /root/.config/mihomo
+  ip -n client link del mihomo0
+  cfg_back
+  check "the routing table equals the snapshot" base_state
+  show_log
+}
+
+# S34: the corp VPN has no next hop (its routes are on-link); the plan works, the note is shown
+s_diag_onlink() {
+  CUR=S34
+  say "S34: the corp gateway without a next hop: routes are on-link, the note is shown"
+  fresh
+  ip -n client route add 10.30.0.0/16 dev wgcorp
+  start_run s34 run
+  check "routes applied" wait_for 20 applied
+  routes_ok
+  check "the corp route has no 'via'" bash -c "[ -z \"\$(ip -n client -4 route get 203.0.113.11 | grep -o 'via [^ ]*')\" ]"
+  DIAG=$(diag_out)
+  show_diag
+  check "CORP_ONLINK is a note" has_diag info CORP_ONLINK
+  kill -TERM "$RPID"
+  reap
+  check "exit code 0 (got $RCODE)" test "$RCODE" = 0
+  ip -n client route del 10.30.0.0/16 dev wgcorp
+  check "the routing table equals the snapshot" base_state
+  show_log
+}
+
+# S35: the DNS servers we set on a link that had none stay while the plan is applied again (the old code saw
+# a link with servers in the next cycle, planned nothing, and took its own entry away)
+s_dns_keep() {
+  CUR=S35
+  say "S35: the 'dns' entry we made stays after a second apply"
+  cfg_save
+  fresh
+  fake_resolved_on
+  : > "$WORK/resolved/wgcorp.dns"
+  start_run s35 run
+  check "routes applied" wait_for 20 applied
+  check "the corp link got the corp DNS" test "$(rdns wgcorp)" = 10.200.0.1
+  check "the journal has the dns entry" grep -q '"dns wgcorp ' /var/lib/vpnsplit/state.json
+  vs add 203.0.113.19 >/dev/null
+  check "the new rule was applied by the loop" wait_for 20 dev_is 203.0.113.19 wgcorp
+  sleep 3
+  check "the corp link still has the corp DNS" test "$(rdns wgcorp)" = 10.200.0.1
+  check "the journal still has the dns entry" grep -q '"dns wgcorp ' /var/lib/vpnsplit/state.json
+  check "the servers were set once and never cleared" bash -c "[ \"\$(grep -c '^dns wgcorp' $WORK/resolved/calls.log)\" = 1 ]"
+  kill -TERM "$RPID"
+  reap
+  check "exit code 0 (got $RCODE)" test "$RCODE" = 0
+  check "the corp link has no DNS servers again, as before" test -z "$(rdns wgcorp)"
+  check "the routing table equals the snapshot" base_state
+  cfg_back
+  fake_resolved_off
+  show_log
+}
+
 # --------------------------------------------------------------------- main
 say "setting up the network (home VPN variant: $VARIANT)"
 setup
@@ -1277,6 +1541,14 @@ want S24 && s_dns_overlap
 want S25 && s_dns_foreign
 want S26 && s_ipv6_v4only
 want S27 && s_dns_readfail
+want S28 && s_diag_quiet
+want S29 && s_diag_wg
+want S30 && s_diag_corp_full
+want S31 && s_diag_overlap
+want S32 && s_diag_endpoint
+want S33 && s_diag_fakeip
+want S34 && s_diag_onlink
+want S35 && s_dns_keep
 
 say "result: $PASS ok, $FAIL failed"
 for f in "${FAILED[@]+"${FAILED[@]}"}"; do echo "  FAIL $f"; done

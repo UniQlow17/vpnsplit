@@ -32,12 +32,14 @@ Go (1.24), TUI на bubbletea. Утилита сплит-туннелинга д
   - `paths*.go` — защищённый каталог;
   - `fsutil*.go` — безопасная запись;
   - `userdir_*.go` — профиль пользователя через SUDO_USER/PKEXEC_UID.
+  - `userfiles*.go` — `ReadRegularMax`, `ReadUserFile`/`ListUserDir` (через `os.Root` профиля, без ссылок, владелец — пользователь/root), `ReadMachineFile`/`ListMachineDir` (только владелец SYSTEM/Administrators/TrustedInstaller или root), `RealUserHome`/`RealUserConfigDir`/`RealUser`.
 - `internal/router` — ядро:
   - `manager.go` — `Manager`/`Session`: `Acquire` (lock + recover + снимок), `Apply`, `Reset`, `Cleanup`/`CleanupUntil`, `Report`;
   - `backend.go` — интерфейс `Backend` (маршруты, правила, DNS, чтение таблиц), `osBackend`;
   - `router.go` — `applyEnv`, Sig (имя + индекс + хеш адресов + признак v6), детект;
   - `tun6.go` + `tun6_windows.go` — Teredo/6to4/ISATAP (Windows): прежнее состояние в журнал до смены, откат в Cleanup/Recover;
   - `v6.go` — `V6Status` (подсветка v6 мимо дом. VPN);
+  - `diag.go` + `diag_detect.go` — `Diagnose`/`Diag`, детекторы этапа 4; `fakeip.go` — диапазоны fake-ip из конфигов только запущенных клиентов (`fakeRangesFor`), `isFakeIP` только для ответов DNS (для серверов — `badServer`); `dns_entry.go` — `ownDNSEntry`;
   - `plan.go` — желаемое состояние: маршруты, правила, пины (endpoints), `policyFor`, `pickOwnTable`;
   - `reconcile.go` — diff и согласование: write-ahead pending, add→del, replace, `Drifted`;
   - `table.go` — `OSRoute`/`OSRule`, метки владения;
@@ -53,6 +55,7 @@ Go (1.24), TUI на bubbletea. Утилита сплит-туннелинга д
 - `internal/netif` — детект адаптеров:
   - `providers.go` — известные VPN-клиенты;
   - `owners_*.go`, `descriptions_windows.go`.
+- `internal/clientcfg` — чтение настроек клиентов и ОС для предупреждений (прокси, sing-box/Hiddify/Mihomo, GPO NRPT, OpenVPN, Cisco); ничего не меняет.
 - `internal/ripe` — префиксы AS из RIPE, кэш с санитизацией.
 - `internal/sysexec` — единственный способ запускать системные утилиты: абсолютные пути, урезанное env, `sysexec.PowerShell(script, env)`.
 - `internal/sysproc` — `Alive`/`AliveExact(pid, start)`, `BootID`, `SameBoot`.
@@ -69,7 +72,7 @@ Go (1.24), TUI на bubbletea. Утилита сплит-туннелинга д
   - Контейнер `--privileged`, внутри netns client/isp/inet/corp-gw/home-gw, WireGuard wgcorp/wghome, dnsmasq.
   - Адрес 203.0.113.x отвечает именем сети, так curl показывает путь трафика.
   - Варианты домашнего VPN: a — 0/1+128/1 в main; b — `ip rule` + table 2022 (как sing-box); c — wg-quick `suppress_prefixlength 0`.
-  - Сценарии S0–S27:
+  - Сценарии S0–S35 (S28–S35 — этап 4: детект, `vpnsplit status`):
     - сигналы и выход TUI (S1/S2/S6);
     - kill -9 → Recover (S3);
     - persistent (S4/S7);
@@ -126,7 +129,7 @@ Go (1.24), TUI на bubbletea. Утилита сплит-туннелинга д
   - `a7f9f7c` — этап 2, нативные маршруты, согласование, «как до запуска».
 - Открыто: третий раунд reviewer + security по `a7f9f7c`. Windows-бэкенд вживую не проверялся, macOS — только компиляция.
 - Этап 3 — DNS и утечки: готов. «Напрямую» через DNS провайдера + /32 (`directServers`, `physicalDNS`; единый фильтр адресов `badAddr`/`avoid`: loopback, link-local, multicast, fake-ip, корп. префиксы, DNS корп./дом. VPN, endpoint), /32 до корп. DNS, зоны direct-доменов → DNS провайдера при `rest=home` (`plan.direct`), NRPT «.» / `~.` на линке дом. VPN (`plan.rest`, `restDNS`; не ставится при `apply` без `watch` (`SetOneShot`), без корп. зон при корп. VPN, macOS не делается; чужая запись — «выполнено, не наше», без флапа), IPv6 (`::/1`+`8000::/1` через дом. VPN при его глобальном v6; на macOS пока не планируются; `V6Status` с признаком `Env.V6Cap`: на Linux читаются v6-правила), Windows Teredo/6to4/ISATAP (`tun6.go`, `State.Tun6`, повторное отключение, предупреждение о незнакомом значении), enum `Config.Rest` (`home`/`direct`/`keep`, миграция `home_default`), правила `--home`. Старый журнал из профиля: `Tun6` и зона «.» отбрасываются. Стенд S19–S26. Не проверено вживую: Windows (NRPT, Tun6, SOCKADDR_INET v6, scope_id link-local next hop), macOS (`-inet6`), настоящий systemd-resolved.
-- Этап 4 — детект и предупреждения: Прокси, strict_route, fake-ip, WG 0/0, block-outside-dns, GPO NRPT, full-tunnel корп., пересечения подсетей.
+- Этап 4 — детект и предупреждения: готов. `router.Diagnose(cfg, env, st)` → `[]Diag{Code, Level info/warn/danger, TextRU/EN, AdviceRU/EN}` (`diag.go` кэш 20 с по `Sig`+журналу; `diag_detect.go` чистые детекторы `diagnose(diagIn)`). Находки: `PROXY_ON`, `STRICT_ROUTE`, `FAKE_IP`, `WG_FULL_TUNNEL`, `CORP_FULL_TUNNEL`, `CORP_LOCKDOWN` (профиль Cisco), `BLOCK_OUTSIDE_DNS` (эвристика по конфигу/логу OpenVPN, info), `GPO_NRPT` (danger), `OVERLAP_LAN`/`OVERLAP_ADAPTER`/`OVERLAP_WELLKNOWN`/`OVERLAP_VPN_LAN`, `ENDPOINT_COVERED`, `DIRECT_CDN_AS`/`DIRECT_BIG` (> /10 в сумме), `HYPERV_UPLINK`, `CORP_ONLINK`. Показ: `vpnsplit status` (блок `diagnostics:`), TUI — индикатор в строке статуса и раздел «Окружение» на экране «Текущее состояние»; экран «Диагностика» — этап 5. `internal/clientcfg` читает (только чтение, лимит 4 МиБ, без ссылок: `config.ReadRegularMax`) конфиги sing-box/Hiddify/Mihomo (узкий разбор YAML без зависимостей), прокси (WinINET из реестра реального пользователя сессии, `scutil --proxy`, `gsettings` через `runuser`), GPO NRPT, OpenVPN, профили Cisco; кэш 30 с с single-flight без мьютекса на время скана (`Cached` ждёт ≤2 с, `Files` для apply не ждёт; запуск утилит — `runLimited`: таймаут, `WaitDelay`, kill группы процессов на unix). Машинные пути (`/etc`, `/usr/local/etc`, `%ProgramData%`, Cisco) читаются только при владельце SYSTEM/Administrators/TrustedInstaller или root. Диапазоны fake-ip из конфигов (`fake-ip-range`, `inet4_range`) сужают фильтр ответов DNS (IPv4, не короче /8, без частных/loopback/multicast/CGNAT/документационных; mihomo — только при `dns.enable: true`; в отчёте apply — диапазон и клиент, без пути). ProxyOverride НЕ делается (см. отчёт этапа). Linux `dns <link>`: запись, которую мы сами поставили (индекс и серверы совпали с журналом), продолжает планироваться (`ownDNSEntry`), а при смене желаемых серверов заменяется. Windows: `IfMetric` заполняется в `listRoutes` для всех потребителей. Стенд S28–S35. Не проверено вживую: Windows (WTS-сессия, реестр других пользователей, GPO, vEthernet), macOS (`scutil --proxy`), Hiddify (пути данных предположительные).
 - Этап 5 — меню, «Дополнительно», авторесайз окна.
 - Трей — отдельный поздний этап.
 

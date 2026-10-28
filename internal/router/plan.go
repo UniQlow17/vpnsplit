@@ -398,10 +398,12 @@ func hostRoutes(servers []string, iface, gateway, via string, onlink []netip.Pre
 	return out
 }
 
-// badAddr says why no route and no DNS entry is made for the address a (""
-// when it is fine): it is not an address of one host in the network, or it is
-// the fake one of a client.
-func badAddr(a netip.Addr) string {
+// badServer says why the address of a DNS server that the OS reported cannot
+// be used for a route or a DNS entry ("" when it is fine): it is not an address
+// of one host in the network (loopback, link-local, multicast...). A fake-ip range
+// is not a reason here: it describes what a DNS answers, and a server the OS
+// itself reports (the DNS of the TUN of a client, 198.18.0.2) is a real one.
+func badServer(a netip.Addr) string {
 	a = a.Unmap()
 	switch {
 	case !a.IsValid():
@@ -416,8 +418,19 @@ func badAddr(a netip.Addr) string {
 		return "link-local"
 	case a.Is4() && a == netip.AddrFrom4([4]byte{255, 255, 255, 255}):
 		return "broadcast"
-	case fakeIPNet.Contains(a):
-		return "in the fake-ip range (198.18.0.0/15)"
+	}
+	return ""
+}
+
+// badAddr says why no route and no DNS entry is made for the address a (""
+// when it is fine) that a DNS answered: it is not an address of one host in the
+// network, or it is the fake one of a client.
+func badAddr(a netip.Addr) string {
+	if w := badServer(a); w != "" {
+		return w
+	}
+	if a = a.Unmap(); isFakeIP(a) {
+		return "in the fake-ip range (" + fakeRangeOf(a) + ")"
 	}
 	return ""
 }
@@ -574,7 +587,7 @@ func (m *Manager) buildPlan(cfg *config.Config, e Env, st *config.State, tbl *ta
 			}
 		}
 		if cfg.SplitDNS && len(servers) > 0 {
-			p.dns = cleanZones(e.Corp.Name, servers, append(zones, cfg.Domains...), cfg.DirectDomains)
+			p.dns = cleanZones(e.Corp.Name, servers, append(zones, cfg.Domains...), cfg.DirectDomains, journalResolvers(st))
 		}
 	}
 	for _, r := range corpRoutes {
@@ -645,7 +658,7 @@ func (m *Manager) buildPlan(cfg *config.Config, e Env, st *config.State, tbl *ta
 			// with the rest going home the applications must ask the same server, or they
 			// get another address than the one the route was made for
 			if restHome && len(servers) > 0 {
-				p.direct = cleanZones(e.GW.Iface, servers, cfg.DirectDomains, nil)
+				p.direct = cleanZones(e.GW.Iface, servers, cfg.DirectDomains, nil, journalResolvers(st))
 			}
 		}
 	}
@@ -739,7 +752,7 @@ func (m *Manager) buildPlan(cfg *config.Config, e Env, st *config.State, tbl *ta
 	case len(homeDNS) == 0:
 		p.warns = append(p.warns, "the DNS servers of the home VPN are unknown: the DNS of the rest of the traffic stays with the system")
 	default:
-		if ids := resolverPlan(e.Home.Name, homeDNS, []string{"."}); len(ids) > 0 {
+		if ids := resolverPlan(e.Home.Name, homeDNS, []string{"."}, journalResolvers(st)); len(ids) > 0 {
 			fmt.Fprintf(w, "home DNS: %s (for everything else)\n", strings.Join(homeDNS, ", "))
 			p.rest = &dnsPlan{iface: e.Home.Name, servers: homeDNS, ids: ids}
 		} else {
@@ -786,7 +799,7 @@ func policyFor(routes []config.Route, pfx []netip.Prefix, tbl *table, rs *ruleSe
 
 // cleanZones prepares the zones for the per-domain DNS entries: lower case,
 // valid, without the zones that go direct.
-func cleanZones(iface string, servers, zones, skip []string) *dnsPlan {
+func cleanZones(iface string, servers, zones, skip, journal []string) *dnsPlan {
 	var clean []string
 	done := map[string]bool{}
 	for _, s := range skip {
@@ -799,7 +812,7 @@ func cleanZones(iface string, servers, zones, skip []string) *dnsPlan {
 			clean = append(clean, z)
 		}
 	}
-	ids := resolverPlan(iface, servers, clean)
+	ids := resolverPlan(iface, servers, clean, journal)
 	if len(ids) == 0 {
 		return nil
 	}
@@ -908,4 +921,12 @@ func foreignHalves(tbl *table, st *config.State, iface string) []OSRoute {
 		out = append(out, r)
 	}
 	return out
+}
+
+// journalResolvers lists the DNS entries of the journal (nil for no journal).
+func journalResolvers(st *config.State) []string {
+	if st == nil {
+		return nil
+	}
+	return st.Resolvers
 }

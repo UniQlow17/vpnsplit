@@ -64,7 +64,7 @@ func corpDNS(iface string) (servers, zones []string) {
 // resolverPlan: Windows sends a zone to given servers through a Name
 // Resolution Policy Table rule; the journal holds the zone, and our rules
 // are tagged with a comment so others' rules are never touched.
-func resolverPlan(_ string, servers, zones []string) []string {
+func resolverPlan(_ string, servers, zones, _ []string) []string {
 	if len(servers) == 0 {
 		return nil
 	}

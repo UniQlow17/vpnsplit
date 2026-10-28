@@ -204,7 +204,7 @@ func corpDNS(corpIface string) (servers, zones []string) {
 
 // resolverPlan: macOS reads per-domain DNS servers from /etc/resolver/<zone>;
 // the journal holds the file paths.
-func resolverPlan(_ string, _, zones []string) []string {
+func resolverPlan(_ string, _, zones, _ []string) []string {
 	var ids []string
 	for _, z := range zones {
 		ids = append(ids, filepath.Join(resolverDir, z))

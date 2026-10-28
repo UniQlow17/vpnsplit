@@ -35,7 +35,7 @@ func sudoOwner() *owner {
 	if err1 != nil || err2 != nil {
 		return nil
 	}
-	return &owner{uid: uid, gid: gid, home: u.HomeDir}
+	return &owner{uid: uid, gid: gid, home: u.HomeDir, name: u.Username}
 }
 
 // userConfigDir is the per-user configuration base of home on this OS.

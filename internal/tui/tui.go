@@ -46,6 +46,7 @@ type (
 		warns        []string             // config and journal problems found while loading
 		journal      config.JournalStatus // whether the protected journal could be read
 		diff         *router.Baseline     // the system against the state before the start; nil without rights
+		diags        []router.Diag        // findings about the environment (proxy, client settings, overlaps...)
 	}
 	opDone struct {
 		title string
@@ -77,6 +78,7 @@ type model struct {
 	readOnly    string           // why this copy may not change the network (no rights, or another copy owns it); "" if it may
 	lastSession string           // how the previous session ended (from a file), shown on the status screen
 	diff        *router.Baseline // live difference from the state before the start (status screen)
+	diags       []router.Diag    // findings about the environment, from the last refresh
 	auto        bool
 	autoWait    int
 	busy        string
@@ -178,6 +180,7 @@ func refreshCmd() tea.Cmd {
 			s.cfg = cfg
 			s.warns = append(s.warns, cwarns...)
 			s.env = router.Detect(cfg)
+			s.diags = router.Diagnose(cfg, s.env, st)
 			s.apply, s.reset = router.Sync(cfg, s.env, st)
 			if !s.apply && !s.reset && router.Drifted(st) {
 				s.apply = true // routes of a reconnected VPN went with its old adapter
@@ -316,6 +319,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.needApply, m.needReset = msg.apply, msg.reset
 		m.warns, m.journal = msg.warns, msg.journal
 		m.diff = msg.diff
+		m.diags = msg.diags
 		m.flashWarnings()
 		if m.auto && m.busy == "" && m.cfg != nil && m.admin && !m.foreign() && m.frame >= m.autoWait {
 			if m.needApply {
@@ -696,6 +700,7 @@ func (m model) statusLines() []string {
 		line("  %s", v6InfoText(m.env))
 	}
 	line("  Корп. домены через корп. DNS: %s", map[bool]string{true: "да", false: "нет"}[c.SplitDNS])
+	m.diagLines(&out, h)
 
 	out = append(out, "")
 	st := m.st
@@ -1098,4 +1103,48 @@ func v6InfoText(e router.Env) string {
 		return "IPv6: на совести клиента домашнего VPN (не удалось определить, забирает ли он IPv6)"
 	}
 	return "IPv6: через домашний VPN (у него есть глобальный IPv6)"
+}
+
+// diagLines adds the section of the findings about the environment to the
+// status screen: the level and code of each, what it is, and what to do.
+func (m model) diagLines(out *[]string, h func(string)) {
+	if len(m.diags) == 0 {
+		return
+	}
+	*out = append(*out, "")
+	h("Окружение: " + router.DiagSummary(m.diags, true))
+	for _, d := range m.diags {
+		tag := map[router.DiagLevel]lipgloss.Style{router.DiagDanger: sRed, router.DiagWarn: sYel, router.DiagInfo: sGray}[d.Level]
+		*out = append(*out, "  "+tag.Render("["+diagLevelRU(d.Level)+"] "+d.Code)+" "+d.Text(true))
+		if a := d.Advice(true); a != "" {
+			*out = append(*out, "      "+sGray.Render("-> "+a))
+		}
+	}
+}
+
+// diagLevelRU names the level of a finding.
+func diagLevelRU(l router.DiagLevel) string {
+	switch l {
+	case router.DiagDanger:
+		return "опасно"
+	case router.DiagWarn:
+		return "внимание"
+	}
+	return "инфо"
+}
+
+// diagIndicator is the part of the status line that tells there are findings
+// (nothing when there are none): the colour is the one of the worst level.
+func (m model) diagIndicator() string {
+	if len(m.diags) == 0 {
+		return ""
+	}
+	st := sGray
+	switch router.WorstDiag(m.diags) {
+	case router.DiagDanger:
+		st = sRed
+	case router.DiagWarn:
+		st = sYel
+	}
+	return st.Render("окружение: " + router.DiagSummary(m.diags, true) + " (см. Статус)")
 }

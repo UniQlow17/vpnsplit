@@ -418,6 +418,7 @@ func cmdStatus() error {
 	if n := config.LegacyNote(false); n != "" {
 		printWarnings([]string{n})
 	}
+	printDiagnostics(os.Stdout, router.Diagnose(cfg, e, st))
 	switch jstatus {
 	case config.JournalDenied:
 		fmt.Printf("journal of applied routes: available only with administrator rights (%s); what is applied is unknown\n", router.PrivHint)
@@ -458,4 +459,19 @@ func parseReset(args []string) (resetOpts, error) {
 		}
 	}
 	return o, nil
+}
+
+// printDiagnostics lists what the diagnostics found around the setup: one line
+// per finding with its level and code, and what to do about it.
+func printDiagnostics(w io.Writer, list []router.Diag) {
+	if len(list) == 0 {
+		return
+	}
+	fmt.Fprintf(w, "diagnostics: %s\n", router.DiagSummary(list, false))
+	for _, d := range list {
+		fmt.Fprintf(w, "  [%s] %s: %s\n", d.Level, d.Code, d.Text(false))
+		if a := d.Advice(false); a != "" {
+			fmt.Fprintf(w, "      -> %s\n", a)
+		}
+	}
 }

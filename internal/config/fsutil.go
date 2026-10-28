@@ -17,6 +17,7 @@ const maxFileSize = 16 << 20
 // writes; they must stay theirs.
 type owner struct {
 	uid, gid int
+	name     string // the login name, from the user database
 	home     string
 }
 
@@ -24,7 +25,10 @@ type owner struct {
 // refused. The check is repeated on the opened descriptor (and, where the OS
 // has it, the open itself refuses a symlink and never blocks on a pipe), so
 // swapping the file between the check and the open does not help.
-func readRegular(path string) ([]byte, error) {
+func readRegular(path string) ([]byte, error) { return readRegularMax(path, maxFileSize) }
+
+// readRegularMax is readRegular with a limit of max bytes.
+func readRegularMax(path string, max int64) ([]byte, error) {
 	fi, err := os.Lstat(path)
 	if err != nil {
 		return nil, err
@@ -32,7 +36,7 @@ func readRegular(path string) ([]byte, error) {
 	if !fi.Mode().IsRegular() {
 		return nil, fmt.Errorf("%s is not a regular file", path)
 	}
-	if fi.Size() > maxFileSize {
+	if fi.Size() > max {
 		return nil, fmt.Errorf("%s is too large", path)
 	}
 	f, err := os.OpenFile(path, os.O_RDONLY|openReadFlags, 0)
@@ -47,11 +51,11 @@ func readRegular(path string) ([]byte, error) {
 	if !fi2.Mode().IsRegular() || !os.SameFile(fi, fi2) {
 		return nil, fmt.Errorf("%s changed while it was opened", path)
 	}
-	b, err := io.ReadAll(io.LimitReader(f, maxFileSize+1))
+	b, err := io.ReadAll(io.LimitReader(f, max+1))
 	if err != nil {
 		return nil, err
 	}
-	if len(b) > maxFileSize {
+	if int64(len(b)) > max {
 		return nil, fmt.Errorf("%s is too large", path)
 	}
 	return b, nil

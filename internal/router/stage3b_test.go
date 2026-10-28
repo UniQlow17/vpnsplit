@@ -25,10 +25,11 @@ func TestBadAddr(t *testing.T) {
 }
 
 // The servers the OS reports for DNS pass the same filter: the stub of a local
-// resolver, link-local, multicast and the fake-ip range are no provider's.
+// resolver, link-local and multicast are no provider's. The fake-ip range is
+// not judged here (badServer): it describes DNS answers, not servers.
 func TestValidServersUseTheAddressFilter(t *testing.T) {
 	got := validServers([]string{"127.0.0.53", "0.0.0.0", "169.254.1.1", "224.0.0.1", "198.18.0.2", "255.255.255.255", "9.9.9.9", "192.168.1.1"})
-	if strings.Join(got, ",") != "9.9.9.9,192.168.1.1" {
+	if strings.Join(got, ",") != "198.18.0.2,9.9.9.9,192.168.1.1" {
 		t.Errorf("%v", got)
 	}
 }
@@ -229,7 +230,7 @@ func TestProviderDNSOnLink(t *testing.T) {
 // needDNS skips a test on a system where the zones cannot be sent to a server.
 func needDNS(t *testing.T) {
 	t.Helper()
-	if len(resolverPlan("wgcorp", []string{"10.200.0.1"}, []string{"corp.example"})) == 0 {
+	if len(resolverPlan("wgcorp", []string{"10.200.0.1"}, []string{"corp.example"}, nil)) == 0 {
 		t.Skip("this OS cannot send zones to a server here (systemd-resolved)")
 	}
 }

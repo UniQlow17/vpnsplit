@@ -54,6 +54,20 @@ func Prefixes(as string) (nets []string, fetched time.Time, err error) {
 	return nets, time.Now(), nil
 }
 
+// Cached returns the networks of the AS from the cache, of any age, without
+// asking RIPE; ok is false when the cache has none. For diagnostics, which must
+// not wait for the network.
+func Cached(as string) (nets []string, ok bool) {
+	as = strings.ToUpper(as)
+	if !config.ValidAS(as) {
+		return nil, false
+	}
+	cache := map[string]entry{}
+	_ = config.LoadJSON("ripe-cache.json", &cache)
+	e, found := sanitizeCache(cache)[as]
+	return e.Prefixes, found
+}
+
 // sanitizeCache keeps only well-formed answers: the cache is a user-writable
 // file whose networks become routes added with administrator rights.
 func sanitizeCache(in map[string]entry) map[string]entry {

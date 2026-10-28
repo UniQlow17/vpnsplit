@@ -95,6 +95,9 @@ func (m model) statusRows() []string {
 	if m.foreign() {
 		parts = append(parts, sYel.Render(foreignNote))
 	}
+	if d := m.diagIndicator(); d != "" {
+		parts = append(parts, d)
+	}
 	var lines []string
 	for _, l := range wrapLines(joinFit(aw, "  ", parts...), aw) {
 		lines = append(lines, strings.Repeat(" ", textIndent)+l)
