@@ -121,65 +121,45 @@ var helpText = []string{
 		"Для применения и сброса нужны права администратора (Windows) или sudo (Linux, macOS).",
 }
 
-// wrapText breaks s into lines of at most width runes, keeping explicit newlines.
-func wrapText(s string, width int) []string {
-	var lines []string
-	for _, para := range strings.Split(s, "\n") {
-		cur := ""
-		for _, w := range strings.Fields(para) {
-			switch {
-			case cur == "":
-				cur = w
-			case len([]rune(cur))+1+len([]rune(w)) <= width:
-				cur += " " + w
-			default:
-				lines = append(lines, cur)
-				cur = w
-			}
-		}
-		lines = append(lines, cur)
-	}
-	return lines
-}
-
 const tipWidth = 58
 
-// tipLines renders a tip as wrapped lines: hint, admin marker, command.
-func tipLines(t tip) []string {
-	lines := wrapText(t.Hint, tipWidth)
+// tipLines renders a tip as wrapped lines of at most width cells: hint, admin
+// marker, command.
+func tipLines(t tip, width int) []string {
+	lines := wrapLines(t.Hint, width)
 	if t.Admin {
-		lines = append(lines, sYel.Render("● требует прав администратора"))
+		for _, l := range wrapLines("● требует прав администратора", width) {
+			lines = append(lines, sYel.Render(l))
+		}
 	}
 	if t.Cmd != "" {
-		lines = append(lines, sDim.Render("⌨ ")+sGray.Render(t.Cmd))
+		// "> " instead of a keyboard emoji: its width differs between terminals
+		for i, l := range wrapLines("> "+t.Cmd, width) {
+			if rest, ok := strings.CutPrefix(l, "> "); ok && i == 0 {
+				lines = append(lines, sDim.Render("> ")+sGray.Render(rest))
+				continue
+			}
+			lines = append(lines, sGray.Render(l))
+		}
 	}
 	return lines
 }
 
 // panel renders the tip of tips[idx] under a separator, padded to the height of
 // the tallest tip so the layout does not jump while moving the cursor.
-func panel(tips []tip, idx int) string {
+func panel(tips []tip, idx, width int) string {
 	tall := 0
 	for _, t := range tips {
-		n := len(wrapText(t.Hint, tipWidth))
-		if t.Admin {
-			n++
-		}
-		if t.Cmd != "" {
-			n++
-		}
-		if n > tall {
-			tall = n
-		}
+		tall = max(tall, len(tipLines(t, width)))
 	}
 	var lines []string
 	if idx >= 0 && idx < len(tips) {
-		lines = tipLines(tips[idx])
+		lines = tipLines(tips[idx], width)
 	}
 	for len(lines) < tall {
 		lines = append(lines, "")
 	}
-	return "  " + sDim.Render(strings.Repeat("─", tipWidth)) + "\n  " + strings.Join(lines, "\n  ")
+	return "  " + sDim.Render(strings.Repeat("─", width)) + "\n  " + strings.Join(lines, "\n  ")
 }
 
 func menuTips() []tip {

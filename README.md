@@ -111,6 +111,20 @@ make test
 make snapshot   # сборка всех платформ как в релизе (нужен goreleaser)
 ```
 
+Windows без make (PowerShell, нужен только Go):
+
+```
+.\build.ps1                      # сборка vpnsplit.exe
+.\build.ps1 test                 # тесты (также: vet, fmt)
+.\build.ps1 build -Version 1.2.0 # сборка с указанной версией
+.\build.ps1 clean                # удалить артефакты сборки
+```
+
+Цель snapshot через build.ps1 не поддерживается: используйте `goreleaser release --snapshot --clean`.
+
+Если запуск скриптов заблокирован политикой выполнения:
+`powershell -ExecutionPolicy Bypass -File .\build.ps1`.
+
 Структура:
 
 ```
