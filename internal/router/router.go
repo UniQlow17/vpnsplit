@@ -81,79 +81,25 @@ func Sync(cfg *config.Config, e Env, st *config.State) (apply, reset bool) {
 	return Sig(cfg, e) != st.Sig, false
 }
 
-// Reset removes every route and DNS file recorded in the journal. Entries
-// that could not be removed stay in the journal for the next try.
-// It needs no config, so it works even if config.json is broken or missing.
-func Reset() (removed int, errs []error) {
-	st, _, status := config.LoadStateStatus()
-	switch status {
-	case config.JournalDenied:
-		return 0, []error{fmt.Errorf("the journal of routes is available to administrators only: %s", PrivHint)}
-	case config.JournalUnreadable:
-		// what to remove is unknown, and the journal must not be overwritten
-		return 0, []error{errors.New("the journal of routes cannot be read, nothing was changed (see the warnings of `vpnsplit status`)")}
-	}
-	return reset(st, resetOps{delRoute: delRoute, delResolver: delResolver, flushDNS: flushDNS, save: config.SaveState})
-}
-
-// resetOps are the operations reset performs; tests replace them.
-type resetOps struct {
-	delRoute    func(config.Route) error
-	delResolver func(string) error
-	flushDNS    func()
-	save        func(*config.State) error
-}
-
-func reset(st *config.State, ops resetOps) (removed int, errs []error) {
-	keep := &config.State{}
-	for _, r := range st.Routes {
-		err := config.ValidateRoute(r)
-		if err == nil {
-			err = ops.delRoute(r)
-		}
-		if err != nil {
-			errs = append(errs, err)
-			keep.Routes = append(keep.Routes, r)
-			continue
-		}
-		removed++
-	}
-	for _, p := range st.Resolvers {
-		var err error
-		if !config.ValidResolverEntry(p) {
-			err = fmt.Errorf("invalid DNS entry %q", p)
-		} else {
-			err = ops.delResolver(p)
-		}
-		if err != nil {
-			errs = append(errs, err)
-			keep.Resolvers = append(keep.Resolvers, p)
-			continue
-		}
-		removed++
-	}
-	if len(st.Resolvers) > 0 {
-		ops.flushDNS()
-	}
-	if !st.Empty() {
-		if err := ops.save(keep); err != nil {
-			errs = append(errs, fmt.Errorf("journal not updated, entries removed above may be listed again: %w", err))
-		}
-	}
-	return
-}
-
 // Apply sends corp rules through the corp VPN, direct rules past every VPN,
 // and, if configured, everything else through the home VPN. Whatever is not
-// connected is skipped. Progress goes to w.
-func Apply(cfg *config.Config, w io.Writer) error {
+// connected is skipped. Progress goes to w. The Manager must own the journal
+// (see Acquire).
+func (m *Manager) Apply(cfg *config.Config, w io.Writer) error {
+	if err := m.requireOwner(); err != nil {
+		return err
+	}
+	if err := m.begin(); err != nil {
+		return err
+	}
+	defer m.unlockSem()
 	e := Detect(cfg)
 	if !e.Any() {
 		return fmt.Errorf("no VPN is connected: connect the corporate and/or home VPN first")
 	}
-	if n, errs := Reset(); len(errs) > 0 {
+	if rep, errs := m.resetLocked(m.ctx); len(errs) > 0 {
 		return fmt.Errorf("could not clear previous routes: %v", errs[0])
-	} else if n > 0 {
+	} else if n := rep.Total(); n > 0 {
 		fmt.Fprintf(w, "cleared %d previous entries\n", n)
 	}
 	show := func(role, sel string, ok bool, i netif.Info) {
@@ -175,31 +121,34 @@ func Apply(cfg *config.Config, w io.Writer) error {
 	// what was really created stays, so reset never removes routes that the
 	// VPN clients set up themselves
 	st := &config.State{Sig: Sig(cfg, e)}
-	if err := config.SaveState(st); err != nil {
+	if err := m.save(st); err != nil {
 		return err
 	}
 	added, kept, failed := 0, 0, 0
 	add := func(r config.Route) {
+		if m.ctx.Err() != nil {
+			return // the program is exiting: Cleanup removes what is already in the journal
+		}
 		if err := config.ValidateRoute(r); err != nil {
 			failed++
 			fmt.Fprintf(w, "  ! %s: %v\n", r.Dest, err)
 			return
 		}
 		st.Routes = append(st.Routes, r)
-		if err := config.SaveState(st); err != nil {
+		if err := m.save(st); err != nil {
 			fmt.Fprintf(w, "  ! journal: %v\n", err)
 			failed++
 			st.Routes = st.Routes[:len(st.Routes)-1]
 			return
 		}
-		err := addRoute(r)
+		err := m.b.AddRoute(r)
 		if err == nil {
 			added++
 			fmt.Fprintf(w, "  + %-18s -> %-6s %s\n", r.Dest, r.Via, r.Iface)
 			return
 		}
 		st.Routes = st.Routes[:len(st.Routes)-1]
-		_ = config.SaveState(st)
+		_ = m.save(st) // best effort: the entry stays listed, which is harmless for the removal
 		if errors.Is(err, errExists) {
 			kept++
 			fmt.Fprintf(w, "  = %-18s already routed by the system or a VPN client, left as is\n", r.Dest)
@@ -227,12 +176,12 @@ func Apply(cfg *config.Config, w io.Writer) error {
 		}
 		if len(cfg.Domains) > 0 {
 			fmt.Fprintln(w, "resolving corp domains...")
-			for _, ip := range resolveDomains(cfg.Domains, first(servers), w) {
+			for _, ip := range resolveDomains(m.ctx, cfg.Domains, first(servers), w) {
 				corp(ip)
 			}
 		}
 		if cfg.SplitDNS && len(servers) > 0 {
-			splitDNS(st, e.Corp.Name, servers, append(zones, cfg.Domains...), cfg.DirectDomains, w)
+			m.splitDNS(st, e.Corp.Name, servers, append(zones, cfg.Domains...), cfg.DirectDomains, w)
 		}
 	}
 	if e.GWOK {
@@ -244,7 +193,7 @@ func Apply(cfg *config.Config, w io.Writer) error {
 		}
 		if len(cfg.DirectDomains) > 0 {
 			fmt.Fprintln(w, "resolving direct domains...")
-			for _, ip := range resolveDomains(cfg.DirectDomains, "", w) {
+			for _, ip := range resolveDomains(m.ctx, cfg.DirectDomains, "", w) {
 				direct(ip)
 			}
 		}
@@ -263,7 +212,7 @@ func Apply(cfg *config.Config, w io.Writer) error {
 // working when the home VPN replaces the system DNS (BlancVPN does). How is
 // up to the OS (dns_<os>.go): resolverPlan lists the entries to create, each
 // is journaled before it is created, like routes.
-func splitDNS(st *config.State, iface string, servers, zones, skip []string, w io.Writer) {
+func (m *Manager) splitDNS(st *config.State, iface string, servers, zones, skip []string, w io.Writer) {
 	var clean []string
 	done := map[string]bool{}
 	for _, s := range skip {
@@ -278,21 +227,24 @@ func splitDNS(st *config.State, iface string, servers, zones, skip []string, w i
 	}
 	plan := resolverPlan(iface, servers, clean)
 	for _, id := range plan {
+		if m.ctx.Err() != nil {
+			return
+		}
 		st.Resolvers = append(st.Resolvers, id)
-		if err := config.SaveState(st); err != nil {
+		if err := m.save(st); err != nil {
 			fmt.Fprintf(w, "  ! journal: %v\n", err)
 			return
 		}
-		if err := addResolver(id, servers); err != nil {
+		if err := m.b.AddResolver(id, servers); err != nil {
 			st.Resolvers = st.Resolvers[:len(st.Resolvers)-1]
-			_ = config.SaveState(st)
+			_ = m.save(st)
 			fmt.Fprintf(w, "  = %s: %v\n", id, err)
 			continue
 		}
 		fmt.Fprintf(w, "  + %-18s -> corp DNS\n", id)
 	}
 	if len(plan) > 0 {
-		flushDNS()
+		m.b.FlushDNS()
 	}
 }
 
@@ -362,7 +314,7 @@ func parseDefaultGW(out string) (Gateway, bool) {
 	return Gateway{}, false
 }
 
-func resolveDomains(domains []string, dns string, w io.Writer) []string {
+func resolveDomains(parent context.Context, domains []string, dns string, w io.Writer) []string {
 	res := net.DefaultResolver
 	if dns != "" {
 		res = &net.Resolver{PreferGo: true, Dial: func(ctx context.Context, _, _ string) (net.Conn, error) {
@@ -372,7 +324,7 @@ func resolveDomains(domains []string, dns string, w io.Writer) []string {
 	}
 	var cidrs []string
 	for _, d := range domains {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		ctx, cancel := context.WithTimeout(parent, 5*time.Second)
 		ips, err := res.LookupIP(ctx, "ip4", d)
 		cancel()
 		if err != nil {

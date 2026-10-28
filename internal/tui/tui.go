@@ -50,40 +50,45 @@ type (
 		err   error
 		quiet bool
 	}
+	// tookOver is the answer of the [t] key: the routes of apply/watch are the session's now.
+	tookOver struct{ err error }
 )
 
 type model struct {
-	sc         screen
-	cursor     int
-	frame      int
-	cfg        *config.Config
-	env        router.Env
-	needApply  bool
-	needReset  bool
-	routes     int
-	st         *config.State
-	warns      []string
-	warnShown  string // the warnings already flashed, to flash a new set only
-	journal    config.JournalStatus
-	delAsk     bool // rules: waiting for "delete this rule?" answer
-	scroll     int  // status screen
-	admin      bool
-	auto       bool
-	autoWait   int
-	busy       string
-	quiet      bool
-	resTitle   string
-	resText    string
-	resErr     bool
-	ifs        []netif.Info
-	pickStep   int
-	input      textinput.Model
-	inputting  bool
-	purpose    string
-	flash      string
-	flashAt    int
-	spin       spinner.Model
-	refreshing bool
+	sc          screen
+	cursor      int
+	frame       int
+	cfg         *config.Config
+	env         router.Env
+	needApply   bool
+	needReset   bool
+	routes      int
+	st          *config.State
+	warns       []string
+	warnShown   string // the warnings already flashed, to flash a new set only
+	journal     config.JournalStatus
+	delAsk      bool // rules: waiting for "delete this rule?" answer
+	scroll      int  // status screen
+	admin       bool
+	mgr         *router.Manager // owns the journal; nil without administrator rights and in tests
+	readOnly    string          // why this copy may not change the network (no rights, or another copy owns it); "" if it may
+	lastSession string          // how the previous session ended (from a file), shown on the status screen
+	auto        bool
+	autoWait    int
+	busy        string
+	quiet       bool
+	resTitle    string
+	resText     string
+	resErr      bool
+	ifs         []netif.Info
+	pickStep    int
+	input       textinput.Model
+	inputting   bool
+	purpose     string
+	flash       string
+	flashAt     int
+	spin        spinner.Model
+	refreshing  bool
 
 	width, height int // terminal size from tea.WindowSizeMsg; 0 until known
 	prompt        string
@@ -151,17 +156,6 @@ func newInput() textinput.Model {
 	return ti
 }
 
-// Run starts the interactive menu.
-func Run() error {
-	sp := spinner.New(spinner.WithSpinner(spinner.Dot))
-	sp.Style = lipgloss.NewStyle().Foreground(cCyan)
-	admin := router.IsPrivileged()
-	// with rights, keep routes in sync from the start: nothing to think about
-	m := model{admin: admin, auto: admin, input: newInput(), spin: sp, streamPaste: streamPasteDefault, now: time.Now}
-	_, err := tea.NewProgram(m, tea.WithAltScreen()).Run()
-	return err
-}
-
 func tick() tea.Cmd {
 	return tea.Tick(100*time.Millisecond, func(t time.Time) tea.Msg { return tickMsg(t) })
 }
@@ -170,6 +164,9 @@ func refreshCmd() tea.Cmd {
 	return func() tea.Msg {
 		st, warns, journal := config.LoadStateStatus()
 		s := statusMsg{routes: len(st.Routes), st: st, warns: warns, journal: journal}
+		if w := deadSessionDNSWarning(st); w != "" {
+			s.warns = append(s.warns, w)
+		}
 		if cfg, cwarns, err := config.LoadChecked(); err == nil {
 			s.cfg = cfg
 			s.warns = append(s.warns, cwarns...)
@@ -200,22 +197,43 @@ func (m *model) startApply(quiet bool) tea.Cmd {
 		m.setFlash("Конфиг повреждён: исправьте или удалите его (vpnsplit reset --purge)")
 		return nil
 	}
+	if m.readOnly != "" || m.mgr == nil {
+		m.setFlash(m.notOwner())
+		return nil
+	}
 	m.busy, m.quiet = "Применяю маршруты", quiet
 	if !quiet {
 		m.sc = scBusy
 	}
-	cfg := m.cfg
-	return opCmd("Применение маршрутов", quiet, func(w io.Writer) error { return router.Apply(cfg, w) })
+	cfg, mgr := m.cfg, m.mgr
+	return opCmd("Применение маршрутов", quiet, func(w io.Writer) error { return mgr.Apply(cfg, w) })
+}
+
+// notOwner is why this copy may not change the network.
+func (m *model) notOwner() string {
+	if m.readOnly != "" {
+		return m.readOnly
+	}
+	return "Нужны права администратора: " + router.PrivHint
 }
 
 func (m *model) startReset(quiet bool) tea.Cmd {
+	if m.readOnly != "" || m.mgr == nil {
+		m.setFlash(m.notOwner())
+		m.sc = scMenu
+		return nil
+	}
 	m.busy, m.quiet = "Сбрасываю маршруты", quiet
 	if !quiet {
 		m.sc = scBusy
 	}
+	mgr := m.mgr
 	return opCmd("Сброс", quiet, func(w io.Writer) error {
-		n, errs := router.Reset()
-		fmt.Fprintf(w, "Удалено маршрутов: %d\n", n)
+		rep, errs := mgr.ResetReport()
+		fmt.Fprintf(w, "Удалено маршрутов: %d\n", rep.Total())
+		if n := rep.Notice(true); n != "" {
+			fmt.Fprintln(w, n)
+		}
 		for _, e := range errs {
 			fmt.Fprintln(w, "  !", e)
 		}
@@ -225,6 +243,18 @@ func (m *model) startReset(quiet bool) tea.Cmd {
 		fmt.Fprintln(w, "Маршрутизация вернулась к исходной.")
 		return nil
 	})
+}
+
+// foreign reports whether the routes of apply/watch wait for the user to take them (the [t] key).
+func (m model) foreign() bool { return m.mgr != nil && m.mgr.Foreign() }
+
+// deadSessionDNSWarning is the warning about DNS rules a dead session left:
+// they survive reboots and capture the DNS queries of their zones.
+func deadSessionDNSWarning(st *config.State) string {
+	if st.Mode != config.ModeSession || st.Owner == nil || len(st.Resolvers) == 0 || router.OwnerRunning(*st.Owner) {
+		return ""
+	}
+	return "остались DNS-правила прошлого сеанса, запустите vpnsplit с правами администратора для очистки"
 }
 
 func (m *model) setFlash(s string) { m.flash, m.flashAt = s, m.frame+40 }
@@ -271,7 +301,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.needApply, m.needReset = msg.apply, msg.reset
 		m.warns, m.journal = msg.warns, msg.journal
 		m.flashWarnings()
-		if m.auto && m.busy == "" && m.cfg != nil && m.admin && m.frame >= m.autoWait {
+		if m.auto && m.busy == "" && m.cfg != nil && m.admin && !m.foreign() && m.frame >= m.autoWait {
 			if m.needApply {
 				m.autoWait = m.frame + 100
 				return m, m.startApply(true)
@@ -282,6 +312,16 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 		return m, nil
+
+	case tookOver:
+		if msg.err != nil {
+			m.setFlash("Не удалось забрать маршруты: " + msg.err.Error())
+			return m, nil
+		}
+		m.auto, m.autoWait = true, 0
+		m.setFlash("Маршруты забраны в сессию: при выходе будут сняты")
+		m.refreshing = true
+		return m, refreshCmd()
 
 	case opDone:
 		m.busy = ""
@@ -379,6 +419,12 @@ func (m model) updateKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		switch k {
 		case "q":
 			return m, tea.Quit
+		case "t":
+			if !m.foreign() {
+				return m, nil
+			}
+			mgr := m.mgr
+			return m, func() tea.Msg { return tookOver{err: mgr.TakeOver()} }
 		case "enter", " ":
 			switch m.cursor {
 			case itemApply:
@@ -404,6 +450,10 @@ func (m model) updateKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			case itemAuto:
 				if !m.admin {
 					m.setFlash("Авто-режим требует прав администратора: " + router.PrivHint)
+					return m, nil
+				}
+				if m.readOnly != "" {
+					m.setFlash(m.readOnly)
 					return m, nil
 				}
 				m.auto = !m.auto
@@ -637,6 +687,11 @@ func (m model) statusLines() []string {
 	}
 	if m.needApply && !st.Empty() {
 		out = append(out, "", sYel.Render("VPN или правила изменились после применения — нужно применить заново"))
+	}
+	if m.lastSession != "" {
+		out = append(out, "")
+		h("Последний сеанс")
+		line("  %s", sGray.Render(m.lastSession))
 	}
 	if len(m.warns) > 0 {
 		out = append(out, "")
