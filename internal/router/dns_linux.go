@@ -80,39 +80,70 @@ func resolvectlGet(what, iface string) ([]string, error) {
 	return parseResolvectl(string(out)), nil
 }
 
+// resolversLostOnReboot: the settings that resolvectl makes live in the memory
+// of systemd-resolved only, until the computer is restarted or the link is made
+// again. (An NRPT rule or a file in /etc/resolver stays.)
+func (osBackend) resolversLostOnReboot() bool { return true }
+
+// resolverLink finds the link of a journal entry and tells whether the entry can
+// still be ours there: an entry with an index is not, when the link is gone or
+// was made again (resolved forgot its settings, and what is there now was set by
+// somebody else). ours false carries why.
+func resolverLink(r config.LinuxResolver) (ours bool, why string, err error) {
+	idx, found, err := ifaceByName(r.Link)
+	if err != nil {
+		return false, "", err
+	}
+	switch {
+	case !found && r.Index == 0:
+		return false, "the link is gone", nil
+	case !found:
+		return false, fmt.Sprintf("the link %s is gone", r.Link), nil
+	case r.Index != 0 && idx != r.Index:
+		return false, fmt.Sprintf("the link %s was made again (index %d, now %d)", r.Link, r.Index, idx), nil
+	}
+	return true, "", nil
+}
+
 // MissingResolvers lists the journal entries that systemd-resolved no longer
-// has on their link (the link was recreated, or somebody reset it). An error
-// means it could not be asked.
+// has on their link (somebody reset it). An entry on a link that is gone or
+// was made again, or a "dns" entry whose servers were changed, is not listed:
+// it is not ours any more, and is not made again under the name of the old one.
+// An error means it could not be asked.
 func (osBackend) MissingResolvers(ids []string) ([]string, error) {
 	var missing []string
 	for _, id := range ids {
-		f := strings.Fields(id)
-		if len(f) < 2 {
+		r, ok := config.ParseLinuxResolver(id)
+		if !ok {
 			continue
 		}
-		if _, found, err := ifaceByName(f[1]); err != nil {
+		ours, _, err := resolverLink(r)
+		if err != nil {
 			return nil, err
-		} else if !found {
-			missing = append(missing, id)
+		}
+		if !ours {
+			if r.Index == 0 {
+				missing = append(missing, id) // the old format: the link is gone, so the entry is
+			}
 			continue
 		}
-		switch {
-		case len(f) == 2 && f[0] == "dns":
-			l, err := resolvectlGet("dns", f[1])
+		switch r.Kind {
+		case "dns":
+			l, err := resolvectlGet("dns", r.Link)
 			if err != nil {
 				return nil, err
 			}
 			if len(l) == 0 {
 				missing = append(missing, id)
 			}
-		case len(f) == 3 && f[0] == "domain":
-			l, err := resolvectlGet("domain", f[1])
+		case "domain":
+			l, err := resolvectlGet("domain", r.Link)
 			if err != nil {
 				return nil, err
 			}
 			has := false
 			for _, d := range l {
-				has = has || d == "~"+f[2]
+				has = has || d == "~"+r.Zone
 			}
 			if !has {
 				missing = append(missing, id)
@@ -124,17 +155,28 @@ func (osBackend) MissingResolvers(ids []string) ([]string, error) {
 
 // resolverPlan: systemd-resolved sends a zone to a link's DNS when the link
 // has it as a routing domain ("~corp.example"). The journal holds
-// "domain <link> <zone>", plus "dns <link>" if the link had no DNS servers.
-func resolverPlan(iface string, _, zones []string) []string {
+// "domain <link> <zone> <ifindex>", plus "dns <link> <ifindex> <servers>" if the
+// link had no DNS servers. When the link or its settings cannot be read nothing
+// is planned for it: not knowing whether it has DNS servers is no reason to set
+// or to clear any.
+func resolverPlan(iface string, servers, zones []string) []string {
 	if len(zones) == 0 || !hasResolved() {
 		return nil
 	}
+	idx, found, err := ifaceByName(iface)
+	if err != nil || !found {
+		return nil
+	}
+	cur, err := resolvectlGet("dns", iface)
+	if err != nil {
+		return nil
+	}
 	var ids []string
-	if len(resolvectlList("dns", iface)) == 0 {
-		ids = append(ids, "dns "+iface)
+	if srv := validServers(servers); len(cur) == 0 && len(srv) > 0 {
+		ids = append(ids, config.FormatLinuxResolver(iface, idx, "", srv))
 	}
 	for _, z := range zones {
-		ids = append(ids, "domain "+iface+" "+z)
+		ids = append(ids, config.FormatLinuxResolver(iface, idx, z, nil))
 	}
 	return ids
 }
@@ -147,57 +189,96 @@ var resolvedMu sync.Mutex
 func addResolver(id string, servers []string) error {
 	resolvedMu.Lock()
 	defer resolvedMu.Unlock()
-	if !config.ValidResolverEntry(id) {
+	r, ok := config.ParseLinuxResolver(id)
+	if !ok {
 		return fmt.Errorf("invalid DNS entry %q", id)
 	}
 	if err := config.ValidateServers(servers); err != nil {
 		return err
 	}
-	f := strings.Fields(id)
+	if ours, why, err := resolverLink(r); err != nil {
+		return err
+	} else if !ours {
+		return fmt.Errorf("DNS entry %q: %s", id, why)
+	}
 	switch {
-	case len(f) == 2 && f[0] == "dns":
-		return resolvectl(append([]string{"dns", f[1]}, servers...)...)
-	case len(f) == 3 && f[0] == "domain":
-		cur := resolvectlList("domain", f[1])
+	case r.Kind == "dns" && r.Index != 0:
+		return resolvectl(append([]string{"dns", r.Link}, r.Servers...)...)
+	case r.Kind == "dns":
+		return resolvectl(append([]string{"dns", r.Link}, servers...)...)
+	case r.Kind == "domain":
+		cur, err := resolvectlGet("domain", r.Link)
+		if err != nil {
+			return fmt.Errorf("cannot read the domains of %s, nothing changed: %w", r.Link, err)
+		}
 		for _, d := range cur {
-			if strings.TrimPrefix(d, "~") == f[2] {
-				return fmt.Errorf("%w: already set up on %s, left as is", errResolverExists, f[1])
+			if strings.TrimPrefix(d, "~") == r.Zone {
+				return fmt.Errorf("%w: already set up on %s, left as is", errResolverExists, r.Link)
 			}
 		}
-		return resolvectl(append([]string{"domain", f[1]}, append(cur, "~"+f[2])...)...)
+		return resolvectl(append([]string{"domain", r.Link}, append(cur, "~"+r.Zone)...)...)
 	}
 	return fmt.Errorf("unknown DNS entry %q", id)
 }
 
+// delResolver takes the entry away, if it is ours: on the same link (the index
+// is the one in the journal), and for "dns" with the servers that were set. What
+// cannot be told (resolvectl does not answer) is an error, and the entry stays in
+// the journal; what is not ours is errNotOurs.
 func delResolver(id string) error {
 	resolvedMu.Lock()
 	defer resolvedMu.Unlock()
-	if !config.ValidResolverEntry(id) {
+	r, ok := config.ParseLinuxResolver(id)
+	if !ok {
 		return fmt.Errorf("invalid DNS entry %q", id)
 	}
-	f := strings.Fields(id)
-	if len(f) < 2 {
-		return nil
-	}
-	if _, found, err := ifaceByName(f[1]); err != nil {
+	ours, why, err := resolverLink(r)
+	if err != nil {
 		return err
-	} else if !found {
-		return nil // the link is gone and took its DNS settings with it
 	}
-	switch {
-	case len(f) == 2 && f[0] == "dns":
-		return resolvectl("dns", f[1], "")
-	case len(f) == 3 && f[0] == "domain":
+	if !ours {
+		if r.Index == 0 {
+			return nil // the link is gone and took its DNS settings with it
+		}
+		return fmt.Errorf("%w: %s", errNotOurs, why)
+	}
+	switch r.Kind {
+	case "dns":
+		if r.Index == 0 {
+			return resolvectl("dns", r.Link, "")
+		}
+		cur, err := resolvectlGet("dns", r.Link)
+		if err != nil {
+			return fmt.Errorf("cannot read the DNS servers of %s, left as they are: %w", r.Link, err)
+		}
+		switch {
+		case len(cur) == 0:
+			return nil // already gone
+		case !sameSet(cur, r.Servers):
+			return fmt.Errorf("%w: the DNS servers of %s are not the ones that were set (%s)", errNotOurs, r.Link, strings.Join(cur, ","))
+		}
+		return resolvectl("dns", r.Link, "")
+	case "domain":
+		cur, err := resolvectlGet("domain", r.Link)
+		if err != nil {
+			return fmt.Errorf("cannot read the domains of %s, left as they are: %w", r.Link, err)
+		}
 		var keep []string
-		for _, d := range resolvectlList("domain", f[1]) {
-			if d != "~"+f[2] {
-				keep = append(keep, d)
+		found := false
+		for _, d := range cur {
+			if d == "~"+r.Zone {
+				found = true
+				continue
 			}
+			keep = append(keep, d)
+		}
+		if !found {
+			return nil // already gone
 		}
 		if len(keep) == 0 {
 			keep = []string{""}
 		}
-		return resolvectl(append([]string{"domain", f[1]}, keep...)...)
+		return resolvectl(append([]string{"domain", r.Link}, keep...)...)
 	}
 	return nil
 }

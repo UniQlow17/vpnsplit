@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"unicode/utf16"
 )
@@ -175,19 +176,82 @@ func validResolverEntry(goos, id string) bool {
 	case "darwin": // /etc/resolver/<zone>
 		zone := filepath.Base(id)
 		return id == "/etc/resolver/"+zone && ValidZone(zone)
-	default: // "dns <link>" or "domain <link> <zone>"
-		f := strings.Fields(id)
-		if strings.Join(f, " ") != id {
-			return false
-		}
-		switch {
-		case len(f) == 2 && f[0] == "dns":
-			return ValidIface(f[1])
-		case len(f) == 3 && f[0] == "domain":
-			return ValidIface(f[1]) && (ValidZone(f[2]) || f[2] == ".") // "." is the routing domain "~." of everything else
-		}
-		return false
+	default: // Linux, see ParseLinuxResolver
+		_, ok := ParseLinuxResolver(id)
+		return ok
 	}
+}
+
+// LinuxResolver is a DNS journal entry of systemd-resolved, see ParseLinuxResolver.
+type LinuxResolver struct {
+	Kind    string   // "dns" or "domain"
+	Link    string   // the link
+	Index   int      // the index of the link when the entry was made; 0 in the old format, which has none
+	Zone    string   // "domain": the zone, "." for everything else
+	Servers []string // "dns": the servers that were set
+}
+
+// ParseLinuxResolver reads a journal entry of systemd-resolved. The formats:
+//
+//	dns <link> <ifindex> <server>[,<server>...]
+//	domain <link> <zone> <ifindex>
+//	dns <link>, domain <link> <zone>   (old: no index, not trusted after a
+//	                                    restart of the computer)
+//
+// The index and the servers tell the entry apart from the settings that
+// somebody else made later under the same name: resolved forgets the settings of
+// a gone link, and a link that is made again has another index.
+func ParseLinuxResolver(id string) (LinuxResolver, bool) {
+	f := strings.Fields(id)
+	if len(f) < 2 || strings.Join(f, " ") != id || !ValidIface(f[1]) {
+		return LinuxResolver{}, false
+	}
+	r := LinuxResolver{Kind: f[0], Link: f[1]}
+	var ok bool
+	switch {
+	case len(f) == 2 && f[0] == "dns":
+		return r, true
+	case len(f) == 4 && f[0] == "dns":
+		if r.Index, ok = parseIfIndex(f[2]); !ok {
+			return LinuxResolver{}, false
+		}
+		for _, s := range strings.Split(f[3], ",") {
+			if _, err := ParseIPv4(s); err != nil {
+				return LinuxResolver{}, false
+			}
+			r.Servers = append(r.Servers, s)
+		}
+		return r, true
+	case len(f) == 3 && f[0] == "domain" && validLinuxZone(f[2]):
+		r.Zone = f[2]
+		return r, true
+	case len(f) == 4 && f[0] == "domain" && validLinuxZone(f[2]):
+		if r.Index, ok = parseIfIndex(f[3]); !ok {
+			return LinuxResolver{}, false
+		}
+		r.Zone = f[2]
+		return r, true
+	}
+	return LinuxResolver{}, false
+}
+
+func validLinuxZone(z string) bool { return ValidZone(z) || z == "." } // "." is the routing domain "~." of everything else
+
+func parseIfIndex(s string) (int, bool) {
+	n, err := strconv.Atoi(s)
+	if err != nil || n < 1 || n > 1<<30 || strconv.Itoa(n) != s {
+		return 0, false
+	}
+	return n, true
+}
+
+// FormatLinuxResolver makes the journal entry for "dns" (zone empty) or
+// "domain" (zone set) of a link.
+func FormatLinuxResolver(link string, index int, zone string, servers []string) string {
+	if zone == "" {
+		return fmt.Sprintf("dns %s %d %s", link, index, strings.Join(servers, ","))
+	}
+	return fmt.Sprintf("domain %s %s %d", link, zone, index)
 }
 
 // Sanitize drops every journal entry that could not have been written by this

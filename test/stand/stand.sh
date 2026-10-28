@@ -953,7 +953,7 @@ s_dns_rest() {
   check "the journal lists the entry for the rest" grep -q 'domain wghome \.' /var/lib/vpnsplit/state.json
   : > "$WORK/resolved/wghome.domain" # the network manager rewrites the link
   check "the domain was put back by the loop (<= 45 s)" wait_for 45 has_dom wghome "~."
-  check "the journal lists the entry once" test "$(tr ',' '\n' < /var/lib/vpnsplit/state.json | grep -c '^ *"domain wghome \.\"')" = 1
+  check "the journal lists the entry once" test "$(tr ',' '\n' < /var/lib/vpnsplit/state.json | grep -c '^ *"domain wghome \. [0-9]*"')" = 1
   kill -TERM "$RPID"
   reap
   check "exit code 0 (got $RCODE)" test "$RCODE" = 0
@@ -1141,8 +1141,8 @@ s_dns_foreign() {
   echo "~." > "$WORK/resolved/wghome.domain"
   start_run s25 run
   check "routes applied" wait_for 20 applied
-  check "the report says the entry was there already" grep -q "= domain wghome \.: " "$RLOG"
-  check "the journal does not list the entry as ours" bash -c "! grep -E '^ +\"domain wghome \.\",?$' /var/lib/vpnsplit/state.json"
+  check "the report says the entry was there already" grep -q "= domain wghome \. [0-9]*: " "$RLOG"
+  check "the journal does not list the entry as ours" bash -c "! grep -E '^ +\"domain wghome \. [0-9]+\",?$' /var/lib/vpnsplit/state.json"
   check "the corp zone is set up as usual" has_dom wgcorp "~corp.example"
   local f1 f2 n1 n2 w1 w2
   f1=$(grep -c flush "$WORK/resolved/calls.log")
@@ -1200,6 +1200,49 @@ s_ipv6_v4only() {
   check "the routing table equals the snapshot" base_state
 }
 
+# S27: resolvectl does not answer when asked (a timeout, resolved restarting): that is not "the link has no DNS
+# servers" and not "the link has no such domain". Nothing is planned for the links, nothing is written; and when
+# the answer is missing at the end, the entries stay in the journal and the domains stay as they are, until
+# `reset` is able to ask.
+s_dns_readfail() {
+  CUR=S27
+  say "S27: resolvectl fails when read: no DNS entries are made, the domains of the links are not wiped"
+  fresh
+  fake_resolved_on
+  echo "existing.local" > "$WORK/resolved/eth0.domain"
+  touch "$WORK/resolved/fail"
+  start_run s27 run
+  check "routes applied" wait_for 20 applied
+  check "resolvectl was never asked to change anything" bash -c "! grep -q -E '^(dns|domain) ' $WORK/resolved/calls.log 2>/dev/null"
+  check "the domains of eth0 are as they were" test "$(rdomain eth0)" = existing.local
+  check "the DNS servers of eth0 are as they were" test "$(rdns eth0)" = 1.1.1.1
+  check "the journal has no DNS entry" bash -c "! grep -q -E '\"(dns|domain) ' /var/lib/vpnsplit/state.json"
+  kill -TERM "$RPID"
+  reap
+  check "exit code 0 (got $RCODE)" test "$RCODE" = 0
+  check "the domains of eth0 are still as they were" test "$(rdomain eth0)" = existing.local
+  check "the routing table equals the snapshot" base_state
+  rm -f "$WORK/resolved/fail"
+  : > "$WORK/resolved/eth0.domain"
+
+  say "S27b: the entries are made, then resolvectl stops answering: the end leaves them and the journal keeps them"
+  start_run s27b run
+  check "routes applied" wait_for 20 applied
+  check "the corp zone is on the corp link" has_dom wgcorp "~corp.example"
+  touch "$WORK/resolved/fail"
+  kill -TERM "$RPID"
+  reap
+  check "the corp zone is left on the corp link (not asked, not touched)" has_dom wgcorp "~corp.example"
+  check "the journal keeps the entry" grep -q 'domain wgcorp corp.example' /var/lib/vpnsplit/state.json
+  rm -f "$WORK/resolved/fail"
+  vs reset >/dev/null 2>&1
+  check "reset removed the entry once resolvectl answers" bash -c "! grep -q 'domain wgcorp' /var/lib/vpnsplit/state.json"
+  check "the DNS of the links is as before" resolved_base
+  check "the routing table equals the snapshot" base_state
+  fake_resolved_off
+  show_log
+}
+
 # --------------------------------------------------------------------- main
 say "setting up the network (home VPN variant: $VARIANT)"
 setup
@@ -1233,6 +1276,7 @@ want S23 && s_rest_keep
 want S24 && s_dns_overlap
 want S25 && s_dns_foreign
 want S26 && s_ipv6_v4only
+want S27 && s_dns_readfail
 
 say "result: $PASS ok, $FAIL failed"
 for f in "${FAILED[@]+"${FAILED[@]}"}"; do echo "  FAIL $f"; done

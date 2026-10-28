@@ -182,8 +182,8 @@ type Report struct {
 	Routes, Resolvers int
 	Rules             int
 	Tun6              bool      // the settings of the automatic IPv6 tunnels (Windows) were put back
-	Forgotten         int       // journal routes dropped without removal: gone with a reboot
-	Left              []string  // journal routes found in the table but not removed because they are not ours (or may not be); dropped from the journal
+	Forgotten         int       // journal routes (and DNS entries of systemd-resolved) dropped without removal: gone with a reboot
+	Left              []string  // journal routes and DNS entries found in the table but not removed because they are not ours (or may not be); dropped from the journal
 	FullTunnel        bool      // 0.0.0.0/1 and 128.0.0.0/1 of the home VPN were removed
 	Base              *Baseline // the system compared with the state before the start; nil: not done
 }
@@ -212,7 +212,7 @@ func (r Report) Describe(ru bool) string {
 			s += "; полный туннель 0/1+128/1 снят"
 		}
 		if r.Forgotten > 0 {
-			s += fmt.Sprintf("; после перезагрузки забыто маршрутов: %d", r.Forgotten)
+			s += fmt.Sprintf("; после перезагрузки забыто записей (маршруты, DNS): %d", r.Forgotten)
 		}
 		if len(r.Left) > 0 {
 			s += fmt.Sprintf("; оставлено (не похоже на наше): %d (%s)", len(r.Left), leftList(r.Left))
@@ -230,7 +230,7 @@ func (r Report) Describe(ru bool) string {
 		s += "; full tunnel 0/1+128/1 removed"
 	}
 	if r.Forgotten > 0 {
-		s += fmt.Sprintf("; routes forgotten after a reboot: %d", r.Forgotten)
+		s += fmt.Sprintf("; entries (routes, DNS) forgotten after a reboot: %d", r.Forgotten)
 	}
 	if len(r.Left) > 0 {
 		s += fmt.Sprintf("; left (do not look like ours): %d (%s)", len(r.Left), leftList(r.Left))
@@ -479,8 +479,9 @@ func (m *Manager) TakeOver() error {
 //
 //   - computer restarted since (boot id differs): routes are gone with the
 //     reboot and are forgotten, never removed (the table may hold a route of a
-//     VPN client to the same place); DNS entries survive a reboot and are
-//     removed. With SetForce everything is removed instead;
+//     VPN client to the same place); DNS entries that survive a reboot (NRPT,
+//     /etc/resolver) are removed, the settings of systemd-resolved are
+//     forgotten like the routes. With SetForce everything is removed instead;
 //   - session journal: everything is removed, DNS first;
 //   - persistent journal (and one written by an older version): left alone.
 //
@@ -501,11 +502,18 @@ func (m *Manager) recover(ctx context.Context, st *config.State, self config.Own
 	rebooted := o != nil && !m.force && !m.procs.SameBoot(o.Boot, self.Boot)
 	switch {
 	case rebooted:
-		fmt.Fprintln(w, "the computer was restarted since the routes were applied: removing DNS entries, forgetting routes")
-		dns := &config.State{Resolvers: st.Resolvers, Tun6: st.Tun6} // both survive a reboot
+		dns := &config.State{Resolvers: st.Resolvers, Tun6: st.Tun6} // survive a reboot, unless the OS keeps them in memory
+		if loses, ok := m.b.(interface{ resolversLostOnReboot() bool }); ok && loses.resolversLostOnReboot() {
+			// what is there under the same name now was set by somebody else
+			dns.Resolvers = nil
+			rep.Forgotten += len(st.Resolvers)
+			fmt.Fprintln(w, "the computer was restarted since the routes were applied: forgetting routes and DNS entries (the DNS settings of the links do not survive a restart)")
+		} else {
+			fmt.Fprintln(w, "the computer was restarted since the routes were applied: removing DNS entries, forgetting routes")
+		}
 		r, keep, errs := m.removeEntries(ctx, dns, nil)
 		rep.add(r)
-		rep.Forgotten = len(st.Routes) + len(st.Rules)
+		rep.Forgotten += len(st.Routes) + len(st.Rules)
 		st.Resolvers, st.Routes, st.Rules, st.Sig, st.DNSSig, st.Tun6 = keep.Resolvers, nil, nil, "", "", keep.Tun6
 		if err := m.saveBare(st); err != nil {
 			errs = append(errs, fmt.Errorf("journal not updated: %w", err))
@@ -587,7 +595,12 @@ func (m *Manager) removeEntries(ctx context.Context, st *config.State, progress 
 		})
 	}
 	for i, id := range st.Resolvers {
-		if err := dnsErrs[i]; err != nil {
+		if err := dnsErrs[i]; errors.Is(err, errNotOurs) {
+			// not ours (the link was made again, somebody changed the servers): it stays as it
+			// is and leaves the journal
+			rep.Left = append(rep.Left, fmt.Sprintf("DNS %s: %v", id, err))
+			continue
+		} else if err != nil {
 			errs = append(errs, entryErr("DNS "+id, err))
 			keep.Resolvers = append(keep.Resolvers, id)
 			continue

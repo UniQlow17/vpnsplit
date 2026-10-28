@@ -264,8 +264,8 @@ func legacyReasonRu(r string) string {
 // a VPN client takes all traffic), with no metric and no table (those versions
 // recorded neither; every route of theirs had metric 1, which removal checks
 // against the OS, see delRoute). Rules are dropped whole: those versions had
-// none. "dns <link>" entries (Linux) are dropped too: they would clear the DNS
-// servers of any link the file names. What is kept is marked FromLegacy, the
+// none. "dns <link>" and "domain <link> <zone>" entries (Linux) are dropped too:
+// they would clear the DNS servers or the domains of any link the file names. What is kept is marked FromLegacy, the
 // mark is set here and nowhere else (whatever the file says about it is
 // overwritten), and removal treats such routes with extra care.
 func (s *State) trustLegacy() (warnings []string) {
@@ -298,7 +298,7 @@ func (s *State) trustLegacy() (warnings []string) {
 	s.Rules = nil
 	var res []string
 	for _, id := range s.Resolvers {
-		if strings.HasPrefix(id, "dns ") || resolverIsRoot(id) {
+		if strings.HasPrefix(id, "dns ") || strings.HasPrefix(id, "domain ") || resolverIsRoot(id) {
 			warnings = append(warnings, fmt.Sprintf("old journal: DNS entry %q dropped", clip(id)))
 			continue
 		}

@@ -1,6 +1,7 @@
 package config
 
 import (
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -174,6 +175,20 @@ func TestValidResolverEntry(t *testing.T) {
 		{"linux", "domain tun0 corp.com extra", false},
 		{"linux", "dns  tun0", false},
 		{"linux", "rm tun0", false},
+		{"linux", "domain tun0 corp.example.com 7", true},
+		{"linux", "domain wghome . 12", true},
+		{"linux", "dns tun0 7 10.200.0.1", true},
+		{"linux", "dns tun0 7 10.200.0.1,10.200.0.2", true},
+		{"linux", "dns tun0 0 10.200.0.1", false},
+		{"linux", "dns tun0 07 10.200.0.1", false},
+		{"linux", "dns tun0 7", false},
+		{"linux", "dns tun0 7 10.200.0.1,", false},
+		{"linux", "dns tun0 7 not-an-ip", false},
+		{"linux", "dns tun0 7 ::1", false},
+		{"linux", "domain tun0 corp.example.com -1", false},
+		{"linux", "domain tun0 corp.example.com x", false},
+		{"linux", "domain tun0 ../x 7", false},
+		{"linux", "domain tun0 corp.example.com 7 8", false},
 	}
 	for _, c := range cases {
 		if got := validResolverEntry(c.goos, c.id); got != c.ok {
@@ -228,5 +243,37 @@ func TestValidIfaceRejectsLineSeparators(t *testing.T) {
 		if !ValidIface(s) {
 			t.Errorf("ValidIface(%q) = false", s)
 		}
+	}
+}
+
+func TestParseLinuxResolver(t *testing.T) {
+	r, ok := ParseLinuxResolver(FormatLinuxResolver("wgcorp", 9, "", []string{"10.200.0.1", "10.200.0.2"}))
+	if !ok || r.Kind != "dns" || r.Link != "wgcorp" || r.Index != 9 || len(r.Servers) != 2 || r.Servers[1] != "10.200.0.2" {
+		t.Errorf("dns: %+v %v", r, ok)
+	}
+	r, ok = ParseLinuxResolver(FormatLinuxResolver("wgcorp", 9, "corp.example", nil))
+	if !ok || r.Kind != "domain" || r.Link != "wgcorp" || r.Index != 9 || r.Zone != "corp.example" {
+		t.Errorf("domain: %+v %v", r, ok)
+	}
+	// the old format has no index
+	if r, ok = ParseLinuxResolver("domain wgcorp corp.example"); !ok || r.Index != 0 {
+		t.Errorf("old domain: %+v %v", r, ok)
+	}
+	if r, ok = ParseLinuxResolver("dns wgcorp"); !ok || r.Index != 0 || len(r.Servers) != 0 {
+		t.Errorf("old dns: %+v %v", r, ok)
+	}
+}
+
+func TestStateSanitizeKeepsLinuxResolverFormats(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("the entries are those of systemd-resolved")
+	}
+	s := State{Resolvers: []string{
+		"dns tun0 7 10.200.0.1", "domain tun0 corp.example 7", "domain tun0 corp.example", "dns tun0",
+		"dns tun0 7 8.8.8.8;rm", "domain tun0 corp.example 0",
+	}}
+	w := s.Sanitize()
+	if len(s.Resolvers) != 4 || len(w) != 2 {
+		t.Errorf("%q %q", s.Resolvers, w)
 	}
 }

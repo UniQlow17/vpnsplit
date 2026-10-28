@@ -335,6 +335,9 @@ func (osBackend) ListResolvers() ([]OSResolver, error) {
 	return res, nil
 }
 
+// resolversLostOnReboot: the entries stay in the system after a restart.
+func (osBackend) resolversLostOnReboot() bool { return false }
+
 // restDNS is false: /etc/resolver holds domains only ("." is not one of them),
 // and the other way to send everything else to the DNS of a VPN is to change
 // the DNS of a network service with scutil/networksetup, which belongs to the

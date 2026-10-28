@@ -229,5 +229,8 @@ func nrptNamespace(id string) string {
 	return "." + id
 }
 
+// resolversLostOnReboot: the entries stay in the system after a restart.
+func (osBackend) resolversLostOnReboot() bool { return false }
+
 // restDNS: Windows sends everything else to the home DNS through the NRPT rule ".".
 const restDNS = true

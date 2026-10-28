@@ -349,6 +349,7 @@ type foreignBackend struct {
 	foreignIDs map[string]bool
 	adds       []string
 	flushes    int
+	onFlush    func() // called when the DNS cache is flushed: after all the entries are made, before the final journal
 }
 
 func (b *foreignBackend) AddResolver(id string, s []string) error {
@@ -358,7 +359,12 @@ func (b *foreignBackend) AddResolver(id string, s []string) error {
 	}
 	return b.memBackend.AddResolver(id, s)
 }
-func (b *foreignBackend) FlushDNS() { b.flushes++ }
+func (b *foreignBackend) FlushDNS() {
+	b.flushes++
+	if b.onFlush != nil {
+		b.onFlush()
+	}
+}
 
 // The entry that somebody else made is left as it is, and it does not make the
 // next cycles redo the DNS entries and flush the cache: the plan counts as done.

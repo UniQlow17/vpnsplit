@@ -15,6 +15,8 @@ case "$1" in
     link=$2
     [ -n "$link" ] || exit 1
     if [ $# -le 2 ]; then
+      # reading fails (S27): resolved does not answer, which is not the same as "the link has none"
+      [ -e "$d/fail" ] && { echo "Failed to get $kind: Connection timed out" >&2; exit 1; }
       i=$(ip -o link show "$link" 2>/dev/null | cut -d: -f1)
       echo "Link ${i:-0} ($link): $(cat "$d/$link.$kind" 2>/dev/null)"
       exit 0

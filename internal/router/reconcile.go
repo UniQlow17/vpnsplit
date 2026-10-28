@@ -163,6 +163,17 @@ func (d *diff) planned(st *config.State, newIDs []string) *config.State {
 	return n
 }
 
+// withoutIDs is ids without the ones in drop.
+func withoutIDs(ids []string, drop map[string]bool) []string {
+	var out []string
+	for _, id := range ids {
+		if !drop[id] {
+			out = append(out, id)
+		}
+	}
+	return out
+}
+
 func (d *diff) empty() bool {
 	return len(d.readd)+len(d.add)+len(d.del)+len(d.adopt)+len(d.readdR)+len(d.addR)+len(d.delR) == 0 && d.dropJ == 0
 }
@@ -537,6 +548,7 @@ func (m *Manager) reconcile(st *config.State, p *plan, tbl *table, rs *ruleSet, 
 	for _, id := range st.Resolvers {
 		inJournal[id] = true
 	}
+	refused := map[string]bool{} // wanted, but made by somebody else: not ours
 	if dnsChange && len(items) > 0 && m.ctx.Err() == nil {
 		for _, it := range items {
 			id := it.id
@@ -551,6 +563,20 @@ func (m *Manager) reconcile(st *config.State, p *plan, tbl *table, rs *ruleSet, 
 				fmt.Fprintf(w, "  = %s: %v\n", id, err)
 				if !inJournal[id] {
 					foreign[id] = true // done, and not ours
+					// The journal written before the change lists it as ours (if the
+					// process died now, the next start would remove somebody else's
+					// entry): written again without it, before anything goes on.
+					refused[id] = true
+					pl := d.planned(st, withoutIDs(newIDs, refused))
+					pl.Tun6 = tunOrig
+					for _, rid := range out.Resolvers {
+						pl.Resolvers = config.AddUnique(pl.Resolvers, rid)
+					}
+					if err := m.save(pl); err != nil {
+						sum.failed++
+						fmt.Fprintf(w, "  ! journal: %v\n", err)
+						return fmt.Errorf("journal not updated after a DNS entry turned out not to be ours: %w", err)
+					}
 				}
 				continue
 			}
@@ -579,7 +605,12 @@ func (m *Manager) reconcile(st *config.State, p *plan, tbl *table, rs *ruleSet, 
 				left = append(left, id)
 				continue
 			}
-			if err := m.b.DelResolver(id); err != nil {
+			if err := m.b.DelResolver(id); errors.Is(err, errNotOurs) {
+				// not ours any more (the link was made again, the servers were changed):
+				// it stays as it is and leaves the journal
+				fmt.Fprintf(w, "  = DNS %s: %v, left as is\n", id, err)
+				continue
+			} else if err != nil {
 				fmt.Fprintf(w, "  ! DNS %s: %v\n", id, err)
 				left = append(left, id)
 				continue

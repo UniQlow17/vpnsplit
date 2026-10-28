@@ -215,11 +215,11 @@ func TestTrustLegacy(t *testing.T) {
 	if len(s.Rules) != 0 {
 		t.Errorf("rules kept: %+v", s.Rules)
 	}
-	if len(s.Resolvers) != 2 || len(warns) != 9 {
+	if len(s.Resolvers) != 1 || s.Resolvers[0] != "corp.example.com" || len(warns) != 10 {
 		t.Errorf("%+v %q", s, warns)
 	}
 	for _, r := range s.Resolvers {
-		if strings.HasPrefix(r, "dns ") {
+		if strings.HasPrefix(r, "dns ") || strings.HasPrefix(r, "domain ") {
 			t.Errorf("dns entry kept: %q", r)
 		}
 	}
