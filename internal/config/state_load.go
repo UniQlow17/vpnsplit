@@ -124,13 +124,13 @@ func (e stateEnv) load() (*State, []string, JournalStatus) {
 		b, err := readRegular(p)
 		if err != nil {
 			if !os.IsNotExist(err) {
-				warns = append(warns, "old journal ignored: "+err.Error())
+				warns = append(warns, fmt.Sprintf("old journal %s found but not transferred: %v", p, err))
 			}
 			continue
 		}
 		old, w, err := parseState(b)
 		if err != nil {
-			warns = append(warns, fmt.Sprintf("old journal %s ignored: %v", p, err))
+			warns = append(warns, fmt.Sprintf("old journal %s found but not transferred: not a valid journal: %v", p, err))
 			continue
 		}
 		warns = append(warns, w...)
@@ -158,13 +158,93 @@ func (e stateEnv) load() (*State, []string, JournalStatus) {
 	return s, warns, status
 }
 
+// LegacyInfo is a journal of an older version that is still in the user's
+// directory: it describes routes vpnsplit put there and has not taken over yet.
+type LegacyInfo struct {
+	Path      string
+	Routes    int
+	Resolvers int
+	Reason    string // why it was not transferred (English)
+}
+
+// LegacyPending lists the old-format journals that are still where older
+// versions kept them, with the reason each was not transferred into the
+// protected journal. It only reads.
+func LegacyPending() []LegacyInfo { return realStateEnv().legacyPending() }
+
+func (e stateEnv) legacyPending() []LegacyInfo {
+	var out []LegacyInfo
+	for _, d := range e.legacy {
+		p := filepath.Join(d, stateFile)
+		b, err := readRegular(p)
+		if err != nil {
+			if !os.IsNotExist(err) {
+				out = append(out, LegacyInfo{Path: p, Reason: "it cannot be read: " + err.Error()})
+			}
+			continue
+		}
+		old, _, err := parseState(b)
+		if err != nil {
+			out = append(out, LegacyInfo{Path: p, Reason: "it is not a valid journal: " + err.Error()})
+			continue
+		}
+		old.trustLegacy()
+		li := LegacyInfo{Path: p, Routes: len(old.Routes), Resolvers: len(old.Resolvers)}
+		if e.elevated {
+			li.Reason = "the transfer into the protected journal did not complete (see the warnings of the start)"
+		} else {
+			li.Reason = "vpnsplit was not started with administrator rights, only they can move it"
+		}
+		out = append(out, li)
+	}
+	return out
+}
+
+// LegacyNote is one line about old-format journals that were found but not
+// transferred, for the screen and the log; "" when there are none.
+func LegacyNote(ru bool) string { return legacyNoteOf(LegacyPending(), ru) }
+
+func legacyNoteOf(l []LegacyInfo, ru bool) string {
+	var parts []string
+	for _, li := range l {
+		if ru {
+			what := fmt.Sprintf("маршрутов: %d", li.Routes)
+			if li.Resolvers > 0 {
+				what += fmt.Sprintf(", DNS-записей: %d", li.Resolvers)
+			}
+			parts = append(parts, fmt.Sprintf("старый журнал найден, но не перенесён: %s (%s): %s", clip(li.Path), what, legacyReasonRu(li.Reason)))
+			continue
+		}
+		what := fmt.Sprintf("%d routes", li.Routes)
+		if li.Resolvers > 0 {
+			what += fmt.Sprintf(", %d DNS entries", li.Resolvers)
+		}
+		parts = append(parts, fmt.Sprintf("old journal found but not transferred: %s (%s): %s", clip(li.Path), what, li.Reason))
+	}
+	return strings.Join(parts, "; ")
+}
+
+func legacyReasonRu(r string) string {
+	switch {
+	case strings.HasPrefix(r, "vpnsplit was not started"):
+		return "vpnsplit запущен без прав администратора, перенести может только он"
+	case strings.HasPrefix(r, "the transfer"):
+		return "перенос в защищённый журнал не завершился (см. предупреждения при запуске)"
+	case strings.HasPrefix(r, "it is not a valid journal"):
+		return "файл не является журналом: " + strings.TrimPrefix(r, "it is not a valid journal: ")
+	case strings.HasPrefix(r, "it cannot be read"):
+		return "файл не читается: " + strings.TrimPrefix(r, "it cannot be read: ")
+	}
+	return r
+}
+
 // trustLegacy drops what an old journal, a file any process of the user could
 // have written, must not be believed about. Its routes are removed with
 // administrator rights, so only the kind of route this tool really adds is
 // kept: not a default route (/0), which would cut the host off. Every route
-// of this tool is added with metric 1, but the journal never recorded a
-// metric, so that cannot be checked here; removal matches on it instead (see
-// delRoute). "dns <link>" entries (Linux) are always dropped: they would
+// of this tool was added with metric 1, but those journals never recorded a
+// metric (Route.Legacy), so that cannot be checked here; removal matches on
+// it instead (see delRoute). "dns <link>" entries (Linux) are always dropped: they would
 // clear the DNS servers of any link the file names.
 func (s *State) trustLegacy() (warnings []string) {
 	var routes []Route

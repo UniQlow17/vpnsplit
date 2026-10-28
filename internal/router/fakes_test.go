@@ -64,6 +64,65 @@ type memStore struct {
 	saveErr     error
 	saves       int
 	panicOnLoad bool
+
+	snap       []byte // the snapshot (JSON), nil: none
+	snapSaves  int
+	snapRemove int
+	plan       []byte // the notes of the plans (JSON), nil: none
+	planSaves  int
+}
+
+func (s *memStore) LoadPlanNotes(taken string) (*config.PlanNotes, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.plan == nil {
+		return nil, nil
+	}
+	n := &config.PlanNotes{}
+	if err := json.Unmarshal(s.plan, n); err != nil {
+		return nil, err
+	}
+	if n.Taken != taken {
+		return nil, nil
+	}
+	return n, nil
+}
+
+func (s *memStore) SavePlanNotes(n *config.PlanNotes) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.planSaves++
+	s.plan, _ = json.Marshal(n)
+	return nil
+}
+
+func (s *memStore) LoadSnapshot() (*config.Snapshot, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.snap == nil {
+		return nil, nil
+	}
+	sn := &config.Snapshot{}
+	if err := json.Unmarshal(s.snap, sn); err != nil {
+		return nil, err
+	}
+	return sn, nil
+}
+
+func (s *memStore) SaveSnapshot(sn *config.Snapshot) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.snapSaves++
+	s.snap, _ = json.Marshal(sn)
+	return nil
+}
+
+func (s *memStore) RemoveSnapshot() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.snapRemove++
+	s.snap, s.plan = nil, nil
+	return nil
 }
 
 func newMemStore(st *config.State) *memStore {
@@ -209,4 +268,15 @@ func before(log []string, a, b string) bool {
 func (p *fakeProcs) AliveExact(o config.Owner) bool {
 	start, ok := p.alive[o.PID]
 	return ok && o.Start != 0 && start == o.Start
+}
+
+func (f *fakeBackend) Routes() ([]OSRoute, error) { return nil, ErrNoTable }
+func (f *fakeBackend) Rules() ([]OSRule, error)   { return nil, nil }
+func (f *fakeBackend) AddRule(r config.Rule) error {
+	f.record(fmt.Sprintf("addrule %d", r.Pref))
+	return nil
+}
+func (f *fakeBackend) DelRule(r config.Rule) error {
+	f.record(fmt.Sprintf("rule %d", r.Pref))
+	return nil
 }

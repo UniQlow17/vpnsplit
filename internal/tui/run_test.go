@@ -230,6 +230,11 @@ func TestStartupNotes(t *testing.T) {
 	if ro != "" || !strings.Contains(note, "[t] Забрать в сессию — будут сняты при выходе") || !strings.Contains(note, "apply/watch") {
 		t.Errorf("%q %q", ro, note)
 	}
+	// the journal of an older version has no owner: the session takes it, the menu does not ask
+	ro, note = startupNotes(router.AcquireInfo{TookOver: true}, nil)
+	if ro != "" || !strings.Contains(note, "без владельца") || !strings.Contains(note, "будут сняты при выходе") || strings.Contains(note, "[t]") {
+		t.Errorf("%q %q", ro, note)
+	}
 	if ro, note = startupNotes(router.AcquireInfo{}, nil); ro != "" || note != "" {
 		t.Errorf("a quiet start has no notes: %q %q", ro, note)
 	}
@@ -387,6 +392,49 @@ func TestDeadSessionDNSWarning(t *testing.T) {
 func TestStatusScreenShowsLastSession(t *testing.T) {
 	m := model{cfg: config.New(), lastSession: "2026-01-01 12:00:00 (сигнал terminated): снято: маршрутов 3", width: 120, height: 40}
 	if v := strings.Join(m.statusLines(), "\n"); !strings.Contains(v, "Последний сеанс") || !strings.Contains(v, "маршрутов 3") {
+		t.Errorf("%s", v)
+	}
+}
+
+// The comparison with the state before the start is part of the outcome: on the
+// screen and in the note of the last session.
+func TestFinishSaysWhetherTheSystemIsBackToWhatItWas(t *testing.T) {
+	for _, c := range []struct {
+		base *router.Baseline
+		want string
+	}{
+		{&router.Baseline{Checked: true}, "Восстановлено как до запуска"},
+		{&router.Baseline{Checked: true, Extra: []router.BaseDiff{{Kind: "route", Text: "192.0.2.0/24 dev wgcorp", Who: "adapter wgcorp"}}}, "Осталось отличий: 1"},
+	} {
+		f := &fakeEnder{rep: router.Report{Routes: 3, Base: c.base}}
+		var out, errOut bytes.Buffer
+		var last []string
+		if err := finishFor(f, nil, &out, &errOut, &last); err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(out.String(), c.want) || len(last) != 1 || !strings.Contains(last[0], c.want) {
+			t.Errorf("%q: out %q, last %q", c.want, out.String(), last)
+		}
+	}
+}
+
+func TestStatusScreenShowsDifferencesFromTheStateBeforeTheStart(t *testing.T) {
+	b := router.Baseline{Checked: true, Live: true, Extra: []router.BaseDiff{
+		{Kind: "route", Text: "192.0.2.0/24 dev wgcorp metric 0", Who: "adapter wgcorp / client WireGuard"},
+	}}
+	m := model{cfg: config.New(), diff: &b, width: 120, height: 40}
+	v := strings.Join(m.statusLines(), "\n")
+	for _, w := range []string{"Отличия от состояния до запуска", "Сейчас отличий: 1", "поставлено не vpnsplit", "WireGuard"} {
+		if !strings.Contains(v, w) {
+			t.Errorf("no %q in\n%s", w, v)
+		}
+	}
+	m.diff = &router.Baseline{Note: "no snapshot"}
+	if v := strings.Join(m.statusLines(), "\n"); !strings.Contains(v, "снимка состояния до запуска нет") {
+		t.Errorf("%s", v)
+	}
+	m.diff = nil // no rights: the block is not shown at all
+	if v := strings.Join(m.statusLines(), "\n"); strings.Contains(v, "Отличия от состояния до запуска") {
 		t.Errorf("%s", v)
 	}
 }

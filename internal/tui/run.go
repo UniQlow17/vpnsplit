@@ -82,9 +82,11 @@ func Run() (err error) {
 		if m.lastSession != "" && aerr == nil {
 			m.flash = joinNotes(m.flash, "Последний сеанс: "+m.lastSession)
 		}
+		m.flash = joinNotes(m.flash, config.LegacyNote(true))
 	} else {
 		m.readOnly = noAdminNote()
-		m.flash, m.flashAt = m.readOnly, 100
+		// an old journal can only be moved with rights: say that it is there and why it is not moved
+		m.flash, m.flashAt = joinNotes(m.readOnly, config.LegacyNote(true)), 100
 	}
 	if sess != nil {
 		defer func() {
@@ -182,8 +184,16 @@ func startupNotes(info router.AcquireInfo, err error) (readOnly, note string) {
 	if len(info.Errors) > 0 {
 		parts = append(parts, fmt.Sprintf("Не всё убрано после прошлого запуска (%d), будет повтор", len(info.Errors)))
 	}
+	if info.Baseline != nil {
+		if s := info.Baseline.Describe(true); s != "" {
+			parts = append(parts, "Состояние до прошлого запуска: "+s)
+		}
+	}
 	if info.Foreign {
 		parts = append(parts, foreignNote)
+	}
+	if info.TookOver {
+		parts = append(parts, "Маршруты журнала без владельца (старая версия) забраны в сессию: будут сняты при выходе")
 	}
 	return "", strings.Join(parts, ". ")
 }
@@ -226,6 +236,12 @@ func finish(sess ender, fi finishInfo, runErr error, stdout, stderr io.Writer) e
 	default:
 		summary = rep.Describe(true)
 		fmt.Fprintln(stdout, "vpnsplit:", summary)
+		if rep.Base != nil {
+			if s := rep.Base.Describe(true); s != "" {
+				fmt.Fprintln(stdout, "vpnsplit:", s)
+				summary += ". " + s
+			}
+		}
 	}
 	if n := rep.Notice(true); n != "" {
 		fmt.Fprintln(stdout, "vpnsplit:", n)

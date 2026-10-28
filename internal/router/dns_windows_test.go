@@ -45,3 +45,24 @@ func TestRouteRejectsInvalidInput(t *testing.T) {
 		t.Error("delRoute accepted a bad gateway")
 	}
 }
+
+func TestParseNrptRules(t *testing.T) {
+	for name, in := range map[string]string{
+		"list":   `[{"n":".corp.example,corp.example","s":"10.0.0.1","c":"vpnsplit"},{"n":".other.test","s":"1.1.1.1,8.8.8.8","c":""}]`,
+		"single": `{"n":".corp.example,corp.example","s":"10.0.0.1","c":"vpnsplit"}`,
+	} {
+		res, err := parseNrptRules([]byte(in))
+		if err != nil || len(res) == 0 {
+			t.Fatalf("%s: %v %v", name, res, err)
+		}
+		if res[0].ID != "corp.example" || !res[0].Ours {
+			t.Errorf("%s: %+v", name, res[0])
+		}
+		if name == "list" && (len(res) != 2 || res[1].ID != "other.test" || res[1].Ours) {
+			t.Errorf("%s: %+v", name, res)
+		}
+	}
+	if res, err := parseNrptRules([]byte("  ")); err != nil || res != nil {
+		t.Errorf("%v %v", res, err)
+	}
+}

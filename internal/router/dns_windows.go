@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 
 	"github.com/UniQlow17/vpnsplit/internal/config"
@@ -70,15 +71,18 @@ func addResolver(zone string, servers []string) error {
 		return err
 	}
 	env := map[string]string{"ZONE": zone, "SERVERS": strings.Join(servers, ",")}
-	out, err := ps(env, "$z=$env:VS_ZONE; @(Get-DnsClientNrptRule | Where-Object { $_.Namespace -contains ('.'+$z) }).Count")
+	// a rule of somebody else stays; a rule with our comment is a leftover of
+	// ours (the journal was lost) and is replaced, not left behind for ever
+	out, err := ps(env, "$z=$env:VS_ZONE; @(Get-DnsClientNrptRule | Where-Object { $_.Namespace -contains ('.'+$z) -and $_.Comment -ne 'vpnsplit' }).Count")
 	if err != nil {
 		return err
 	}
 	if strings.TrimSpace(string(out)) != "0" {
-		return fmt.Errorf("an NRPT rule for %s exists, left as is", zone)
+		return fmt.Errorf("%w: an NRPT rule for %s exists, left as is", errResolverExists, zone)
 	}
-	_, err = ps(env, "$z=$env:VS_ZONE; Add-DnsClientNrptRule -Namespace ('.'+$z),$z "+
-		"-NameServers ($env:VS_SERVERS -split ',') -Comment 'vpnsplit'")
+	_, err = ps(env, "$z=$env:VS_ZONE; Get-DnsClientNrptRule | Where-Object { $_.Comment -eq 'vpnsplit' -and $_.Namespace -contains ('.'+$z) } | "+
+		"Remove-DnsClientNrptRule -Force; "+
+		"Add-DnsClientNrptRule -Namespace ('.'+$z),$z -NameServers ($env:VS_SERVERS -split ',') -Comment 'vpnsplit'")
 	return err
 }
 
@@ -92,4 +96,96 @@ func delResolver(zone string) error {
 	return err
 }
 
+// MissingResolvers lists the zones of the journal that have no NRPT rule of ours
+// any more (one PowerShell call for all of them).
+func (osBackend) MissingResolvers(ids []string) ([]string, error) {
+	out, err := ps(nil, "ConvertTo-Json -Compress @(Get-DnsClientNrptRule | Where-Object { $_.Comment -eq 'vpnsplit' } | "+
+		"ForEach-Object { $_.Namespace } | Where-Object { $_ })")
+	if err != nil {
+		return nil, err
+	}
+	have, err := parseNrptNamespaces(out)
+	if err != nil {
+		return nil, err
+	}
+	var missing []string
+	for _, id := range ids {
+		if !have["."+id] {
+			missing = append(missing, id)
+		}
+	}
+	return missing, nil
+}
+
+// parseNrptNamespaces reads the JSON list (or a single string, which is how
+// PowerShell writes a one-element array) of NRPT namespaces.
+func parseNrptNamespaces(out []byte) (map[string]bool, error) {
+	out = bytes.TrimSpace(out)
+	var list []string
+	if len(out) == 0 {
+		return map[string]bool{}, nil
+	}
+	if out[0] == '"' {
+		var one string
+		if err := json.Unmarshal(out, &one); err != nil {
+			return nil, err
+		}
+		list = []string{one}
+	} else if err := json.Unmarshal(out, &list); err != nil {
+		return nil, err
+	}
+	have := map[string]bool{}
+	for _, n := range list {
+		have[strings.ToLower(n)] = true
+	}
+	return have, nil
+}
+
 func flushDNS() { _, _ = ps(nil, "Clear-DnsClientCache") }
+
+// ListResolvers lists the NRPT rules of the computer: the zone (the first
+// namespace without its dot), the name servers and the comment. A rule with
+// our comment is ours.
+func (osBackend) ListResolvers() ([]OSResolver, error) {
+	out, err := ps(nil, "ConvertTo-Json -Compress -Depth 3 @(Get-DnsClientNrptRule | ForEach-Object { "+
+		"@{ n = (@($_.Namespace) -join ','); s = (@($_.NameServers) -join ','); c = [string]$_.Comment } })")
+	if err != nil {
+		return nil, err
+	}
+	return parseNrptRules(out)
+}
+
+// parseNrptRules reads the JSON of ListResolvers: a list, or a single object
+// (how PowerShell writes a one-element array).
+func parseNrptRules(out []byte) ([]OSResolver, error) {
+	out = bytes.TrimSpace(out)
+	if len(out) == 0 {
+		return nil, nil
+	}
+	type rule struct{ N, S, C string }
+	var list []rule
+	if out[0] == '{' {
+		var one rule
+		if err := json.Unmarshal(out, &one); err != nil {
+			return nil, err
+		}
+		list = []rule{one}
+	} else if err := json.Unmarshal(out, &list); err != nil {
+		return nil, err
+	}
+	var res []OSResolver
+	for _, r := range list {
+		id := r.N
+		for _, ns := range strings.Split(r.N, ",") {
+			if strings.HasPrefix(ns, ".") {
+				id = strings.TrimPrefix(ns, ".")
+				break
+			}
+		}
+		res = append(res, OSResolver{ID: strings.ToLower(id), Detail: "servers " + r.S + " comment " + strconv.Quote(r.C), Ours: r.C == nrptComment})
+	}
+	return res, nil
+}
+
+// nrptComment marks the NRPT rules vpnsplit creates.
+const nrptComment = "vpnsplit"

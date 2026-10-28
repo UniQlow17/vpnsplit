@@ -5,15 +5,26 @@ import (
 	"github.com/UniQlow17/vpnsplit/internal/sysproc"
 )
 
-// Backend is what the OS is asked to do. The real one (osBackend) runs the
-// system tools of each OS; tests use a fake, and a native API can replace
-// the tools later without touching the logic above.
+// Backend is what the OS is asked to do. The real one (osBackend) talks to
+// the routing API of each OS (iphlpapi, rtnetlink; the route tool on macOS)
+// and runs the system tools for DNS; tests use a fake.
 type Backend interface {
 	// AddRoute creates the route; an error wrapping errExists means the
 	// route was already in the table (not ours: it must stay).
 	AddRoute(config.Route) error
 	// DelRoute removes the route; a route that is already gone is not an error.
 	DelRoute(config.Route) error
+	// Routes reads the IPv4 routing table (Linux: all tables). An error
+	// wrapping ErrNoTable means the OS does not offer it.
+	Routes() ([]OSRoute, error)
+	// AddRule creates a policy rule; an error wrapping errExists means an
+	// identical rule is already there. Where the OS has no policy routing
+	// it fails.
+	AddRule(config.Rule) error
+	// DelRule removes a rule; one that is already gone is not an error.
+	DelRule(config.Rule) error
+	// Rules reads the policy rules; nil where the OS has none.
+	Rules() ([]OSRule, error)
 	// AddResolver creates one per-domain DNS entry (see resolverPlan for ids).
 	AddResolver(id string, servers []string) error
 	// DelResolver removes an entry; one that is already gone is not an error.
@@ -26,6 +37,10 @@ type osBackend struct{}
 
 func (osBackend) AddRoute(r config.Route) error                 { return addRoute(r) }
 func (osBackend) DelRoute(r config.Route) error                 { return delRoute(r) }
+func (osBackend) Routes() ([]OSRoute, error)                    { return listRoutes() }
+func (osBackend) AddRule(r config.Rule) error                   { return addRule(r) }
+func (osBackend) DelRule(r config.Rule) error                   { return delRule(r) }
+func (osBackend) Rules() ([]OSRule, error)                      { return listRules() }
 func (osBackend) AddResolver(id string, servers []string) error { return addResolver(id, servers) }
 func (osBackend) DelResolver(id string) error                   { return delResolver(id) }
 func (osBackend) FlushDNS()                                     { flushDNS() }

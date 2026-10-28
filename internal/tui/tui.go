@@ -2,6 +2,7 @@ package tui
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"io"
 	"os"
@@ -43,6 +44,7 @@ type (
 		apply, reset bool                 // what auto mode should do
 		warns        []string             // config and journal problems found while loading
 		journal      config.JournalStatus // whether the protected journal could be read
+		diff         *router.Baseline     // the system against the state before the start; nil without rights
 	}
 	opDone struct {
 		title string
@@ -70,9 +72,10 @@ type model struct {
 	delAsk      bool // rules: waiting for "delete this rule?" answer
 	scroll      int  // status screen
 	admin       bool
-	mgr         *router.Manager // owns the journal; nil without administrator rights and in tests
-	readOnly    string          // why this copy may not change the network (no rights, or another copy owns it); "" if it may
-	lastSession string          // how the previous session ended (from a file), shown on the status screen
+	mgr         *router.Manager  // owns the journal; nil without administrator rights and in tests
+	readOnly    string           // why this copy may not change the network (no rights, or another copy owns it); "" if it may
+	lastSession string           // how the previous session ended (from a file), shown on the status screen
+	diff        *router.Baseline // live difference from the state before the start (status screen)
 	auto        bool
 	autoWait    int
 	busy        string
@@ -167,11 +170,22 @@ func refreshCmd() tea.Cmd {
 		if w := deadSessionDNSWarning(st); w != "" {
 			s.warns = append(s.warns, w)
 		}
+		if n := config.LegacyNote(true); n != "" {
+			s.warns = append(s.warns, n) // an old journal that was found and not moved, and why
+		}
 		if cfg, cwarns, err := config.LoadChecked(); err == nil {
 			s.cfg = cfg
 			s.warns = append(s.warns, cwarns...)
 			s.env = router.Detect(cfg)
 			s.apply, s.reset = router.Sync(cfg, s.env, st)
+			if !s.apply && !s.reset && router.Drifted(st) {
+				s.apply = true // routes of a reconnected VPN went with its old adapter
+			}
+		}
+		if router.IsPrivileged() {
+			// the routes and rules only: the DNS entries would start PowerShell on every refresh
+			b := router.Diff(context.Background(), false)
+			s.diff = &b
 		}
 		return s
 	}
@@ -300,6 +314,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.cfg, m.env, m.routes, m.st = msg.cfg, msg.env, msg.routes, msg.st
 		m.needApply, m.needReset = msg.apply, msg.reset
 		m.warns, m.journal = msg.warns, msg.journal
+		m.diff = msg.diff
 		m.flashWarnings()
 		if m.auto && m.busy == "" && m.cfg != nil && m.admin && !m.foreign() && m.frame >= m.autoWait {
 			if m.needApply {
@@ -687,6 +702,20 @@ func (m model) statusLines() []string {
 	}
 	if m.needApply && !st.Empty() {
 		out = append(out, "", sYel.Render("VPN или правила изменились после применения — нужно применить заново"))
+	}
+	if m.diff != nil {
+		out = append(out, "")
+		h("Отличия от состояния до запуска")
+		if m.diff.Checked {
+			line("  %s", m.diff.Describe(true))
+			if !m.diff.Restored() {
+				for _, l := range m.diff.Lines(true) {
+					line("    %s", sGray.Render(l))
+				}
+			}
+		} else {
+			line("  %s", sGray.Render(m.diff.Lines(true)[0]))
+		}
 	}
 	if m.lastSession != "" {
 		out = append(out, "")

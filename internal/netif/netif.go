@@ -13,6 +13,7 @@ import (
 // Info describes one network adapter.
 type Info struct {
 	Name     string
+	Index    int // OS interface index: a reconnected VPN of the same name usually gets a new one
 	Desc     string
 	Up       bool
 	Addrs    []string
@@ -80,7 +81,7 @@ func List() ([]Info, error) {
 		if i.Flags&net.FlagLoopback != 0 {
 			continue
 		}
-		info := Info{Name: i.Name, Desc: descs[i.Name], Up: i.Flags&net.FlagUp != 0}
+		info := Info{Name: i.Name, Index: i.Index, Desc: descs[i.Name], Up: i.Flags&net.FlagUp != 0}
 		if as, err := i.Addrs(); err == nil {
 			for _, a := range as {
 				if ipn, ok := a.(*net.IPNet); ok && ipn.IP.To4() != nil {

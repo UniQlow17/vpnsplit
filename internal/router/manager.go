@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"runtime"
 	"runtime/debug"
 	"sync"
 	"sync/atomic"
@@ -64,9 +65,23 @@ type Manager struct {
 	closed atomic.Bool                  // the session ended: nothing writes the journal any more
 	force  bool                         // see SetForce
 
-	mu      sync.Mutex
-	mode    string // what Cleanup does: config.ModeSession or config.ModePersistent
-	foreign bool   // persistent entries of apply/watch are waiting for TakeOver
+	// the OS-dependent inputs of Apply; tests replace them
+	detect func(*config.Config) Env
+	dnsOf  func(iface string) (servers, zones []string)
+
+	goos       string                   // the OS whose rules tell a route of ours from a client's (runtime.GOOS; tests set it)
+	providerOf func() map[string]string // adapter name -> VPN client behind it, for the report
+	snapOff    bool                     // see NoSnapshot
+
+	mu        sync.Mutex
+	mode      string          // what Cleanup does: config.ModeSession or config.ModePersistent
+	foreign   bool            // persistent entries of apply/watch are waiting for TakeOver
+	planned   map[string]bool // routes of the plans of this run (kept in the notes next to the snapshot too)
+	kept      map[string]bool // routes found in place and left as somebody else's
+	planTaken string          // the snapshot the notes belong to
+	planDirty bool            // the notes grew since they were written
+	jhint     []config.Route  // routes the journal listed before they were removed in this run
+	jhintRes  []string        // the same for DNS entries
 }
 
 // NewManager returns the Manager that works on this OS.
@@ -82,8 +97,14 @@ func NewManagerFor(b Backend, s Store, p Procs, l LockFunc) *Manager {
 
 func newManager(b Backend, s Store, p Procs, l LockFunc) *Manager {
 	ctx, cancel := context.WithCancel(context.Background())
-	return &Manager{b: b, store: s, procs: p, lock: l, sem: make(chan struct{}, 1), ctx: ctx, cancel: cancel}
+	return &Manager{b: b, store: s, procs: p, lock: l, sem: make(chan struct{}, 1), ctx: ctx, cancel: cancel,
+		detect: Detect, dnsOf: corpDNS, goos: runtime.GOOS, providerOf: providersByName, planned: map[string]bool{}, kept: map[string]bool{}}
 }
+
+// NoSnapshot makes Acquire leave the snapshot of the state before the start
+// alone (neither taken nor compared): for `reset`, which takes nothing new on.
+// Call it before Acquire.
+func (m *Manager) NoSnapshot() { m.snapOff = true }
 
 // SetForce makes the recovery in Acquire distrust the "computer was restarted"
 // verdict: routes of an earlier run are then removed instead of forgotten.
@@ -150,12 +171,14 @@ func (m *Manager) saveBare(st *config.State) error {
 // Report says what was removed.
 type Report struct {
 	Routes, Resolvers int
-	Forgotten         int  // journal routes dropped without removal: gone with a reboot
-	FullTunnel        bool // 0.0.0.0/1 and 128.0.0.0/1 of the home VPN were removed
+	Rules             int
+	Forgotten         int       // journal routes dropped without removal: gone with a reboot
+	FullTunnel        bool      // 0.0.0.0/1 and 128.0.0.0/1 of the home VPN were removed
+	Base              *Baseline // the system compared with the state before the start; nil: not done
 }
 
 // Total is the number of entries removed.
-func (r Report) Total() int { return r.Routes + r.Resolvers }
+func (r Report) Total() int { return r.Routes + r.Resolvers + r.Rules }
 
 // Describe tells what was removed, in English or Russian.
 func (r Report) Describe(ru bool) string {
@@ -168,6 +191,9 @@ func (r Report) Describe(ru bool) string {
 	var s string
 	if ru {
 		s = fmt.Sprintf("снято: маршрутов %d, DNS-записей %d", r.Routes, r.Resolvers)
+		if r.Rules > 0 {
+			s += fmt.Sprintf(", правил маршрутизации %d", r.Rules)
+		}
 		if r.FullTunnel {
 			s += "; полный туннель 0/1+128/1 снят"
 		}
@@ -177,6 +203,9 @@ func (r Report) Describe(ru bool) string {
 		return s
 	}
 	s = fmt.Sprintf("removed: %d routes, %d DNS entries", r.Routes, r.Resolvers)
+	if r.Rules > 0 {
+		s += fmt.Sprintf(", %d policy rules", r.Rules)
+	}
 	if r.FullTunnel {
 		s += "; full tunnel 0/1+128/1 removed"
 	}
@@ -201,6 +230,7 @@ func (r Report) Notice(ru bool) string {
 func (r *Report) add(o Report) {
 	r.Routes += o.Routes
 	r.Resolvers += o.Resolvers
+	r.Rules += o.Rules
 	r.Forgotten += o.Forgotten
 	r.FullTunnel = r.FullTunnel || o.FullTunnel
 }
@@ -208,10 +238,11 @@ func (r *Report) add(o Report) {
 // AcquireInfo is what happened while the journal was taken over.
 type AcquireInfo struct {
 	Recovered Report
-	Errors    []error  // entries of a dead owner that could not be removed; they stay in the journal
-	Warns     []string // problems found while reading the journal
-	TookOver  bool     // a persistent (apply/watch) journal with entries became a session's
-	Foreign   bool     // ModeSessionAsk: such a journal was found and left alone, see TakeOver
+	Errors    []error   // entries of a dead owner that could not be removed; they stay in the journal
+	Warns     []string  // problems found while reading the journal
+	TookOver  bool      // a persistent (apply/watch) journal with entries became a session's
+	Foreign   bool      // ModeSessionAsk: such a journal was found and left alone, see TakeOver
+	Baseline  *Baseline // an earlier run's snapshot was compared with the system (nil: there was none)
 }
 
 // Acquire makes this process the owner of the journal, or fails. It takes
@@ -255,15 +286,22 @@ func (m *Manager) Acquire(ctx context.Context, mode string, w io.Writer) (*Sessi
 		return fail(fmt.Errorf("interrupted while finishing the previous run, the rest stays in the journal: %w", err))
 	}
 
-	leftover := !st.Empty() && (st.Mode == config.ModePersistent || st.Owner == nil)
+	// A journal with no owner is one of an older version (or one moved from the
+	// user's directory): what it lists is ours, and a session removes it at its end.
+	// What apply/watch left is not taken without the user's word in the menu.
+	legacy := !st.Empty() && st.Owner == nil
+	leftover := !st.Empty() && st.Mode == config.ModePersistent
 	eff := mode
 	switch mode {
 	case config.ModeSession:
-		info.TookOver = leftover
+		info.TookOver = leftover || legacy
 	case ModeSessionAsk:
 		eff = config.ModeSession
-		if leftover {
+		switch {
+		case leftover:
 			eff, info.Foreign = config.ModePersistent, true
+		case legacy:
+			info.TookOver = true
 		}
 	}
 	// whatever a dead session could not remove stays a session's: the next
@@ -279,6 +317,9 @@ func (m *Manager) Acquire(ctx context.Context, mode string, w io.Writer) (*Sessi
 	if err := m.save(st); err != nil {
 		m.stamp.Store(nil)
 		return fail(err)
+	}
+	if !m.snapOff {
+		info.Baseline = m.acquireSnapshot(rctx, st, self, w)
 	}
 	return &Session{m: m, release: release}, info, nil
 }
@@ -408,8 +449,8 @@ func (m *Manager) recover(ctx context.Context, st *config.State, self config.Own
 		dns := &config.State{Resolvers: st.Resolvers}
 		r, keep, errs := m.removeEntries(ctx, dns, nil)
 		rep.add(r)
-		rep.Forgotten = len(st.Routes)
-		st.Resolvers, st.Routes, st.Sig = keep.Resolvers, nil, ""
+		rep.Forgotten = len(st.Routes) + len(st.Rules)
+		st.Resolvers, st.Routes, st.Rules, st.Sig, st.DNSSig = keep.Resolvers, nil, nil, "", ""
 		if err := m.saveBare(st); err != nil {
 			errs = append(errs, fmt.Errorf("journal not updated: %w", err))
 		}
@@ -431,18 +472,22 @@ func (m *Manager) recover(ctx context.Context, st *config.State, self config.Own
 	return rep, nil
 }
 
-// removeEntries removes the DNS entries of st, then its routes, up to four
+// removeEntries removes the DNS entries of st, then its policy rules and routes, up to four
 // calls at a time, and returns what stays in the journal: the entries that
 // could not be removed or were not reached before ctx ended. Nothing is
 // written. progress, if set, is told after every entry how many are done.
 func (m *Manager) removeEntries(ctx context.Context, st *config.State, progress func(done, total int)) (Report, *config.State, []error) {
+	m.mu.Lock()
+	m.jhint = append(m.jhint, st.Routes...)
+	m.jhintRes = append(m.jhintRes, st.Resolvers...)
+	m.mu.Unlock()
 	var (
 		rep   Report
 		errs  []error
 		keep  = &config.State{}
 		pmu   sync.Mutex
 		done  int
-		total = len(st.Resolvers) + len(st.Routes)
+		total = len(st.Resolvers) + len(st.Rules) + len(st.Routes)
 	)
 	step := func() {
 		if progress == nil {
@@ -467,6 +512,21 @@ func (m *Manager) removeEntries(ctx context.Context, st *config.State, progress 
 			continue
 		}
 		rep.Resolvers++
+	}
+	ruleErrs := runAll(ctx, st.Rules, removeWorkers, func(r config.Rule) error {
+		defer step()
+		if err := config.ValidateRule(r); err != nil {
+			return err
+		}
+		return m.b.DelRule(r)
+	})
+	for i, r := range st.Rules {
+		if err := ruleErrs[i]; err != nil {
+			errs = append(errs, entryErr(fmt.Sprintf("rule lookup %d pref %d", r.Table, r.Pref), err))
+			keep.Rules = append(keep.Rules, r)
+			continue
+		}
+		rep.Rules++
 	}
 	routeErrs := runAll(ctx, st.Routes, removeWorkers, func(r config.Route) error {
 		defer step()
@@ -691,18 +751,29 @@ func (m *Manager) cleanupLocked(ctx context.Context, progress func(done, total i
 	if err := statusErr(status); err != nil {
 		return Report{}, err
 	}
-	if st.Empty() && st.Owner == nil {
-		return Report{}, nil
+	// a cleanup given little time is the OS shutting the program down
+	dl, has := ctx.Deadline()
+	abrupt := has && time.Until(dl) < abruptBelow
+	var (
+		rep  Report
+		errs []error
+	)
+	if !(st.Empty() && st.Owner == nil) {
+		var keep *config.State
+		rep, keep, errs = m.removeEntries(ctx, st, progress)
+		var serr error
+		if len(errs) == 0 {
+			serr = m.saveBare(&config.State{})
+		} else {
+			serr = m.save(keep)
+		}
+		if serr != nil {
+			errs = append(errs, fmt.Errorf("journal not updated: %w", serr))
+		}
 	}
-	rep, keep, errs := m.removeEntries(ctx, st, progress)
-	var serr error
 	if len(errs) == 0 {
-		serr = m.saveBare(&config.State{})
-	} else {
-		serr = m.save(keep)
-	}
-	if serr != nil {
-		errs = append(errs, fmt.Errorf("journal not updated: %w", serr))
+		// what the journal listed is gone: now whatever else changed since the start
+		rep.Base = m.settle(ctx, abrupt)
 	}
 	if len(errs) > 0 {
 		return rep, fmt.Errorf("%d entries were not removed, the journal keeps them for the next start: %w", len(errs), errors.Join(errs...))

@@ -37,6 +37,8 @@ const usage = `vpnsplit - corp traffic through the corp VPN, chosen sites past e
                                  (SIGINT/SIGTERM/SIGHUP, console closed), or by the next start
                                  if it was killed; for scripts and services
   vpnsplit status                show what is connected and what vpnsplit added
+  vpnsplit diff                  show how routes, rules and DNS entries differ from the state
+                                 before vpnsplit started, and whose each difference is
   vpnsplit reset [--purge] [--force]
                                  remove ALL routes added by this tool and restore original
                                  routing (--purge also deletes config.json; --force removes
@@ -86,6 +88,8 @@ func run(args []string, version string) error {
 		return needAdmin(func() error { return cmdSync(config.ModeSession) })
 	case "status":
 		return cmdStatus()
+	case "diff":
+		return cmdDiff(os.Stdout)
 	case "reset":
 		o, err := parseReset(rest)
 		if err != nil {
@@ -364,6 +368,9 @@ func cmdStatus() error {
 	fmt.Printf("corp-dns=%q corp-gateway=%q home-default=%v split-dns=%v\n", cfg.CorpDNS, cfg.CorpGateway, cfg.HomeDefault, cfg.SplitDNS)
 	st, warns, jstatus := config.LoadStateStatus()
 	printWarnings(warns)
+	if n := config.LegacyNote(false); n != "" {
+		printWarnings([]string{n})
+	}
 	switch jstatus {
 	case config.JournalDenied:
 		fmt.Printf("journal of applied routes: available only with administrator rights (%s); what is applied is unknown\n", router.PrivHint)
@@ -377,6 +384,9 @@ func cmdStatus() error {
 	fmt.Printf("routes owned by vpnsplit: %d\n", len(st.Routes))
 	for _, r := range st.Routes {
 		fmt.Printf("  %-18s -> %-6s %s\n", r.Dest, r.Via, r.Iface)
+	}
+	for _, r := range st.Rules {
+		fmt.Printf("  rule: lookup %d pref %d\n", r.Table, r.Pref)
 	}
 	for _, p := range st.Resolvers {
 		fmt.Printf("  dns file %s\n", p)

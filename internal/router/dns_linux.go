@@ -4,7 +4,6 @@ package router
 
 import (
 	"fmt"
-	"net"
 	"os"
 	"strings"
 
@@ -63,11 +62,59 @@ func resolvectl(args ...string) error {
 }
 
 func resolvectlList(what, iface string) []string {
+	l, _ := resolvectlGet(what, iface)
+	return l
+}
+
+// resolvectlGet is resolvectlList that says when it could not ask.
+func resolvectlGet(what, iface string) ([]string, error) {
 	out, err := sysexec.Command("resolvectl", what, iface).Output()
 	if err != nil {
-		return nil
+		return nil, err
 	}
-	return parseResolvectl(string(out))
+	return parseResolvectl(string(out)), nil
+}
+
+// MissingResolvers lists the journal entries that systemd-resolved no longer
+// has on their link (the link was recreated, or somebody reset it). An error
+// means it could not be asked.
+func (osBackend) MissingResolvers(ids []string) ([]string, error) {
+	var missing []string
+	for _, id := range ids {
+		f := strings.Fields(id)
+		if len(f) < 2 {
+			continue
+		}
+		if _, found, err := ifaceByName(f[1]); err != nil {
+			return nil, err
+		} else if !found {
+			missing = append(missing, id)
+			continue
+		}
+		switch {
+		case len(f) == 2 && f[0] == "dns":
+			l, err := resolvectlGet("dns", f[1])
+			if err != nil {
+				return nil, err
+			}
+			if len(l) == 0 {
+				missing = append(missing, id)
+			}
+		case len(f) == 3 && f[0] == "domain":
+			l, err := resolvectlGet("domain", f[1])
+			if err != nil {
+				return nil, err
+			}
+			has := false
+			for _, d := range l {
+				has = has || d == "~"+f[2]
+			}
+			if !has {
+				missing = append(missing, id)
+			}
+		}
+	}
+	return missing, nil
 }
 
 // resolverPlan: systemd-resolved sends a zone to a link's DNS when the link
@@ -102,7 +149,7 @@ func addResolver(id string, servers []string) error {
 		cur := resolvectlList("domain", f[1])
 		for _, d := range cur {
 			if strings.TrimPrefix(d, "~") == f[2] {
-				return fmt.Errorf("already set up on %s, left as is", f[1])
+				return fmt.Errorf("%w: already set up on %s, left as is", errResolverExists, f[1])
 			}
 		}
 		return resolvectl(append([]string{"domain", f[1]}, append(cur, "~"+f[2])...)...)
@@ -118,7 +165,9 @@ func delResolver(id string) error {
 	if len(f) < 2 {
 		return nil
 	}
-	if _, err := net.InterfaceByName(f[1]); err != nil {
+	if _, found, err := ifaceByName(f[1]); err != nil {
+		return err
+	} else if !found {
 		return nil // the link is gone and took its DNS settings with it
 	}
 	switch {
@@ -140,3 +189,7 @@ func delResolver(id string) error {
 }
 
 func flushDNS() { _ = sysexec.Command("resolvectl", "flush-caches").Run() }
+
+// ListResolvers: the per-link DNS settings of systemd-resolved are not part of
+// the baseline; the journal is the record of what vpnsplit set.
+func (osBackend) ListResolvers() ([]OSResolver, error) { return nil, ErrNoTable }

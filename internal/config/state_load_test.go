@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf16"
 )
 
 // testStateEnv is a journal in a temporary directory with one legacy
@@ -227,5 +228,146 @@ func TestSaveStateRoundTrip(t *testing.T) {
 	e.dir = func(bool) (string, error) { return "", errors.New("boom") }
 	if err := e.save(want); err == nil {
 		t.Error("save error swallowed")
+	}
+}
+
+// realLegacyJournal has the structure of the state.json that an older version
+// left in %APPDATA%\vpnsplit of a real Windows host: pretty-printed by
+// json.MarshalIndent, no version or owner, no metric, an adapter name in
+// Cyrillic with a space, direct routes (public 217.12.x networks) and the two
+// halves of the home VPN, and a "sig" with the same adapter name in it.
+const realLegacyJournal = `{
+  "routes": [
+    {
+      "dest": "217.12.96.0/21",
+      "iface": "Беспроводная сеть",
+      "gateway": "192.168.1.1",
+      "via": "direct"
+    },
+    {
+      "dest": "217.12.104.0/23",
+      "iface": "Беспроводная сеть",
+      "gateway": "192.168.1.1",
+      "via": "direct"
+    },
+    {
+      "dest": "217.12.106.0/24",
+      "iface": "Беспроводная сеть",
+      "gateway": "192.168.1.1",
+      "via": "direct"
+    },
+    {
+      "dest": "0.0.0.0/1",
+      "iface": "happ-xray",
+      "via": "home"
+    },
+    {
+      "dest": "128.0.0.0/1",
+      "iface": "happ-xray",
+      "via": "home"
+    }
+  ],
+  "sig": "corp=- home=happ-xray gw=Беспроводная сеть/192.168.1.1 cfg=b9393d50"
+}`
+
+func utf16Of(s string, bom, bigEndian bool) []byte {
+	var out []byte
+	put := func(u uint16) {
+		if bigEndian {
+			out = append(out, byte(u>>8), byte(u))
+		} else {
+			out = append(out, byte(u), byte(u>>8))
+		}
+	}
+	if bom {
+		put(0xFEFF)
+	}
+	for _, u := range utf16.Encode([]rune(s)) {
+		put(u)
+	}
+	return out
+}
+
+// The journal of an older version is taken over whatever way the file was
+// saved: with a UTF-8 byte order mark, or as UTF-16 (PowerShell's Out-File).
+func TestLegacyJournalEncodings(t *testing.T) {
+	for _, c := range []struct {
+		name string
+		data []byte
+	}{
+		{"plain UTF-8", []byte(realLegacyJournal)},
+		{"UTF-8 with BOM", append([]byte{0xEF, 0xBB, 0xBF}, realLegacyJournal...)},
+		{"UTF-16 LE with BOM", utf16Of(realLegacyJournal, true, false)},
+		{"UTF-16 BE with BOM", utf16Of(realLegacyJournal, true, true)},
+		{"UTF-16 LE without BOM", utf16Of(realLegacyJournal, false, false)},
+		{"UTF-16 BE without BOM", utf16Of(realLegacyJournal, false, true)},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			e, journal, legacy := testStateEnv(t, true)
+			lp := filepath.Join(legacy, stateFile)
+			if err := os.WriteFile(lp, c.data, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			s, warns, status := e.load()
+			if status != JournalOK || len(s.Routes) != 5 || s.Routes[0].Iface != "Беспроводная сеть" || s.Sig == "" {
+				t.Fatalf("%v %+v %q", status, s, warns)
+			}
+			for _, r := range s.Routes {
+				if !r.Legacy() {
+					t.Errorf("a route of the old journal has no metric: %+v", r)
+				}
+			}
+			if _, err := os.Lstat(lp); !os.IsNotExist(err) {
+				t.Errorf("the old file must be moved: %v", err)
+			}
+			if got := readStr(t, filepath.Join(journal, stateFile)); !strings.Contains(got, "217.12.96.0/21") {
+				t.Errorf("the protected journal: %s", got)
+			}
+			if p := e.legacyPending(); len(p) != 0 {
+				t.Errorf("nothing is pending after the transfer: %+v", p)
+			}
+		})
+	}
+}
+
+// Without rights the old journal stays where it is, and the program says so
+// and why (instead of silently showing nothing).
+func TestLegacyPendingSaysWhy(t *testing.T) {
+	e, _, legacy := testStateEnv(t, false)
+	write(t, legacy, stateFile, realLegacyJournal)
+	p := e.legacyPending()
+	if len(p) != 1 || p[0].Routes != 5 || !strings.Contains(p[0].Reason, "administrator") {
+		t.Fatalf("%+v", p)
+	}
+	ru, en := legacyNoteOf(p, true), legacyNoteOf(p, false)
+	if !strings.Contains(ru, "старый журнал найден, но не перенесён") || !strings.Contains(ru, "маршрутов: 5") || !strings.Contains(ru, "без прав администратора") {
+		t.Errorf("%q", ru)
+	}
+	if !strings.Contains(en, "found but not transferred") || !strings.Contains(en, "5 routes") {
+		t.Errorf("%q", en)
+	}
+	if s, warns, _ := e.load(); len(s.Routes) != 5 || len(warns) != 0 {
+		t.Errorf("without rights the entries are included but not moved: %+v %q", s, warns)
+	}
+
+	// a file that is not a journal: the reason is the parse error
+	bad := filepath.Join(legacy, stateFile)
+	if err := os.WriteFile(bad, []byte("not json at all"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	p = e.legacyPending()
+	if len(p) != 1 || !strings.Contains(p[0].Reason, "not a valid journal") {
+		t.Fatalf("%+v", p)
+	}
+	ee, _, _ := testStateEnv(t, true)
+	ee.legacy = e.legacy
+	_, warns, _ := ee.load()
+	if !strings.Contains(strings.Join(warns, "|"), "found but not transferred") {
+		t.Errorf("%q", warns)
+	}
+
+	// nothing there: no note
+	if note := legacyNoteOf((&stateEnv{legacy: []string{t.TempDir()}}).legacyPending(), true); note != "" {
+		t.Errorf("%q", note)
 	}
 }

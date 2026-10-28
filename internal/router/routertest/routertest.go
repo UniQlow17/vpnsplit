@@ -125,6 +125,17 @@ func (b backend) DelRoute(r config.Route) error {
 	return b.r.Fail[r.Dest]
 }
 
+func (b backend) Routes() ([]router.OSRoute, error) { return nil, router.ErrNoTable }
+func (b backend) Rules() ([]router.OSRule, error)   { return nil, nil }
+func (b backend) AddRule(r config.Rule) error {
+	b.r.record(fmt.Sprintf("addrule %d", r.Pref))
+	return nil
+}
+func (b backend) DelRule(r config.Rule) error {
+	b.r.record(fmt.Sprintf("rule %d", r.Pref))
+	return nil
+}
+
 type store struct{ r *Rig }
 
 func (s store) Load() (*config.State, []string, config.JournalStatus) {

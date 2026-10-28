@@ -214,3 +214,20 @@ func TestPrintOwnerWarnsAboutDNSOfDeadSession(t *testing.T) {
 		t.Errorf("%s", out.String())
 	}
 }
+
+func TestEndSaysWhetherTheSystemIsBackToWhatItWas(t *testing.T) {
+	r := routertest.New(routertest.Journal(config.ModePersistent))
+	sess, err := acquire(t.Context(), r.M, config.ModeSession, &bytes.Buffer{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	var saved []string
+	var rerr error
+	endWith(sess, endInfo{deadline: time.Now().Add(5 * time.Second), reason: "finished",
+		saveLast: func(s string) error { saved = append(saved, s); return nil }}, &rerr, &out)
+	// the Rig keeps no snapshot: nothing is compared, and nothing false is claimed
+	if strings.Contains(out.String(), "Restored to the state") || len(saved) != 1 || strings.Contains(saved[0], "Restored") {
+		t.Errorf("%q %q", out.String(), saved)
+	}
+}

@@ -3,18 +3,19 @@
 Runs the Linux network stand (test/stand) in a privileged Docker container.
 
 .DESCRIPTION
-Builds the Linux vpnsplit binary on the host, builds the stand image once
+Builds the Linux vpnsplit binary on the host (with -tags vpnsplit_stand, which
+enables the slow-removal hook the S8 scenario uses), builds the stand image once
 (alpine + iproute2, wireguard-tools, dnsmasq, ...), then runs stand.sh in a
 `docker run --rm --privileged` container. Everything that changes the network
 happens inside the container, never on this machine.
 
 .PARAMETER HomeVariant
 How the home VPN client routes: a (0/1 + 128/1 in the main table, default),
-b (wg-quick style policy routing), c (own routing table via ip rule).
-Only a is supported by vpnsplit now; b and c only set up the topology.
+b (sing-box style: ip rule pref 9000 not fwmark 2022 lookup 2022),
+c (wg-quick style: fwmark, suppress_prefixlength 0).
 
 .PARAMETER Only
-Run only the scenarios whose name contains this text (S1, S3, S6, ...).
+Run only the scenario with this id (S1, S3, S6, S9, S10, ...).
 
 .PARAMETER Rebuild
 Rebuild the stand image.
@@ -45,7 +46,7 @@ Push-Location $repo
 try {
     $saved = @{ GOOS = $env:GOOS; GOARCH = $env:GOARCH; CGO_ENABLED = $env:CGO_ENABLED }
     $env:GOOS = 'linux'; $env:GOARCH = 'amd64'; $env:CGO_ENABLED = '0'
-    go build -o (Join-Path $build 'vpnsplit') ./cmd/vpnsplit
+    go build -tags vpnsplit_stand -o (Join-Path $build 'vpnsplit') ./cmd/vpnsplit
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 }
 finally {
@@ -65,7 +66,7 @@ if ($Rebuild -or -not $have) {
 
 Write-Host '== running the stand' -ForegroundColor Cyan
 docker run --rm --privileged `
-    -e "HOME_VARIANT=$HomeVariant" -e "ONLY=$Only" `
+    -e "HOME_VARIANT=$HomeVariant" -e "ONLY=$Only" -e "DBG=$env:DBG" `
     -v "${PSScriptRoot}:/stand" `
     $image bash /stand/stand.sh
 exit $LASTEXITCODE

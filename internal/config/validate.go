@@ -78,7 +78,7 @@ func ValidIface(s string) bool {
 
 // validVia: where a route sends traffic (empty for old journals).
 func validVia(s string) bool {
-	return s == "" || s == "corp" || s == "home" || s == "direct"
+	return s == "" || s == "corp" || s == "home" || s == "direct" || s == "pin"
 }
 
 // ValidateRoute checks a journal entry before anything is executed for it.
@@ -96,6 +96,12 @@ func ValidateRoute(r Route) error {
 	}
 	if !validVia(r.Via) {
 		return fmt.Errorf("route %s: unknown direction %q", r.Dest, clip(r.Via))
+	}
+	if r.Metric < 0 || r.Metric > MaxMetric {
+		return fmt.Errorf("route %s: invalid metric %d", r.Dest, r.Metric)
+	}
+	if r.Table != 0 && !IsOwnTable(r.Table) {
+		return fmt.Errorf("route %s: invalid table %d", r.Dest, r.Table)
 	}
 	return nil
 }
@@ -187,4 +193,24 @@ func ParseBool(s string) (bool, error) {
 		return false, nil
 	}
 	return false, fmt.Errorf("%q is not a yes/no value (use true/yes/1/да/on or false/no/0/нет/off)", clip(s))
+}
+
+// MaxMetric bounds the route metric accepted from a journal.
+const MaxMetric = 9999
+
+// ValidateRule checks a journal entry of a policy rule before it is executed.
+func ValidateRule(r Rule) error {
+	if !IsOwnTable(r.Table) {
+		return fmt.Errorf("rule: table %d is not the table of this tool", r.Table)
+	}
+	if r.Pref < 1 || r.Pref > 32765 {
+		return fmt.Errorf("rule lookup %d: invalid preference %d", r.Table, r.Pref)
+	}
+	return nil
+}
+
+// hasControl reports whether s has control characters (it is not clipped:
+// the journal's Sig is long, and a clipped copy would never equal the original).
+func hasControl(s string) bool {
+	return strings.IndexFunc(s, unicode.IsControl) >= 0 || !utf8.ValidString(s)
 }

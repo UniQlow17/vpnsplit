@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"unicode/utf16"
 )
 
 const stateFile = "state.json"
@@ -15,7 +16,52 @@ type Route struct {
 	Dest    string `json:"dest"` // CIDR
 	Iface   string `json:"iface"`
 	Gateway string `json:"gateway,omitempty"`
-	Via     string `json:"via,omitempty"` // corp, home or direct; for display
+	Via     string `json:"via,omitempty"` // corp, home, direct or pin; for display
+	// Metric is the route metric the route was created with; it is part of
+	// what marks the route as ours (see EffMetric). 0 in a journal written
+	// before the metric was recorded: such routes have metric 1.
+	Metric int `json:"metric,omitempty"`
+	// Table is the routing table the route lives in: 0 is the main one,
+	// an own one (Linux, see Rule; OwnTable or the next free of 247-250). Routes of older journals are in main.
+	Table int `json:"table,omitempty"`
+}
+
+// OwnTable is the routing table (Linux) in which routes live that must be seen
+// by a policy rule of ours. 247 (0xF7) is the number our routes and rules carry
+// as their protocol too; it is not in the rt_tables of iproute2, and Apply
+// leaves the table alone if somebody else has put routes into it.
+const OwnTable = 247
+
+// OwnTableLast ends the range from which a table is picked when OwnTable is
+// taken by somebody else (see IsOwnTable): 247 to 250.
+const OwnTableLast = 250
+
+// IsOwnTable reports whether t is one of the tables vpnsplit may use.
+func IsOwnTable(t int) bool { return t >= OwnTable && t <= OwnTableLast }
+
+// LegacyMetric is the metric every route had before the journal recorded one.
+const LegacyMetric = 1
+
+// EffMetric is the metric the route has in the OS table.
+func (r Route) EffMetric() int {
+	if r.Metric == 0 {
+		return LegacyMetric
+	}
+	return r.Metric
+}
+
+// Legacy reports whether the route comes from a journal that recorded no
+// metric (and, on OSes that tag routes, no tag either).
+func (r Route) Legacy() bool { return r.Metric == 0 }
+
+// Rule is the policy routing rule added by this tool (Linux): "lookup Table"
+// at preference Pref, with no selector, before the rules of a VPN client that
+// sends everything into its own table. Our routes for corp and direct
+// networks live in Table. A packet that finds no route there goes on to the
+// next rule, so a missing route of ours never lets traffic around the client.
+type Rule struct {
+	Table int `json:"table"`
+	Pref  int `json:"pref"`
 }
 
 // How the journal's owner treats what it applied when it exits.
@@ -46,12 +92,16 @@ type State struct {
 	Owner     *Owner   `json:"owner,omitempty"` // nil: journal of an older version
 	Mode      string   `json:"mode,omitempty"`  // ModeSession or ModePersistent; "" with no owner
 	Routes    []Route  `json:"routes"`
+	Rules     []Rule   `json:"rules,omitempty"`     // policy routing rules we created (Linux)
 	Resolvers []string `json:"resolvers,omitempty"` // per-domain DNS entries we created
 	Sig       string   `json:"sig,omitempty"`       // what was connected when applied
+	DNSSig    string   `json:"dns_sig,omitempty"`   // what the DNS entries were created for
 }
 
 // Empty reports whether nothing is applied.
-func (s *State) Empty() bool { return len(s.Routes) == 0 && len(s.Resolvers) == 0 && s.Sig == "" }
+func (s *State) Empty() bool {
+	return len(s.Routes) == 0 && len(s.Rules) == 0 && len(s.Resolvers) == 0 && s.Sig == ""
+}
 
 // ValidResolverEntry reports whether id is a DNS journal entry in the format
 // of this OS (see resolverPlan in internal/router).
@@ -91,6 +141,15 @@ func (s *State) Sanitize() (warnings []string) {
 		routes = append(routes, r)
 	}
 	s.Routes = routes
+	var rules []Rule
+	for _, r := range s.Rules {
+		if err := ValidateRule(r); err != nil {
+			warnings = append(warnings, "journal: entry dropped: "+err.Error())
+			continue
+		}
+		rules = append(rules, r)
+	}
+	s.Rules = rules
 	var res []string
 	for _, id := range s.Resolvers {
 		if !ValidResolverEntry(id) {
@@ -100,8 +159,11 @@ func (s *State) Sanitize() (warnings []string) {
 		res = append(res, id)
 	}
 	s.Resolvers = res
-	if len(s.Sig) > 1024 || clip(s.Sig) != s.Sig {
+	if len(s.Sig) > 1024 || hasControl(s.Sig) {
 		s.Sig = ""
+	}
+	if len(s.DNSSig) > 4096 || hasControl(s.DNSSig) {
+		s.DNSSig = ""
 	}
 	if s.Mode != ModeSession && s.Mode != ModePersistent {
 		s.Mode = ""
@@ -116,7 +178,39 @@ func (s *State) Sanitize() (warnings []string) {
 	return warnings
 }
 
+// decodeText turns the bytes of a text file into UTF-8: a byte order mark is
+// dropped, and UTF-16 (with or without the mark; what PowerShell's Out-File and
+// Notepad write) is converted.
+func decodeText(b []byte) []byte {
+	switch {
+	case len(b) >= 3 && b[0] == 0xEF && b[1] == 0xBB && b[2] == 0xBF:
+		return b[3:]
+	case len(b) >= 2 && b[0] == 0xFF && b[1] == 0xFE:
+		return utf16Bytes(b[2:], false)
+	case len(b) >= 2 && b[0] == 0xFE && b[1] == 0xFF:
+		return utf16Bytes(b[2:], true)
+	case len(b) >= 4 && b[0] != 0 && b[1] == 0 && b[2] != 0 && b[3] == 0: // "{" 0 and the like
+		return utf16Bytes(b, false)
+	case len(b) >= 4 && b[0] == 0 && b[1] != 0 && b[2] == 0 && b[3] != 0:
+		return utf16Bytes(b, true)
+	}
+	return b
+}
+
+func utf16Bytes(b []byte, bigEndian bool) []byte {
+	u := make([]uint16, 0, len(b)/2)
+	for i := 0; i+1 < len(b); i += 2 {
+		if bigEndian {
+			u = append(u, uint16(b[i])<<8|uint16(b[i+1]))
+		} else {
+			u = append(u, uint16(b[i+1])<<8|uint16(b[i]))
+		}
+	}
+	return []byte(string(utf16.Decode(u)))
+}
+
 func parseState(b []byte) (*State, []string, error) {
+	b = decodeText(b)
 	s := &State{}
 	if err := json.Unmarshal(b, s); err != nil {
 		return nil, nil, err
@@ -133,6 +227,15 @@ func (s *State) merge(o *State) {
 	for _, r := range o.Routes {
 		if !have[r] {
 			s.Routes = append(s.Routes, r)
+		}
+	}
+	haveRule := map[Rule]bool{}
+	for _, r := range s.Rules {
+		haveRule[r] = true
+	}
+	for _, r := range o.Rules {
+		if !haveRule[r] {
+			s.Rules = append(s.Rules, r)
 		}
 	}
 	for _, id := range o.Resolvers {

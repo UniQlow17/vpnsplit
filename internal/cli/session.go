@@ -20,6 +20,10 @@ import (
 func acquire(ctx context.Context, mgr *router.Manager, mode string, out io.Writer) (*router.Session, error) {
 	sess, info, err := mgr.Acquire(ctx, mode, out)
 	printWarningsTo(out, info.Warns)
+	// an old-format journal that is still where it was: say that and why
+	if n := config.LegacyNote(false); n != "" {
+		printWarningsTo(out, []string{n})
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -32,8 +36,13 @@ func acquire(ctx context.Context, mgr *router.Manager, mode string, out io.Write
 	for _, e := range info.Errors {
 		fmt.Fprintln(os.Stderr, "  !", e)
 	}
+	if info.Baseline != nil {
+		if s := info.Baseline.Describe(false); s != "" {
+			fmt.Fprintln(out, "state before the earlier run:", s)
+		}
+	}
 	if info.TookOver {
-		fmt.Fprintln(out, "took over the routes applied by apply/watch: they are removed when this run ends")
+		fmt.Fprintln(out, "took over the routes of the journal that had no owner (apply/watch or an older version): they are removed when this run ends")
 	}
 	return sess, nil
 }
@@ -94,6 +103,12 @@ func endWith(sess *router.Session, ei endInfo, errp *error, out io.Writer) {
 	} else if session {
 		summary = rep.Describe(false)
 		fmt.Fprintln(out, "session ended,", summary)
+		if rep.Base != nil {
+			if s := rep.Base.Describe(false); s != "" {
+				fmt.Fprintln(out, s)
+				summary += ". " + s
+			}
+		}
 	}
 	if n := rep.Notice(false); n != "" {
 		fmt.Fprintln(out, n)
@@ -136,6 +151,7 @@ type resetOpts struct {
 
 func cmdReset(mgr *router.Manager, o resetOpts, out io.Writer) (err error) {
 	mgr.SetForce(o.force)
+	mgr.NoSnapshot() // reset takes nothing new on; it compares with the snapshot of the run it undoes
 	sess, err := acquire(context.Background(), mgr, config.ModePersistent, out)
 	if err != nil {
 		return err
@@ -164,9 +180,26 @@ func cmdReset(mgr *router.Manager, o resetOpts, out io.Writer) (err error) {
 	if len(errs) > 0 {
 		return fmt.Errorf("%d entries could not be removed; journal kept, run reset again (`reset --force` if the routes should be gone with a reboot but are still in the table)", len(errs))
 	}
+	if b := sess.Settle(time.Now().Add(resetCompareBudget)); b != nil {
+		if b.Checked && !b.Restored() {
+			for _, l := range b.Lines(false) {
+				fmt.Fprintln(out, " ", l)
+			}
+		}
+		if s := b.Describe(false); s != "" {
+			fmt.Fprintln(out, s)
+		}
+	}
 	fmt.Fprintln(out, "routing is back to what your VPN clients and OS set up. Reconnect the VPNs if something still looks off.")
 	return nil
 }
+
+// How often cmdSync looks at the adapters and the routing table, and how soon
+// after a restoration of missing routes it may try that again.
+const (
+	syncInterval = 2 * time.Second
+	driftRetry   = 10 * time.Second
+)
 
 // cmdSync keeps routes in line with what is connected, until a signal. In
 // the persistent mode (watch) they stay afterwards; in the session mode
@@ -213,6 +246,7 @@ func cmdSync(mode string) (err error) {
 		fmt.Println("\n"+time.Now().Format("15:04:05"), "got", sig, "- stopping")
 		return nil
 	}
+	var lastDrift time.Time
 	for {
 		if ctx.Err() != nil {
 			return stopping()
@@ -222,9 +256,22 @@ func cmdSync(mode string) (err error) {
 			return err
 		}
 		e := router.Detect(cfg)
-		switch apply, reset := router.Sync(cfg, e, config.LoadState()); {
+		st := config.LoadState()
+		apply, reset := router.Sync(cfg, e, st)
+		drift := false
+		// a VPN that reconnected took its routes along: they are missing from the
+		// table although nothing in the configuration changed. Reading the table
+		// is cheap; a retry is not made more often than every driftRetry.
+		if !apply && !reset && time.Since(lastDrift) >= driftRetry && router.Drifted(st) {
+			apply, drift, lastDrift = true, true, time.Now()
+		}
+		switch {
 		case apply:
-			fmt.Println(time.Now().Format("15:04:05"), "VPNs or rules changed, applying")
+			if drift {
+				fmt.Println(time.Now().Format("15:04:05"), "routes are missing from the table, restoring")
+			} else {
+				fmt.Println(time.Now().Format("15:04:05"), "VPNs or rules changed, applying")
+			}
 			if err := mgr.Apply(cfg, os.Stdout); err != nil && ctx.Err() == nil {
 				fmt.Println("  !", err)
 			}
@@ -235,9 +282,32 @@ func cmdSync(mode string) (err error) {
 		select {
 		case <-ctx.Done():
 			return stopping()
-		case <-time.After(5 * time.Second):
+		case <-time.After(syncInterval):
 		}
 	}
+}
+
+// resetCompareBudget is how long `reset` may take to compare the system with the
+// state before the start, after it has removed what the journal listed.
+const resetCompareBudget = 30 * time.Second
+
+// cmdDiff shows how the system differs from the state before vpnsplit started:
+// what is new (and whose it is: ours is removed at the end of a session,
+// everything else belongs to a VPN client or the OS and stays) and what is gone.
+func cmdDiff(out io.Writer) error {
+	b := router.Diff(context.Background(), true)
+	if !b.Checked {
+		fmt.Fprintln(out, "no comparison:", b.Note)
+		if !router.IsPrivileged() {
+			fmt.Fprintf(out, "the snapshot is kept in the protected directory: %s\n", router.PrivHint)
+		}
+		return nil
+	}
+	for _, l := range b.Lines(false) {
+		fmt.Fprintln(out, l)
+	}
+	fmt.Fprintln(out, b.Describe(false))
+	return nil
 }
 
 // printOwner tells who applied what the journal lists and what happens to it.

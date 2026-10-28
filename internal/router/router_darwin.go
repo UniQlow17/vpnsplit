@@ -3,11 +3,13 @@
 package router
 
 import (
+	"bytes"
 	"fmt"
 	"net"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 
 	"github.com/UniQlow17/vpnsplit/internal/config"
@@ -28,32 +30,74 @@ func routeCmd(args ...string) error {
 	return nil
 }
 
+const (
+	// ownMetric is only recorded in the journal: BSD routes have no metric.
+	ownMetric = 1
+	// routesTagged: routes carry RTF_PROTO2 (see addRoute), but the table is
+	// not read here, so the tag is never checked.
+	routesTagged = false
+)
+
+// listRoutes: the table is read through the PF_ROUTE sysctl (NET_RT_DUMP2),
+// which needs x/net/route or hand-written sockaddr parsing; neither can be
+// tested here, so the journal alone says what is in the table.
+func listRoutes() ([]OSRoute, error) { return nil, ErrNoTable }
+
 func addRoute(r config.Route) error {
 	if err := config.ValidateRoute(r); err != nil {
 		return err
 	}
-	err := addRouteCmd(r)
+	err := addRouteCmd(r, true)
+	if err != nil && strings.Contains(err.Error(), "bad keyword") {
+		err = addRouteCmd(r, false) // a route(8) without -proto2: untagged, but there (see bsdOwns)
+	}
 	if err != nil && strings.Contains(strings.ToLower(err.Error()), "exists") {
 		return fmt.Errorf("%w: %v", errExists, err)
 	}
 	return err
 }
 
-func addRouteCmd(r config.Route) error {
+// addRouteCmd runs `route add`; -proto2 sets RTF_PROTO2 (0x4000), a flag the
+// kernel keeps and `netstat -rn` shows as "2". Nothing else in the system
+// sets it for routes of this kind, which tells our routes from the clients'.
+func addRouteCmd(r config.Route, tag bool) error {
+	var args []string
 	if r.Gateway != "" {
-		return routeCmd("add", "-net", r.Dest, r.Gateway)
+		args = []string{"add", "-net", r.Dest, r.Gateway}
+	} else {
+		args = []string{"add", "-net", r.Dest, "-interface", r.Iface}
 	}
-	return routeCmd("add", "-net", r.Dest, "-interface", r.Iface)
+	if tag {
+		args = append(args, "-proto2")
+	}
+	return routeCmd(args...)
 }
 
+// delRoute removes only our route. `route delete` takes a destination and a
+// next hop, nothing that says whose route it is, so the route is looked at
+// first (`route -n get`): it is removed if it has the next hop (or, on-link,
+// the adapter) of the journal and our tag RTF_PROTO2. A route of a client to the
+// same destination through another gateway, or without the tag, stays. Where
+// the route tool has no -proto2 the tag is not asked for (see bsdOwns).
 func delRoute(r config.Route) error {
 	if err := config.ValidateRoute(r); err != nil {
 		return err
 	}
-	if _, err := net.InterfaceByName(r.Iface); err != nil && r.Gateway == "" {
+	if _, found, err := ifaceByName(r.Iface); err != nil {
+		return err
+	} else if !found && r.Gateway == "" {
 		return nil // the tunnel is gone and took its routes with it
 	}
-	var err error
+	out, err := sysexec.Command("route", "-n", "get", "-net", r.Dest).CombinedOutput()
+	if err != nil {
+		if strings.Contains(string(out), "not in table") {
+			return nil
+		}
+		return fmt.Errorf("route get %s: %s", r.Dest, strings.TrimSpace(string(out)))
+	}
+	if !bsdOwns(parseRouteGet(string(out)), r, routeToolHasProto2()) {
+		return nil // not the route we added: somebody else's to the same place
+	}
 	if r.Gateway != "" {
 		err = routeCmd("delete", "-net", r.Dest, r.Gateway)
 	} else {
@@ -63,6 +107,30 @@ func delRoute(r config.Route) error {
 		return nil
 	}
 	return err
+}
+
+var proto2Once struct {
+	sync.Once
+	ok bool
+}
+
+// routeToolHasProto2 reports whether route(8) knows the -proto2 modifier (it is
+// a keyword in its table: the string is in the binary). It is true when that
+// cannot be found out, which is the safe answer: the tag is then required.
+func routeToolHasProto2() bool {
+	proto2Once.Do(func() {
+		proto2Once.ok = true
+		path, err := sysexec.LookPath("route")
+		if err != nil {
+			return
+		}
+		b, err := os.ReadFile(path)
+		if err != nil {
+			return
+		}
+		proto2Once.ok = bytes.Contains(b, []byte("proto2"))
+	})
+	return proto2Once.ok
 }
 
 // physicalGateway is the default route of Wi-Fi/Ethernet; it stays in the
@@ -182,7 +250,7 @@ func addResolver(path string, servers []string) error {
 		return err
 	}
 	if exists && !ours {
-		return fmt.Errorf("%s exists and is not ours, left as is", path)
+		return fmt.Errorf("%w: %s exists and is not ours, left as is", errResolverExists, path)
 	}
 	if err := os.MkdirAll(resolverDir, 0o755); err != nil {
 		return err
@@ -219,7 +287,45 @@ func delResolver(path string) error {
 	return os.Remove(path)
 }
 
+// MissingResolvers lists the resolver files of the journal that are gone or are
+// not ours any more.
+func (osBackend) MissingResolvers(ids []string) ([]string, error) {
+	var missing []string
+	for _, id := range ids {
+		if checkResolverPath(id) != nil {
+			continue
+		}
+		_, ours, err := ourFile(id)
+		if err != nil {
+			return nil, err
+		}
+		if !ours {
+			missing = append(missing, id)
+		}
+	}
+	return missing, nil
+}
+
 func flushDNS() {
 	_ = sysexec.Command("dscacheutil", "-flushcache").Run()
 	_ = sysexec.Command("killall", "-HUP", "mDNSResponder").Run()
+}
+
+// ListResolvers lists the files of /etc/resolver by their paths; a file with
+// our marker is ours.
+func (osBackend) ListResolvers() ([]OSResolver, error) {
+	ents, err := os.ReadDir(resolverDir)
+	if os.IsNotExist(err) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var res []OSResolver
+	for _, e := range ents {
+		p := filepath.Join(resolverDir, e.Name())
+		_, ours, _ := ourFile(p)
+		res = append(res, OSResolver{ID: p, Ours: ours})
+	}
+	return res, nil
 }
