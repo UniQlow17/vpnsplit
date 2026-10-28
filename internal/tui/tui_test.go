@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/x/ansi"
 
 	"github.com/UniQlow17/vpnsplit/internal/config"
 	"github.com/UniQlow17/vpnsplit/internal/netif"
@@ -79,5 +80,39 @@ func TestRulesAddAndDelete(t *testing.T) {
 	got, _ = mm.updateKeys(keyMsg("n"))
 	if mm = got.(model); mm.delAsk || len(mm.cfg.Networks) != 1 {
 		t.Fatal("any other key must cancel the delete")
+	}
+}
+
+func plain(lines []string) string { return ansi.Strip(strings.Join(lines, "\n")) }
+
+func TestStatusWithoutRightsSaysJournalIsAdminOnly(t *testing.T) {
+	m := testModel()
+	m.st = &config.State{}
+	m.journal = config.JournalDenied
+	got := plain(m.statusLines())
+	if !strings.Contains(got, "журнал доступен только с правами администратора") {
+		t.Errorf("no explanation:\n%s", got)
+	}
+	if strings.Contains(got, "ничего — нажмите") {
+		t.Errorf("claims nothing is applied:\n%s", got)
+	}
+}
+
+func TestWarningsAreFlashedOnceAndListed(t *testing.T) {
+	m := testModel()
+	m.st = &config.State{}
+	m.warns = []string{`config: domains: rule "bad domain" dropped: x`, "journal: something"}
+	m.flashWarnings()
+	if !strings.Contains(m.flash, "bad domain") || !strings.Contains(m.flash, "ещё 1") {
+		t.Errorf("flash = %q", m.flash)
+	}
+	m.flash = ""
+	m.flashWarnings() // the same set again: no new flash
+	if m.flash != "" {
+		t.Errorf("flashed twice: %q", m.flash)
+	}
+	got := plain(m.statusLines())
+	if !strings.Contains(got, "Предупреждения") || !strings.Contains(got, "bad domain") || !strings.Contains(got, "config.json.bak") {
+		t.Errorf("warnings not listed:\n%s", got)
 	}
 }

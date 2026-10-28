@@ -4,10 +4,11 @@ package netif
 
 import (
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
+
+	"github.com/UniQlow17/vpnsplit/internal/sysexec"
 )
 
 // owners names the program behind tun adapters it can be sure about:
@@ -19,7 +20,7 @@ import (
 // It also returns the running processes for guessing the rest.
 func owners(ifs []Info) (map[string]string, []string) {
 	res := map[string]string{}
-	if out, err := exec.Command("nmcli", "-t", "-f", "NAME,TYPE,DEVICE", "connection", "show", "--active").Output(); err == nil {
+	if out, err := sysexec.Command("nmcli", "-t", "-f", "NAME,TYPE,DEVICE", "connection", "show", "--active").Output(); err == nil {
 		for iface, name := range parseNMActive(string(out)) {
 			if Classify(iface) != KindPhysical {
 				if p, ok := findProvider(name); ok {

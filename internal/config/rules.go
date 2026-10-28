@@ -2,13 +2,14 @@ package config
 
 import (
 	"fmt"
-	"net"
+	"net/netip"
 	"strings"
 )
 
 // NormalizeRule classifies input as a network (isNet: IPv4 CIDR, IP, or an
 // autonomous system "AS49675" that stands for all its networks) or a domain,
-// and returns its canonical form.
+// and returns its canonical form. Domains must be ASCII (punycode for
+// internationalized names) and pass ValidDomain.
 func NormalizeRule(s string) (isNet bool, val string, err error) {
 	s = strings.TrimSpace(strings.ToLower(s))
 	if s == "" {
@@ -18,23 +19,26 @@ func NormalizeRule(s string) (isNet bool, val string, err error) {
 		if n = strings.TrimLeft(n, "0"); n == "" {
 			return false, "", fmt.Errorf("AS0 is not a real autonomous system")
 		}
-		return true, "AS" + n, nil
-	}
-	if _, n, e := net.ParseCIDR(s); e == nil {
-		if n.IP.To4() == nil {
-			return false, "", fmt.Errorf("%s: only IPv4 is supported", s)
+		if as := "AS" + n; ValidAS(as) {
+			return true, as, nil
 		}
-		return true, n.String(), nil
+		return false, "", fmt.Errorf("%q is not a valid AS number", clip(s))
 	}
-	if ip := net.ParseIP(s); ip != nil {
-		if ip.To4() == nil {
-			return false, "", fmt.Errorf("%s: only IPv4 is supported", s)
+	if p, e := netip.ParsePrefix(s); e == nil {
+		if !p.Addr().Is4() {
+			return false, "", fmt.Errorf("%s: only IPv4 is supported", clip(s))
 		}
-		return true, ip.String() + "/32", nil
+		return true, p.Masked().String(), nil
 	}
-	s = strings.TrimPrefix(s, "*.")
-	if strings.ContainsAny(s, " /\\:") || !strings.Contains(s, ".") {
-		return false, "", fmt.Errorf("%q is neither a CIDR/IP nor a domain", s)
+	if a, e := netip.ParseAddr(s); e == nil {
+		if !a.Is4() {
+			return false, "", fmt.Errorf("%s: only IPv4 is supported", clip(s))
+		}
+		return true, a.String() + "/32", nil
+	}
+	s = strings.TrimSuffix(strings.TrimPrefix(s, "*."), ".")
+	if last := s[strings.LastIndex(s, ".")+1:]; !strings.Contains(s, ".") || !ValidZone(s) || strings.Trim(last, "0123456789") == "" {
+		return false, "", fmt.Errorf("%q is neither a CIDR/IP nor a domain (ASCII letters, digits, '-', '_' and '.'; for non-ASCII names use punycode, e.g. xn--e1afmkfd.xn--p1ai)", clip(s))
 	}
 	return false, s, nil
 }

@@ -40,7 +40,9 @@ type (
 		env          router.Env
 		st           *config.State
 		routes       int
-		apply, reset bool // what auto mode should do
+		apply, reset bool                 // what auto mode should do
+		warns        []string             // config and journal problems found while loading
+		journal      config.JournalStatus // whether the protected journal could be read
 	}
 	opDone struct {
 		title string
@@ -60,6 +62,9 @@ type model struct {
 	needReset  bool
 	routes     int
 	st         *config.State
+	warns      []string
+	warnShown  string // the warnings already flashed, to flash a new set only
+	journal    config.JournalStatus
 	delAsk     bool // rules: waiting for "delete this rule?" answer
 	scroll     int  // status screen
 	admin      bool
@@ -163,10 +168,11 @@ func tick() tea.Cmd {
 
 func refreshCmd() tea.Cmd {
 	return func() tea.Msg {
-		st := config.LoadState()
-		s := statusMsg{routes: len(st.Routes), st: st}
-		if cfg, err := config.Load(); err == nil {
+		st, warns, journal := config.LoadStateStatus()
+		s := statusMsg{routes: len(st.Routes), st: st, warns: warns, journal: journal}
+		if cfg, cwarns, err := config.LoadChecked(); err == nil {
 			s.cfg = cfg
+			s.warns = append(s.warns, cwarns...)
 			s.env = router.Detect(cfg)
 			s.apply, s.reset = router.Sync(cfg, s.env, st)
 		}
@@ -223,6 +229,25 @@ func (m *model) startReset(quiet bool) tea.Cmd {
 
 func (m *model) setFlash(s string) { m.flash, m.flashAt = s, m.frame+40 }
 
+// flashWarnings tells about config or journal problems (dropped rules, a
+// broken journal) once per distinct set, so they are not lost silently; the
+// status screen keeps listing them.
+func (m *model) flashWarnings() {
+	key := strings.Join(m.warns, "\n")
+	if key == m.warnShown {
+		return
+	}
+	m.warnShown = key
+	if len(m.warns) == 0 {
+		return
+	}
+	text := "Внимание: " + m.warns[0]
+	if n := len(m.warns) - 1; n > 0 {
+		text += fmt.Sprintf(" (и ещё %d, см. «Статус»)", n)
+	}
+	m.setFlash(text)
+}
+
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tickMsg:
@@ -244,6 +269,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.refreshing = false
 		m.cfg, m.env, m.routes, m.st = msg.cfg, msg.env, msg.routes, msg.st
 		m.needApply, m.needReset = msg.apply, msg.reset
+		m.warns, m.journal = msg.warns, msg.journal
+		m.flashWarnings()
 		if m.auto && m.busy == "" && m.cfg != nil && m.admin && m.frame >= m.autoWait {
 			if m.needApply {
 				m.autoWait = m.frame + 100
@@ -568,9 +595,18 @@ func (m model) statusLines() []string {
 	if st == nil {
 		st = &config.State{}
 	}
-	h(fmt.Sprintf("Применено сейчас: %d маршрутов, %d DNS-записей", len(st.Routes), len(st.Resolvers)))
-	if st.Empty() {
-		line("  %s", sYel.Render("ничего — нажмите «Применить маршруты» или включите авто-режим"))
+	switch m.journal {
+	case config.JournalDenied:
+		h("Применено сейчас")
+		line("  %s", sYel.Render("журнал доступен только с правами администратора: что применено — неизвестно"))
+	case config.JournalUnreadable:
+		h("Применено сейчас")
+		line("  %s", sRed.Render("журнал не читается (см. предупреждения ниже): что применено — неизвестно"))
+	default:
+		h(fmt.Sprintf("Применено сейчас: %d маршрутов, %d DNS-записей", len(st.Routes), len(st.Resolvers)))
+		if st.Empty() {
+			line("  %s", sYel.Render("ничего — нажмите «Применить маршруты» или включите авто-режим"))
+		}
 	}
 	for _, g := range []struct{ via, title string }{
 		{router.ViaCorp, "через корп. VPN"}, {router.ViaDirect, "напрямую"}, {router.ViaHome, "через домашний VPN"},
@@ -601,6 +637,18 @@ func (m model) statusLines() []string {
 	}
 	if m.needApply && !st.Empty() {
 		out = append(out, "", sYel.Render("VPN или правила изменились после применения — нужно применить заново"))
+	}
+	if len(m.warns) > 0 {
+		out = append(out, "")
+		h("Предупреждения")
+		dropped := false
+		for _, w := range m.warns {
+			line("  %s", sYel.Render(w))
+			dropped = dropped || strings.HasPrefix(w, "config:")
+		}
+		if dropped {
+			line("  %s", sGray.Render("Исходный config.json сохранится как config.json.bak.* при следующем сохранении настроек"))
+		}
 	}
 	// long lines (adapter names, rules) wrap instead of running off the screen
 	var wrapped []string
@@ -784,11 +832,20 @@ func (m model) updateInput(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			}
 			m.save()
 			m.setFlash("Добавлено: " + val + m.applyHint())
-		case "dns":
-			m.cfg.CorpDNS = v
-			m.save()
-		case "gw":
-			m.cfg.CorpGateway = v
+		case "dns", "gw":
+			ip := strings.TrimSpace(v)
+			if ip != "" {
+				var err error
+				if ip, err = config.ParseIPv4(ip); err != nil {
+					m.setFlash(err.Error())
+					break
+				}
+			}
+			if m.purpose == "dns" {
+				m.cfg.CorpDNS = ip
+			} else {
+				m.cfg.CorpGateway = ip
+			}
 			m.save()
 		}
 		return m, nil

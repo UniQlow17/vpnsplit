@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strconv"
+	"time"
 )
 
 // Config is what the user chose: which adapter is which and what goes where.
@@ -25,6 +25,10 @@ type Config struct {
 	Domains        []string `json:"domains"`
 	DirectNetworks []string `json:"direct_networks,omitempty"` // bypass every VPN
 	DirectDomains  []string `json:"direct_domains,omitempty"`
+
+	// lossy: Sanitize dropped or changed something that is still in the file
+	// on disk. The next Save keeps a copy of that file first (see Save).
+	lossy bool
 }
 
 // New returns a Config with defaults: both VPNs detected automatically.
@@ -38,37 +42,40 @@ func (c *Config) Lists(direct bool) (nets, domains *[]string) {
 	return &c.Networks, &c.Domains
 }
 
-// Dir returns (and creates) the directory that holds config and state.
+// Dir returns (and creates) the user's directory that holds the config and
+// caches. The state journal does not live here: it is in a protected system
+// directory (see StateDir). Under sudo/pkexec this is the directory of the
+// user who ran the tool, not root's.
 func Dir() (string, error) {
-	d, err := os.UserConfigDir()
+	p, o, err := userDir()
 	if err != nil {
 		return "", err
 	}
-	p := filepath.Join(d, "vpnsplit")
-	if err := os.MkdirAll(p, 0o755); err != nil {
+	if err := ensureUserDir(p, o); err != nil {
 		return "", err
 	}
-	giveBack(p)
 	return p, nil
 }
 
 // WriteUserFile writes a file for the user; under sudo it still belongs to them.
+// The file is replaced atomically and a symlink at path is never followed.
+// Under sudo/pkexec only paths inside the home directory of the real user
+// are accepted: root must not be used to write anywhere else.
 func WriteUserFile(path string, data []byte) error {
-	if err := os.WriteFile(path, data, 0o644); err != nil {
+	path, err := filepath.Abs(path)
+	if err != nil {
 		return err
 	}
-	giveBack(path)
-	return nil
-}
-
-// giveBack hands a file created under sudo back to the user who ran sudo, so
-// the same config can still be edited without it.
-func giveBack(path string) {
-	uid, err1 := strconv.Atoi(os.Getenv("SUDO_UID"))
-	gid, err2 := strconv.Atoi(os.Getenv("SUDO_GID"))
-	if os.Geteuid() == 0 && err1 == nil && err2 == nil {
-		_ = os.Chown(path, uid, gid)
+	if fi, err := os.Lstat(path); err == nil && fi.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("%s is a symbolic link, refusing to write through it", path)
 	}
+	o := sudoOwner()
+	if o != nil {
+		if _, err := relInside(o.home, filepath.Dir(path)); err != nil {
+			return err
+		}
+	}
+	return writeFileAtomic(filepath.Dir(path), filepath.Base(path), data, 0o644, o)
 }
 
 func load(name string, v any) error {
@@ -76,7 +83,7 @@ func load(name string, v any) error {
 	if err != nil {
 		return err
 	}
-	b, err := os.ReadFile(filepath.Join(dir, name))
+	b, err := readRegular(filepath.Join(dir, name))
 	if err != nil {
 		return err
 	}
@@ -92,32 +99,77 @@ func save(name string, v any) error {
 	if err != nil {
 		return err
 	}
-	tmp := filepath.Join(dir, name+".tmp")
-	if err := os.WriteFile(tmp, b, 0o644); err != nil {
-		return err
-	}
-	giveBack(tmp)
-	return os.Rename(tmp, filepath.Join(dir, name))
+	_, o, _ := userDir()
+	return writeFileAtomic(dir, name, b, 0o644, o)
 }
 
 // LoadJSON and SaveJSON keep other small files (caches) next to the config.
+// Whatever LoadJSON returns comes from a user-writable file: validate it.
 func LoadJSON(name string, v any) error { return load(name, v) }
 func SaveJSON(name string, v any) error { return save(name, v) }
 
-// Load reads the config; without one it returns the defaults, which work as is.
-func Load() (*Config, error) {
-	c := New()
-	if err := load("config.json", c); err != nil {
-		if os.IsNotExist(err) {
-			return c, nil
-		}
-		return nil, fmt.Errorf("read config: %w", err)
+// SaveCache is SaveJSON for data that can be fetched again. It is skipped
+// (without an error) where writing into the user's directory is unsafe for
+// the process, see cacheWritable.
+func SaveCache(name string, v any) error {
+	if !cacheWritable() {
+		return nil
 	}
-	return c, nil
+	return save(name, v)
 }
 
-// Save writes the config atomically.
-func Save(c *Config) error { return save("config.json", c) }
+// LoadChecked reads the config; without one it returns the defaults, which
+// work as is. Every field is validated; invalid values are dropped and
+// reported in warnings.
+func LoadChecked() (c *Config, warnings []string, err error) {
+	c = New()
+	if err := load("config.json", c); err != nil {
+		if os.IsNotExist(err) {
+			return c, nil, nil
+		}
+		return nil, nil, fmt.Errorf("read config: %w", err)
+	}
+	return c, c.Sanitize(), nil
+}
+
+// Load is LoadChecked without the warnings.
+func Load() (*Config, error) {
+	c, _, err := LoadChecked()
+	return c, err
+}
+
+// Save writes the config atomically. If loading dropped invalid values (see
+// Sanitize) the file on disk still has them; it is copied to
+// config.json.bak.<time> first, so nothing the user typed is lost silently.
+func Save(c *Config) error {
+	if c.lossy {
+		if err := backupConfig(); err != nil {
+			return fmt.Errorf("cannot back up config.json before overwriting it: %w", err)
+		}
+	}
+	if err := save("config.json", c); err != nil {
+		return err
+	}
+	c.lossy = false
+	return nil
+}
+
+func backupConfig() error {
+	dir, err := Dir()
+	if err != nil {
+		return err
+	}
+	b, err := readRegular(filepath.Join(dir, "config.json"))
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	_, o, _ := userDir()
+	name := "config.json.bak." + time.Now().UTC().Format("20060102T150405")
+	return writeFileAtomic(dir, name, b, 0o600, o)
+}
 
 // Remove deletes the config file (state is untouched).
 func Remove() error {

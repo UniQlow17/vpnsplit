@@ -7,6 +7,7 @@ package router
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"hash/fnv"
 	"io"
@@ -25,6 +26,11 @@ const (
 	ViaHome   = "home"
 	ViaDirect = "direct"
 )
+
+// errExists is returned by addRoute when the route is already in the table
+// (a VPN client or the OS set it up). It is detected without reading
+// localized command output where the OS allows it.
+var errExists = errors.New("route already exists")
 
 // Gateway is the physical uplink (Wi-Fi, Ethernet) used by direct routes.
 type Gateway struct{ Iface, Router string }
@@ -79,10 +85,33 @@ func Sync(cfg *config.Config, e Env, st *config.State) (apply, reset bool) {
 // that could not be removed stay in the journal for the next try.
 // It needs no config, so it works even if config.json is broken or missing.
 func Reset() (removed int, errs []error) {
-	st := config.LoadState()
+	st, _, status := config.LoadStateStatus()
+	switch status {
+	case config.JournalDenied:
+		return 0, []error{fmt.Errorf("the journal of routes is available to administrators only: %s", PrivHint)}
+	case config.JournalUnreadable:
+		// what to remove is unknown, and the journal must not be overwritten
+		return 0, []error{errors.New("the journal of routes cannot be read, nothing was changed (see the warnings of `vpnsplit status`)")}
+	}
+	return reset(st, resetOps{delRoute: delRoute, delResolver: delResolver, flushDNS: flushDNS, save: config.SaveState})
+}
+
+// resetOps are the operations reset performs; tests replace them.
+type resetOps struct {
+	delRoute    func(config.Route) error
+	delResolver func(string) error
+	flushDNS    func()
+	save        func(*config.State) error
+}
+
+func reset(st *config.State, ops resetOps) (removed int, errs []error) {
 	keep := &config.State{}
 	for _, r := range st.Routes {
-		if err := delRoute(r); err != nil {
+		err := config.ValidateRoute(r)
+		if err == nil {
+			err = ops.delRoute(r)
+		}
+		if err != nil {
 			errs = append(errs, err)
 			keep.Routes = append(keep.Routes, r)
 			continue
@@ -90,7 +119,13 @@ func Reset() (removed int, errs []error) {
 		removed++
 	}
 	for _, p := range st.Resolvers {
-		if err := delResolver(p); err != nil {
+		var err error
+		if !config.ValidResolverEntry(p) {
+			err = fmt.Errorf("invalid DNS entry %q", p)
+		} else {
+			err = ops.delResolver(p)
+		}
+		if err != nil {
 			errs = append(errs, err)
 			keep.Resolvers = append(keep.Resolvers, p)
 			continue
@@ -98,10 +133,12 @@ func Reset() (removed int, errs []error) {
 		removed++
 	}
 	if len(st.Resolvers) > 0 {
-		flushDNS()
+		ops.flushDNS()
 	}
 	if !st.Empty() {
-		_ = config.SaveState(keep)
+		if err := ops.save(keep); err != nil {
+			errs = append(errs, fmt.Errorf("journal not updated, entries removed above may be listed again: %w", err))
+		}
 	}
 	return
 }
@@ -143,6 +180,11 @@ func Apply(cfg *config.Config, w io.Writer) error {
 	}
 	added, kept, failed := 0, 0, 0
 	add := func(r config.Route) {
+		if err := config.ValidateRoute(r); err != nil {
+			failed++
+			fmt.Fprintf(w, "  ! %s: %v\n", r.Dest, err)
+			return
+		}
 		st.Routes = append(st.Routes, r)
 		if err := config.SaveState(st); err != nil {
 			fmt.Fprintf(w, "  ! journal: %v\n", err)
@@ -158,7 +200,7 @@ func Apply(cfg *config.Config, w io.Writer) error {
 		}
 		st.Routes = st.Routes[:len(st.Routes)-1]
 		_ = config.SaveState(st)
-		if strings.Contains(strings.ToLower(err.Error()), "exists") {
+		if errors.Is(err, errExists) {
 			kept++
 			fmt.Fprintf(w, "  = %-18s already routed by the system or a VPN client, left as is\n", r.Dest)
 			return
@@ -172,6 +214,7 @@ func Apply(cfg *config.Config, w io.Writer) error {
 			add(config.Route{Dest: dest, Iface: e.Corp.Name, Gateway: cfg.CorpGateway, Via: ViaCorp})
 		}
 		servers, zones := corpDNS(e.Corp.Name)
+		servers = validServers(servers)
 		if cfg.CorpDNS != "" {
 			servers = []string{cfg.CorpDNS}
 			corp(cfg.CorpDNS + "/32") // the corp DNS itself must be reachable through corp
@@ -228,7 +271,7 @@ func splitDNS(st *config.State, iface string, servers, zones, skip []string, w i
 	}
 	for _, z := range zones {
 		z = strings.TrimSuffix(strings.TrimPrefix(strings.ToLower(z), "~"), ".")
-		if z != "" && !done[z] {
+		if z != "" && !done[z] && config.ValidZone(z) {
 			done[z] = true
 			clean = append(clean, z)
 		}
@@ -273,6 +316,18 @@ func expandNets(rules []string, w io.Writer) []string {
 		}
 		fmt.Fprintf(w, "%s: %d networks from RIPE%s\n", r, len(nets), note)
 		out = append(out, nets...)
+	}
+	return out
+}
+
+// validServers keeps the IPv4 addresses (canonical form) of what the OS
+// reported as DNS servers: they end up in commands and files.
+func validServers(in []string) []string {
+	var out []string
+	for _, s := range in {
+		if ip, err := config.ParseIPv4(strings.TrimSpace(s)); err == nil {
+			out = config.AddUnique(out, ip)
+		}
 	}
 	return out
 }

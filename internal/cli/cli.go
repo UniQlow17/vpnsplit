@@ -30,7 +30,7 @@ const usage = `vpnsplit - corp traffic through the corp VPN, chosen sites past e
   vpnsplit export [file]         write the rules as a rules file (stdout by default)
   vpnsplit set <key> <value>     corp | home (auto, client or adapter name),
                                  corp-dns | corp-gateway ("none" clears),
-                                 home-default | split-dns (true/false)
+                                 home-default | split-dns (yes/no, true/false, 1/0, on/off, да/нет)
   vpnsplit apply                 add routes (needs admin/root)
   vpnsplit watch                 keep routes in sync when VPNs connect, switch or disconnect
   vpnsplit status                show what is connected and what vpnsplit added
@@ -74,7 +74,7 @@ func run(args []string, version string) error {
 		return cmdSet(rest)
 	case "apply":
 		return needAdmin(func() error {
-			cfg, err := config.Load()
+			cfg, err := loadConfig()
 			if err != nil {
 				return err
 			}
@@ -95,6 +95,19 @@ func run(args []string, version string) error {
 	default:
 		fmt.Println(usage)
 		return fmt.Errorf("unknown command %q", cmd)
+	}
+}
+
+// loadConfig loads the config and tells about every value dropped as invalid.
+func loadConfig() (*config.Config, error) {
+	cfg, warns, err := config.LoadChecked()
+	printWarnings(warns)
+	return cfg, err
+}
+
+func printWarnings(warns []string) {
+	for _, w := range warns {
+		fmt.Fprintln(os.Stderr, "warning:", w)
 	}
 }
 
@@ -166,7 +179,7 @@ func cmdInit(r io.Reader, w io.Writer) error {
 		}
 		return line, nil
 	}
-	cfg, err := config.Load()
+	cfg, err := loadConfig()
 	if err != nil {
 		cfg = config.New()
 	}
@@ -187,7 +200,7 @@ func cmdInit(r io.Reader, w io.Writer) error {
 }
 
 func cmdRules(op string, items []string) error {
-	cfg, err := config.Load()
+	cfg, err := loadConfig()
 	if err != nil {
 		return err
 	}
@@ -225,7 +238,7 @@ func cmdRules(op string, items []string) error {
 }
 
 func cmdRulesShow() error {
-	cfg, err := config.Load()
+	cfg, err := loadConfig()
 	if err != nil {
 		return err
 	}
@@ -240,7 +253,7 @@ func cmdImport(a []string) error {
 	if len(a) != 1 {
 		return fmt.Errorf("usage: vpnsplit import <file>")
 	}
-	cfg, err := config.Load()
+	cfg, err := loadConfig()
 	if err != nil {
 		return err
 	}
@@ -260,7 +273,7 @@ func cmdImport(a []string) error {
 }
 
 func cmdExport(a []string) error {
-	cfg, err := config.Load()
+	cfg, err := loadConfig()
 	if err != nil {
 		return err
 	}
@@ -275,7 +288,7 @@ func cmdSet(a []string) error {
 	if len(a) != 2 {
 		return fmt.Errorf("usage: vpnsplit set <corp|home|corp-dns|corp-gateway|home-default|split-dns> <value>")
 	}
-	cfg, err := config.Load()
+	cfg, err := loadConfig()
 	if err != nil {
 		return err
 	}
@@ -284,18 +297,38 @@ func cmdSet(a []string) error {
 		val = ""
 	}
 	switch a[0] {
-	case "corp":
-		cfg.Corp = val
-	case "home":
-		cfg.Home = val
-	case "corp-dns":
-		cfg.CorpDNS = val
-	case "corp-gateway":
-		cfg.CorpGateway = val
-	case "home-default":
-		cfg.HomeDefault = val == "true"
-	case "split-dns":
-		cfg.SplitDNS = val == "true"
+	case "corp", "home":
+		if val != "" && !config.ValidIface(val) {
+			return fmt.Errorf("invalid %s value %q", a[0], val)
+		}
+		if a[0] == "corp" {
+			cfg.Corp = val
+		} else {
+			cfg.Home = val
+		}
+	case "corp-dns", "corp-gateway":
+		if val != "" {
+			ip, err := config.ParseIPv4(val)
+			if err != nil {
+				return fmt.Errorf("%s: %w", a[0], err)
+			}
+			val = ip
+		}
+		if a[0] == "corp-dns" {
+			cfg.CorpDNS = val
+		} else {
+			cfg.CorpGateway = val
+		}
+	case "home-default", "split-dns":
+		b, err := config.ParseBool(a[1])
+		if err != nil {
+			return fmt.Errorf("%s: %w", a[0], err)
+		}
+		if a[0] == "home-default" {
+			cfg.HomeDefault = b
+		} else {
+			cfg.SplitDNS = b
+		}
 	default:
 		return fmt.Errorf("unknown key %q", a[0])
 	}
@@ -303,7 +336,7 @@ func cmdSet(a []string) error {
 }
 
 func cmdStatus() error {
-	cfg, err := config.Load()
+	cfg, err := loadConfig()
 	if err != nil {
 		return err
 	}
@@ -323,7 +356,16 @@ func cmdStatus() error {
 		fmt.Println("direct: no Wi-Fi/Ethernet gateway found")
 	}
 	fmt.Printf("corp-dns=%q corp-gateway=%q home-default=%v split-dns=%v\n", cfg.CorpDNS, cfg.CorpGateway, cfg.HomeDefault, cfg.SplitDNS)
-	st := config.LoadState()
+	st, warns, jstatus := config.LoadStateStatus()
+	printWarnings(warns)
+	switch jstatus {
+	case config.JournalDenied:
+		fmt.Printf("journal of applied routes: available only with administrator rights (%s); what is applied is unknown\n", router.PrivHint)
+		return nil
+	case config.JournalUnreadable:
+		fmt.Println("journal of applied routes: cannot be read (see the warnings above); what is applied is unknown")
+		return nil
+	}
 	fmt.Printf("routes owned by vpnsplit: %d\n", len(st.Routes))
 	for _, r := range st.Routes {
 		fmt.Printf("  %-18s -> %-6s %s\n", r.Dest, r.Via, r.Iface)
@@ -338,6 +380,8 @@ func cmdStatus() error {
 }
 
 func cmdReset(purge bool) error {
+	_, warns := config.LoadStateChecked()
+	printWarnings(warns)
 	n, errs := router.Reset()
 	fmt.Printf("removed %d routes and DNS entries\n", n)
 	for _, e := range errs {
@@ -356,6 +400,9 @@ func cmdReset(purge bool) error {
 }
 
 func cmdWatch() error {
+	if _, err := loadConfig(); err != nil {
+		return err
+	}
 	fmt.Println("watching (Ctrl+C to stop; run `vpnsplit reset` to clean up)...")
 	for {
 		cfg, err := config.Load()

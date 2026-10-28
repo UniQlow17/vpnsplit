@@ -4,16 +4,16 @@ package netif
 
 import (
 	"encoding/json"
-	"os/exec"
+
+	"github.com/UniQlow17/vpnsplit/internal/sysexec"
 )
 
 // descriptions maps adapter name to its driver description (Get-NetAdapter),
 // which is where names like "Check Point Virtual Network Adapter" live.
 func descriptions() map[string]string {
 	m := map[string]string{}
-	out, err := exec.Command("powershell", "-NoProfile", "-Command",
-		"[Console]::OutputEncoding=[Text.UTF8Encoding]::new(); "+
-			"Get-NetAdapter | Select-Object Name,InterfaceDescription | ConvertTo-Json -Compress").Output()
+	out, err := sysexec.PowerShell(
+		"Get-NetAdapter | Select-Object Name,InterfaceDescription | ConvertTo-Json -Compress", nil).Output()
 	if err != nil {
 		return m
 	}

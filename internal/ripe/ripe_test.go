@@ -21,3 +21,16 @@ func TestCollapse(t *testing.T) {
 		t.Errorf("unaligned pair must not merge: %v", got)
 	}
 }
+
+func TestSanitizeCache(t *testing.T) {
+	in := map[string]entry{
+		"AS15632":       {Prefixes: []string{"10.1.2.3/8", "bad", "::/0", "1.2.3.0/24'; calc"}},
+		"AS1; calc":     {Prefixes: []string{"10.0.0.0/8"}},
+		"AS7":           {Prefixes: []string{"nonsense"}},
+		"../../etc/AS1": {Prefixes: []string{"10.0.0.0/8"}},
+	}
+	got := sanitizeCache(in)
+	if len(got) != 1 || len(got["AS15632"].Prefixes) != 1 || got["AS15632"].Prefixes[0] != "10.0.0.0/8" {
+		t.Errorf("%+v", got)
+	}
+}
