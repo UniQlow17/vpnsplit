@@ -298,14 +298,31 @@ func (s *State) trustLegacy() (warnings []string) {
 	s.Rules = nil
 	var res []string
 	for _, id := range s.Resolvers {
-		if strings.HasPrefix(id, "dns ") {
+		if strings.HasPrefix(id, "dns ") || resolverIsRoot(id) {
 			warnings = append(warnings, fmt.Sprintf("old journal: DNS entry %q dropped", clip(id)))
 			continue
 		}
 		res = append(res, id)
 	}
 	s.Resolvers = res
+	// the settings of the IPv6 tunnels are written back with administrator
+	// rights: old versions had none, so a file that has them is not theirs
+	if !s.Tun6.Empty() {
+		warnings = append(warnings, "old journal: IPv6 tunnel settings dropped: old versions had none")
+	}
+	s.Tun6 = nil
 	return warnings
+}
+
+// resolverIsRoot reports whether a DNS journal entry is about the zone "."
+// (the rule that sends everything else to a DNS server): old versions never
+// wrote one.
+func resolverIsRoot(id string) bool {
+	if id == "." {
+		return true
+	}
+	f := strings.Fields(id)
+	return len(f) == 3 && f[0] == "domain" && f[2] == "."
 }
 
 // cleanTmp removes temporary files of writeFileAtomic left behind by a crash.

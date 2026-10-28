@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
@@ -511,24 +512,34 @@ func (m model) updateKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			}
 		}
 	case scRules:
-		// rows: 0 add corp, 1 add direct, then the rules
+		// rows: the actions (add corp, add direct and add home where they matter, import, export), then the rules
+		acts := m.ruleActions()
+		on := func() string {
+			if (k == "enter" || k == " ") && m.cursor < len(acts) {
+				return acts[m.cursor].purpose
+			}
+			return ""
+		}()
 		switch {
 		case k == "esc":
 			m.sc, m.cursor = scMenu, itemRules
-		case k == "a" || k == "n" || (k == "enter" || k == " ") && m.cursor == 0:
+		case k == "a" || k == "n" || on == "rule":
 			m.beginInput("rule", "", "Через корп. VPN — сеть / IP / домен / AS: ")
 			return m, textinput.Blink
-		case k == "b" || (k == "enter" || k == " ") && m.cursor == 1:
+		case (k == "b" || on == "direct") && m.hasKind(config.DestDirect):
 			m.beginInput("direct", "", "Напрямую, мимо VPN — сеть / IP / домен / AS: ")
 			return m, textinput.Blink
-		case (k == "enter" || k == " ") && m.cursor == 2:
+		case (k == "h" || on == "home") && m.hasKind(config.DestHome):
+			m.beginInput("home", "", "Через домашний VPN — сеть / IP / домен / AS: ")
+			return m, textinput.Blink
+		case on == "import":
 			m.beginInput("import", "~/Downloads/", "Файл со списком правил: ")
 			return m, textinput.Blink
-		case (k == "enter" || k == " ") && m.cursor == 3:
+		case on == "export":
 			m.beginInput("export", "~/Desktop/vpnsplit-rules.txt", "Сохранить правила в файл: ")
 			return m, textinput.Blink
 		case k == "enter" || k == " " || k == "d" || k == "delete" || k == "backspace":
-			if m.cursor >= ruleRows {
+			if m.cursor >= len(acts) {
 				m.delAsk = true
 			}
 		}
@@ -545,7 +556,7 @@ func (m model) updateKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.beginInput("gw", m.cfg.CorpGateway, "Корп. шлюз (пусто = on-link): ")
 				return m, textinput.Blink
 			case 2:
-				m.cfg.HomeDefault = !m.cfg.HomeDefault
+				m.cfg.Rest = nextRest(m.cfg.Rest)
 				m.save()
 			case 3:
 				m.cfg.SplitDNS = !m.cfg.SplitDNS
@@ -556,19 +567,39 @@ func (m model) updateKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-// ruleRows is how many action rows (add corp, add direct, import, export)
-// come before the rules on the rules screen.
-const ruleRows = 4
+// ruleAction is a row of actions on the rules screen.
+type ruleAction struct{ purpose string }
+
+// hasKind reports whether rules of a kind matter with the setting of the rest.
+func (m model) hasKind(kind string) bool {
+	return m.cfg != nil && slices.Contains(m.cfg.Kinds(), kind)
+}
+
+// ruleActions are the action rows before the rules: add for each kind that
+// matters with the setting "rest of the traffic", then import and export.
+func (m model) ruleActions() []ruleAction {
+	acts := []ruleAction{{"rule"}}
+	if m.hasKind(config.DestDirect) {
+		acts = append(acts, ruleAction{"direct"})
+	}
+	if m.hasKind(config.DestHome) {
+		acts = append(acts, ruleAction{"home"})
+	}
+	return append(acts, ruleAction{"import"}, ruleAction{"export"})
+}
+
+// ruleRows is how many action rows come before the rules on the rules screen.
+func (m model) ruleRows() int { return len(m.ruleActions()) }
 
 // deleteRule removes the rule under the cursor.
 func (m *model) deleteRule() {
 	items := m.ruleItems()
-	i := m.cursor - ruleRows
+	i := m.cursor - m.ruleRows()
 	if i < 0 || i >= len(items) {
 		return
 	}
 	it := items[i]
-	nets, domains := m.cfg.Lists(it.direct)
+	nets, domains := m.cfg.ListsOf(it.kind)
 	if it.isNet {
 		*nets, _ = config.RemoveVal(*nets, it.val)
 	} else {
@@ -576,7 +607,7 @@ func (m *model) deleteRule() {
 	}
 	m.save()
 	m.setFlash("Удалено: " + it.val + m.applyHint())
-	if m.cursor >= len(items)+ruleRows-1 {
+	if m.cursor >= len(items)+m.ruleRows()-1 {
 		m.cursor--
 	}
 }
@@ -650,9 +681,20 @@ func (m model) statusLines() []string {
 			line("    %s %s", d, sGray.Render("домен"))
 		}
 	}
-	list("Через корп. VPN", c.Networks, c.Domains)
-	list("Напрямую, мимо VPN", c.DirectNetworks, c.DirectDomains)
-	line("  Остальное -> домашний VPN: %s", map[bool]string{true: "да", false: "нет"}[c.HomeDefault])
+	titles := map[string]string{config.DestCorp: "Через корп. VPN", config.DestDirect: "Напрямую, мимо VPN", config.DestHome: "Через домашний VPN"}
+	for _, k := range c.Kinds() {
+		nets, domains := c.ListsOf(k)
+		list(titles[k], *nets, *domains)
+	}
+	if n := m.hiddenRules(); n > 0 {
+		line("  %s", sGray.Render(fmt.Sprintf("Ещё %d правил не действуют при этом режиме «Остального трафика» и скрыты", n)))
+	}
+	line("  Остальной трафик: %s", config.RestLabel(c.Rest, true))
+	if lvl, _ := router.V6Status(c, m.env); lvl == router.V6Leaks {
+		line("  %s", sRed.Render(v6LeakText(m.env)))
+	} else if lvl == router.V6Info {
+		line("  %s", v6InfoText(m.env))
+	}
 	line("  Корп. домены через корп. DNS: %s", map[bool]string{true: "да", false: "нет"}[c.SplitDNS])
 
 	out = append(out, "")
@@ -902,13 +944,13 @@ func (m model) updateInput(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				break
 			}
 			m.setFlash("Правила сохранены в " + v)
-		case "rule", "direct":
+		case "rule", "direct", "home":
 			isNet, val, err := config.NormalizeRule(v)
 			if err != nil {
 				m.setFlash(err.Error())
 				break
 			}
-			nets, domains := m.cfg.Lists(m.purpose == "direct")
+			nets, domains := m.cfg.ListsOf(purposeKind(m.purpose))
 			if isNet {
 				*nets = config.AddUnique(*nets, val)
 			} else {
@@ -950,9 +992,9 @@ func (m model) updateInput(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 }
 
 type ruleItem struct {
-	val    string
-	isNet  bool
-	direct bool
+	val   string
+	isNet bool
+	kind  string // config.DestCorp, DestDirect or DestHome
 }
 
 func (m model) ruleItems() []ruleItem {
@@ -960,13 +1002,13 @@ func (m model) ruleItems() []ruleItem {
 	if m.cfg == nil {
 		return out
 	}
-	for _, direct := range []bool{false, true} {
-		nets, domains := m.cfg.Lists(direct)
+	for _, kind := range m.cfg.Kinds() { // only the kinds that matter with the setting of the rest
+		nets, domains := m.cfg.ListsOf(kind)
 		for _, n := range *nets {
-			out = append(out, ruleItem{n, true, direct})
+			out = append(out, ruleItem{n, true, kind})
 		}
 		for _, d := range *domains {
-			out = append(out, ruleItem{d, false, direct})
+			out = append(out, ruleItem{d, false, kind})
 		}
 	}
 	return out
@@ -979,9 +1021,81 @@ func (m model) listLen() int {
 	case scPick:
 		return len(m.ifs) + 2 // auto + adapters + manual
 	case scRules:
-		return len(m.ruleItems()) + ruleRows
+		return len(m.ruleItems()) + m.ruleRows()
 	case scSettings:
 		return 4
 	}
 	return 0
+}
+
+// purposeKind is the kind of rules an input purpose adds to.
+func purposeKind(purpose string) string {
+	switch purpose {
+	case "direct":
+		return config.DestDirect
+	case "home":
+		return config.DestHome
+	}
+	return config.DestCorp
+}
+
+// hiddenRules counts the rules of kinds that do not matter with the setting of
+// the rest: they stay in the config and are not shown or applied.
+func (m model) hiddenRules() int {
+	n := 0
+	if m.cfg == nil {
+		return n
+	}
+	for _, k := range []string{config.DestDirect, config.DestHome} {
+		if !m.hasKind(k) {
+			nets, domains := m.cfg.ListsOf(k)
+			n += len(*nets) + len(*domains)
+		}
+	}
+	return n
+}
+
+// nextRest is the setting after this one in the order of the settings screen.
+func nextRest(rest string) string {
+	switch rest {
+	case config.RestHome:
+		return config.RestDirect
+	case config.RestDirect:
+		return config.RestKeep
+	}
+	return config.RestHome
+}
+
+// showsDirect reports whether the diagram has the DIRECT node: there are
+// direct rules that apply, or the rest of the traffic goes direct.
+func (m model) showsDirect() bool {
+	if m.cfg == nil {
+		return false
+	}
+	if m.cfg.Rest == config.RestDirect {
+		return true
+	}
+	return m.hasKind(config.DestDirect) && len(m.cfg.DirectNetworks)+len(m.cfg.DirectDomains) > 0
+}
+
+// v6LeakText says in Russian why IPv6 goes past the home VPN.
+func v6LeakText(e router.Env) string {
+	switch {
+	case !e.Home.HasV6():
+		return "IPv6 идёт мимо домашнего VPN: у физического адаптера есть IPv6, у домашнего VPN нет"
+	case e.V6Cap == router.V6CapV4Only:
+		return "IPv6 идёт мимо домашнего VPN: его клиент забирает правилами только IPv4, у физического адаптера есть IPv6"
+	}
+	return "IPv6 идёт мимо домашнего VPN: направлять IPv6 в туннель на этой ОС пока не поддерживается"
+}
+
+// v6InfoText says in Russian what happens to IPv6 when it is handled.
+func v6InfoText(e router.Env) string {
+	switch e.V6Cap {
+	case router.V6CapBoth:
+		return "IPv6: через домашний VPN правилами его клиента"
+	case router.V6CapUnknown:
+		return "IPv6: на совести клиента домашнего VPN (не удалось определить, забирает ли он IPv6)"
+	}
+	return "IPv6: через домашний VPN (у него есть глобальный IPv6)"
 }

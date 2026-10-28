@@ -72,7 +72,7 @@ func resolverPlan(_ string, servers, zones []string) []string {
 }
 
 func addResolver(zone string, servers []string) error {
-	if !config.ValidZone(zone) {
+	if !validNrptID(zone) {
 		return fmt.Errorf("invalid DNS zone %q", zone)
 	}
 	if err := config.ValidateServers(servers); err != nil {
@@ -90,12 +90,13 @@ func addResolver(zone string, servers []string) error {
 	}
 	_, err = ps(env, "$z=$env:VS_ZONE; Get-DnsClientNrptRule | Where-Object { $_.Comment -eq 'vpnsplit' -and "+nrptHas+" } | "+
 		"Remove-DnsClientNrptRule -Force; "+
-		"Add-DnsClientNrptRule -Namespace ('.'+$z),$z -NameServers ($env:VS_SERVERS -split ',') -Comment 'vpnsplit'")
+		"if ($z -eq '.') { $ns=@('.') } else { $ns=@(('.'+$z),$z) }; "+
+		"Add-DnsClientNrptRule -Namespace $ns -NameServers ($env:VS_SERVERS -split ',') -Comment 'vpnsplit'")
 	return err
 }
 
 func delResolver(zone string) error {
-	if !config.ValidZone(zone) {
+	if !validNrptID(zone) {
 		return fmt.Errorf("invalid DNS zone %q", zone)
 	}
 	_, err := ps(map[string]string{"ZONE": zone},
@@ -111,7 +112,7 @@ func delResolver(zone string) error {
 // only checked: an entry that would not be valid is an error, as in delResolver.
 func (osBackend) DelResolvers(ids []string) error {
 	for _, id := range ids {
-		if !config.ValidZone(id) {
+		if !validNrptID(id) {
 			return fmt.Errorf("invalid DNS zone %q", id)
 		}
 	}
@@ -133,7 +134,7 @@ func (osBackend) MissingResolvers(ids []string) ([]string, error) {
 	}
 	var missing []string
 	for _, id := range ids {
-		if !have["."+id] {
+		if !have[nrptNamespace(id)] {
 			missing = append(missing, id)
 		}
 	}
@@ -200,6 +201,10 @@ func parseNrptRules(out []byte) ([]OSResolver, error) {
 	for _, r := range list {
 		id := r.N
 		for _, ns := range strings.Split(r.N, ",") {
+			if ns == "." {
+				id = "."
+				break
+			}
 			if strings.HasPrefix(ns, ".") {
 				id = strings.TrimPrefix(ns, ".")
 				break
@@ -212,3 +217,17 @@ func parseNrptRules(out []byte) ([]OSResolver, error) {
 
 // nrptComment marks the NRPT rules vpnsplit creates.
 const nrptComment = "vpnsplit"
+
+// validNrptID: a zone, or "." for the rule that sends everything else to the DNS of the home VPN.
+func validNrptID(id string) bool { return id == "." || config.ValidZone(id) }
+
+// nrptNamespace is the namespace the rule of an entry has when it is read back.
+func nrptNamespace(id string) string {
+	if id == "." {
+		return "."
+	}
+	return "." + id
+}
+
+// restDNS: Windows sends everything else to the home DNS through the NRPT rule ".".
+const restDNS = true

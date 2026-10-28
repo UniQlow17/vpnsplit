@@ -31,7 +31,8 @@ var (
 )
 
 const (
-	winAfInet = 2
+	winAfInet  = 2
+	winAfInet6 = 23
 
 	// Win32 codes the route calls return (NETIO_STATUS is a Win32 error).
 	errFileNotFound        = syscall.Errno(2)    // ERROR_FILE_NOT_FOUND
@@ -44,7 +45,7 @@ const (
 )
 
 // sockaddrInet is SOCKADDR_INET, a union of sockaddr_in and sockaddr_in6
-// (28 bytes). Only IPv4 is used.
+// (28 bytes): family at 0, IPv4 address at 4, IPv6 address at 8.
 type sockaddrInet [28]byte
 
 func (s *sockaddrInet) setV4(a netip.Addr) {
@@ -165,10 +166,11 @@ func getForwardEntry(row *mibIPForwardRow2) error {
 	return apiErr(uint32(r1))
 }
 
-// forwardRows reads the IPv4 forwarding table and calls fn for every row.
+// forwardRows reads the forwarding table (IPv4 and IPv6) and calls fn for every row.
 func forwardRows(fn func(*mibIPForwardRow2)) error {
 	var tbl *mibIPForwardTable2
-	r1, _, _ := procGetIPForwardTable2.Call(winAfInet, uintptr(unsafe.Pointer(&tbl)))
+	r1, _, _ := procGetIPForwardTable2.Call(0, // AF_UNSPEC: both families
+		uintptr(unsafe.Pointer(&tbl)))
 	if err := apiErr(uint32(r1)); err != nil {
 		return fmt.Errorf("GetIpForwardTable2: %w", err)
 	}
@@ -192,15 +194,68 @@ func forwardKey(row *mibIPForwardRow2, ifIndex int, dest netip.Prefix, gw netip.
 	if err != nil {
 		return err
 	}
+	fillForwardKey(row, luid, ifIndex, dest, gw)
+	return nil
+}
+
+// fillForwardKey is forwardKey for an adapter whose LUID is known.
+func fillForwardKey(row *mibIPForwardRow2, luid uint64, ifIndex int, dest netip.Prefix, gw netip.Addr) {
 	initForwardRow(row)
 	row.InterfaceLuid = luid
 	row.InterfaceIndex = uint32(ifIndex)
-	row.DestinationPrefix.Prefix.setV4(dest.Addr())
+	row.DestinationPrefix.Prefix.setAddr(dest.Addr())
 	row.DestinationPrefix.PrefixLength = uint8(dest.Bits())
-	if gw.IsValid() {
-		row.NextHop.setV4(gw)
-	} else {
+	switch {
+	case gw.IsValid():
+		row.NextHop.setAddr(gw)
+		// a link-local next hop means something on one link only: the zone of that
+		// link (on Windows the zone of the link scope is the index of the adapter)
+		// is in the ScopeId. The address read back from a row has none (see addr),
+		// so the next hops are compared without it.
+		if gw.Is6() && gw.IsLinkLocalUnicast() {
+			row.NextHop.setScope(uint32(ifIndex))
+		}
+	case dest.Addr().Is6():
+		row.NextHop.setAddr(netip.IPv6Unspecified()) // on-link
+	default:
 		row.NextHop.setV4(netip.IPv4Unspecified()) // on-link
 	}
-	return nil
+}
+
+// setAddr sets an IPv4 or IPv6 address.
+func (s *sockaddrInet) setAddr(a netip.Addr) {
+	if a.Is6() {
+		*s = sockaddrInet{}
+		binary.LittleEndian.PutUint16(s[0:], winAfInet6)
+		b := a.As16()
+		copy(s[8:24], b[:])
+		return
+	}
+	s.setV4(a)
+}
+
+// addr returns the address; ok is false for any other family.
+func (s *sockaddrInet) addr() (netip.Addr, bool) {
+	switch binary.LittleEndian.Uint16(s[0:]) {
+	case winAfInet:
+		return netip.AddrFrom4([4]byte(s[4:8])), true
+	case winAfInet6:
+		return netip.AddrFrom16([16]byte(s[8:24])), true
+	}
+	return netip.Addr{}, false
+}
+
+// setScope sets the scope id (sin6_scope_id) of an IPv6 address; IPv4 has none.
+func (s *sockaddrInet) setScope(id uint32) {
+	if binary.LittleEndian.Uint16(s[0:]) == winAfInet6 {
+		binary.LittleEndian.PutUint32(s[24:28], id)
+	}
+}
+
+// scopeID returns sin6_scope_id (0 for IPv4).
+func (s *sockaddrInet) scopeID() uint32 {
+	if binary.LittleEndian.Uint16(s[0:]) != winAfInet6 {
+		return 0
+	}
+	return binary.LittleEndian.Uint32(s[24:28])
 }

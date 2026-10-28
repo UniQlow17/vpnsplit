@@ -2,6 +2,7 @@ package tui
 
 import (
 	"fmt"
+	"github.com/UniQlow17/vpnsplit/internal/router"
 	"strings"
 
 	"github.com/charmbracelet/lipgloss"
@@ -85,6 +86,11 @@ func (m model) statusRows() []string {
 	parts := []string{status}
 	if !m.admin {
 		parts = append(parts, sRed.Render("нет прав администратора"))
+	}
+	if m.cfg != nil {
+		if lvl, _ := router.V6Status(m.cfg, m.env); lvl == router.V6Leaks {
+			parts = append(parts, sRed.Render("IPv6 идёт мимо домашнего VPN!"))
+		}
 	}
 	if m.foreign() {
 		parts = append(parts, sYel.Render(foreignNote))
@@ -312,17 +318,28 @@ func (m model) screenParts() screenParts {
 	case scRules:
 		items := m.ruleItems()
 		add(m.row(0, sGreen.Render("+")+" Добавить через корп. VPN…"))
-		add(m.row(1, sGreen.Render("+")+" Добавить напрямую, мимо VPN…"))
-		add(m.row(2, sCyan.Render("↓")+" Импорт из файла…"))
-		add(m.row(3, sCyan.Render("↑")+" Экспорт в файл…"))
+		n := 1
+		if m.hasKind(config.DestDirect) {
+			add(m.row(n, sGreen.Render("+")+" Добавить напрямую, мимо VPN…"))
+			n++
+		}
+		if m.hasKind(config.DestHome) {
+			add(m.row(n, sGreen.Render("+")+" Добавить через домашний VPN…"))
+			n++
+		}
+		add(m.row(n, sCyan.Render("↓")+" Импорт из файла…"))
+		add(m.row(n+1, sCyan.Render("↑")+" Экспорт в файл…"))
 		add("")
+		if h := m.hiddenRules(); h > 0 {
+			add(strings.Repeat(" ", rowIndent) + sGray.Render(fmt.Sprintf("скрыто правил: %d (не действуют при этом режиме остального трафика)", h)))
+		}
 		if len(items) == 0 {
 			add(strings.Repeat(" ", rowIndent) + sGray.Render("правил пока нет"))
 		}
-		if m.cursor < ruleRows {
+		if m.cursor < m.ruleRows() {
 			p.focus = m.cursor
 		} else {
-			p.focus = len(p.list) + m.cursor - ruleRows
+			p.focus = len(p.list) + m.cursor - m.ruleRows()
 		}
 		vw := min(32, max(cw-rowPrefix-ruleExtra, 8))
 		for i, it := range items {
@@ -334,13 +351,16 @@ func (m model) screenParts() screenParts {
 				kind = "сеть "
 			}
 			where := sCyan.Render("корп.   ")
-			if it.direct {
+			switch it.kind {
+			case config.DestDirect:
 				where = sYel.Render("напрямую")
+			case config.DestHome:
+				where = sGreen.Render("дом.VPN ")
 			}
-			add(m.row(i+ruleRows, padRight(fit(it.val, vw), vw), where+" "+sGray.Render(kind)))
+			add(m.row(i+m.ruleRows(), padRight(fit(it.val, vw), vw), where+" "+sGray.Render(kind)))
 		}
-		if m.delAsk && m.cursor >= ruleRows && m.cursor-ruleRows < len(items) {
-			p.keep = append([]string{""}, m.blockLines(sYel, "Удалить «"+items[m.cursor-ruleRows].val+"»? y / enter — да, другая клавиша — нет")...)
+		if m.delAsk && m.cursor >= m.ruleRows() && m.cursor-m.ruleRows() < len(items) {
+			p.keep = append([]string{""}, m.blockLines(sYel, "Удалить «"+items[m.cursor-m.ruleRows()].val+"»? y / enter — да, другая клавиша — нет")...)
 		}
 		p.tail = append([]string{""}, splitLines(panel([]tip{rulesTip}, 0, tw))...)
 		p.hint, p.hintSt = "enter — выбрать · d — удалить · esc — назад", sDim
@@ -359,7 +379,7 @@ func (m model) screenParts() screenParts {
 		}
 		add(m.row(0, "Корп. DNS", sGray.Render(dns)))
 		add(m.row(1, "Корп. шлюз", sGray.Render(orDash(c.CorpGateway))))
-		add(m.row(2, "Остальной трафик -> домашний VPN", yesNo[c.HomeDefault]))
+		add(m.row(2, "Остальной трафик", sCyan.Render(config.RestLabel(c.Rest, true))))
 		add(m.row(3, "Корп. домены через корп. DNS", yesNo[c.SplitDNS]))
 		p.focus = m.cursor
 		p.tail = append([]string{""}, splitLines(panel(settingsTips, m.cursor, tw))...)

@@ -159,6 +159,7 @@ func (d *diff) planned(st *config.State, newIDs []string) *config.State {
 	for _, id := range newIDs {
 		n.Resolvers = config.AddUnique(n.Resolvers, id)
 	}
+	n.Tun6 = st.Tun6
 	return n
 }
 
@@ -247,20 +248,42 @@ func (m *Manager) replaceRoute(old, next config.Route) (added bool, err error) {
 func (m *Manager) reconcile(st *config.State, p *plan, tbl *table, rs *ruleSet, sig string, partial bool, w io.Writer) error {
 	defer m.flushNotes() // what was found in place and left alone (noteKept) is written once
 	d := makeDiff(st, p, tbl, rs, partial)
-	var dnsSig string
-	var newIDs []string
-	if p.dns != nil {
-		dnsSig = p.dns.sig()
-		newIDs = p.dns.ids
-	}
+	dnsSig, items := p.dnsSig(), p.dnsItems()
+	newIDs := p.dnsIDs()
 	// the entries in place stay while they point where the plan wants them to (the
 	// adapter and the servers); a plan that changes only the zones adds the new
 	// ones and removes the old ones, and leaves the rest alone
 	retarget := dnsTarget(dnsSig) != dnsTarget(st.DNSSig)
 	sigChanged := dnsSig != st.DNSSig
-	dnsChange := !partial && (sigChanged || (p.dns == nil && len(st.Resolvers) > 0) || !sameSet(st.Resolvers, newIDs))
+	// An entry that somebody else has made (a "~." that was there before ours, an NRPT
+	// rule of the user) is not ours and is not in the journal. The plan that was
+	// completed with it counted (DNSSig is set only then), so with the plan
+	// unchanged what is wanted and not in the journal is that one: it is no reason
+	// to redo the entries and flush the cache again in every cycle.
+	foreign := map[string]bool{}
+	if !sigChanged && st.DNSSig != "" {
+		have := make(map[string]bool, len(st.Resolvers))
+		for _, id := range st.Resolvers {
+			have[id] = true
+		}
+		for _, id := range newIDs {
+			if !have[id] {
+				foreign[id] = true
+			}
+		}
+	}
+	ownIDs := newIDs
+	if len(foreign) > 0 {
+		ownIDs = nil
+		for _, id := range newIDs {
+			if !foreign[id] {
+				ownIDs = append(ownIDs, id)
+			}
+		}
+	}
+	dnsChange := !partial && (sigChanged || (len(items) == 0 && len(st.Resolvers) > 0) || !sameSet(st.Resolvers, ownIDs))
 	var missingIDs map[string]bool // entries removed behind our back
-	if !partial && !dnsChange && p.dns != nil && len(st.Resolvers) > 0 {
+	if !partial && !dnsChange && len(items) > 0 && len(st.Resolvers) > 0 {
 		if missing, err := missingResolvers(m.b, st.Resolvers); err == nil && len(missing) > 0 {
 			dnsChange = true // an entry was removed behind our back: those are made again
 			missingIDs = make(map[string]bool, len(missing))
@@ -271,9 +294,46 @@ func (m *Manager) reconcile(st *config.State, p *plan, tbl *table, rs *ruleSet, 
 		}
 	}
 
-	changes := !d.empty() || dnsChange
+	// The automatic IPv6 tunnels (Windows): turned off for a plan that tunnels the
+	// rest, put back when it does not any more. What each was before is in the
+	// journal before it is changed, and the first record is kept as it is: what is
+	// read later is what we have set.
+	t6, _ := m.b.(tunnels6)
+	tunOrig := st.Tun6 // what the journal says must be put back
+	var tunSet config.Tunnels6
+	tunRestore := false
+	if t6 != nil && !partial && m.ctx.Err() == nil {
+		switch {
+		case p.tun6 && st.Tun6.Empty():
+			if cur, unknown, err := t6.Tunnels6(); err != nil {
+				fmt.Fprintf(w, "  ! IPv6 tunnels (Teredo, 6to4, ISATAP): cannot read their settings, left as they are: %v\n", err)
+			} else {
+				warnUnknownTun6(w, unknown)
+				if orig, set := disableTun6(cur); !orig.Empty() {
+					tunOrig, tunSet = &orig, set
+				}
+			}
+		case p.tun6 && !st.Tun6.Empty():
+			// recorded already: a setting we turned off and the OS shows as on again (a
+			// failed attempt before, or somebody turned it back on) is turned off again;
+			// the originals in the journal stay as they are
+			if cur, unknown, err := t6.Tunnels6(); err != nil {
+				fmt.Fprintf(w, "  ! IPv6 tunnels (Teredo, 6to4, ISATAP): cannot read their settings: %v\n", err)
+			} else {
+				warnUnknownTun6(w, unknown)
+				_, set := disableTun6(cur)
+				tunSet = onlyRecorded(set, *st.Tun6)
+			}
+		case !p.tun6 && !st.Tun6.Empty():
+			tunRestore = true
+		}
+	}
+
+	changes := !d.empty() || dnsChange || !tunSet.Empty() || tunRestore
 	if changes {
-		if err := m.save(d.planned(st, newIDs)); err != nil {
+		pl := d.planned(st, newIDs)
+		pl.Tun6 = tunOrig
+		if err := m.save(pl); err != nil {
 			return err
 		}
 	}
@@ -447,6 +507,29 @@ func (m *Manager) reconcile(st *config.State, p *plan, tbl *table, rs *ruleSet, 
 	}
 	out.Routes = append(out.Routes, failedDel...)
 
+	out.Tun6 = tunOrig
+	if !tunSet.Empty() && m.ctx.Err() == nil {
+		if err := t6.SetTunnels6(tunSet); err != nil {
+			sum.failed++
+			fmt.Fprintf(w, "  ! IPv6 tunnels (Teredo, 6to4, ISATAP): %v\n", err)
+		} else {
+			sum.added++
+			fmt.Fprintln(w, "  + IPv6 tunnels (Teredo, 6to4, ISATAP) off, so that IPv6 cannot go around the tunnel")
+		}
+	}
+	if tunRestore {
+		if m.ctx.Err() != nil {
+			// stays in the journal
+		} else if err := t6.SetTunnels6(*st.Tun6); err != nil {
+			sum.failed++
+			fmt.Fprintf(w, "  ! IPv6 tunnels (Teredo, 6to4, ISATAP) not put back: %v\n", err)
+		} else {
+			sum.removed++
+			out.Tun6 = nil
+			fmt.Fprintln(w, "  - IPv6 tunnels (Teredo, 6to4, ISATAP) put back")
+		}
+	}
+
 	// DNS entries last: the new and the missing are made first, then the ones
 	// nobody wants any more go. An entry that is wanted and in place stays.
 	out.Resolvers = append([]string(nil), st.Resolvers...)
@@ -454,17 +537,21 @@ func (m *Manager) reconcile(st *config.State, p *plan, tbl *table, rs *ruleSet, 
 	for _, id := range st.Resolvers {
 		inJournal[id] = true
 	}
-	if dnsChange && p.dns != nil && m.ctx.Err() == nil {
-		for _, id := range p.dns.ids {
+	if dnsChange && len(items) > 0 && m.ctx.Err() == nil {
+		for _, it := range items {
+			id := it.id
 			if m.ctx.Err() != nil {
 				break
 			}
 			if inJournal[id] && !retarget && !missingIDs[id] {
 				continue
 			}
-			err := m.b.AddResolver(id, p.dns.servers)
+			err := m.b.AddResolver(id, it.servers)
 			if errors.Is(err, errResolverExists) {
 				fmt.Fprintf(w, "  = %s: %v\n", id, err)
+				if !inJournal[id] {
+					foreign[id] = true // done, and not ours
+				}
 				continue
 			}
 			if err != nil {
@@ -474,7 +561,7 @@ func (m *Manager) reconcile(st *config.State, p *plan, tbl *table, rs *ruleSet, 
 			}
 			out.Resolvers = config.AddUnique(out.Resolvers, id)
 			sum.added++
-			fmt.Fprintf(w, "  + %-18s -> corp DNS\n", id)
+			fmt.Fprintf(w, "  + %-18s -> DNS %s\n", id, strings.Join(it.servers, ","))
 		}
 	}
 	if dnsChange {
@@ -507,7 +594,7 @@ func (m *Manager) reconcile(st *config.State, p *plan, tbl *table, rs *ruleSet, 
 	switch {
 	case partial:
 		out.DNSSig = st.DNSSig
-	case p.dns == nil || m.ctx.Err() != nil || len(out.Resolvers) != len(p.dns.ids):
+	case len(items) == 0 || m.ctx.Err() != nil || !dnsComplete(out.Resolvers, newIDs, foreign):
 		out.DNSSig = "" // not complete: the next apply redoes the DNS entries
 	}
 	if m.ctx.Err() != nil {
@@ -537,11 +624,38 @@ func (m *Manager) reconcile(st *config.State, p *plan, tbl *table, rs *ruleSet, 
 // dnsTarget is the part of a DNS signature that says where the entries point:
 // the adapter and the servers ("iface|servers|zones").
 func dnsTarget(sig string) string {
-	parts := strings.SplitN(sig, "|", 3)
-	if len(parts) < 3 {
-		return sig
+	var out []string
+	for _, g := range strings.Split(sig, ";") { // one group per kind of entries, see plan.dnsSig
+		parts := strings.SplitN(g, "|", 3)
+		if len(parts) < 3 {
+			out = append(out, g)
+		} else {
+			out = append(out, parts[0]+"|"+parts[1])
+		}
 	}
-	return parts[0] + "|" + parts[1]
+	return strings.Join(out, ";")
+}
+
+// dnsComplete reports whether the entries in place are the wanted ones and
+// nothing else, those that somebody else has made (foreign) counted as wanted.
+func dnsComplete(have, wanted []string, foreign map[string]bool) bool {
+	want := make(map[string]bool, len(wanted))
+	for _, id := range wanted {
+		want[id] = true
+	}
+	n := 0
+	for _, id := range have {
+		if !want[id] {
+			return false
+		}
+		n++
+	}
+	for id := range foreign {
+		if want[id] {
+			n++
+		}
+	}
+	return n == len(want)
 }
 
 func sameSet(a, b []string) bool {

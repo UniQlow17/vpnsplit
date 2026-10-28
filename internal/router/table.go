@@ -240,7 +240,7 @@ func (s *ruleSet) has(r config.Rule) bool {
 func gatewayFrom(rs []OSRoute) (Gateway, bool) {
 	var defs []OSRoute
 	for _, r := range rs {
-		if r.Table == 0 && r.Dest.Bits() == 0 && r.Gateway.IsValid() && r.Iface != "" {
+		if r.Table == 0 && r.Dest.Addr().Is4() && r.Dest.Bits() == 0 && r.Gateway.IsValid() && r.Iface != "" {
 			defs = append(defs, r)
 		}
 	}

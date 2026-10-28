@@ -223,11 +223,13 @@ func (s *Snapshot) Sanitize() {
 	for _, r := range s.Routes {
 		ok := SafeText(r.Iface, 256) && r.Metric >= 0 && r.Metric <= 1<<20 && r.Table >= 0 && r.Table <= 1<<24 &&
 			r.Proto >= 0 && r.Proto <= 255 && r.Origin >= 0 && r.Origin <= 255
-		if p, err := netip.ParsePrefix(r.Dest); err != nil || !p.Addr().Is4() {
+		p, perr := netip.ParsePrefix(r.Dest)
+		if perr != nil || p.Addr().Is4In6() || p.Addr().Zone() != "" {
 			ok = false
 		}
 		if r.Gateway != "" {
-			if a, err := netip.ParseAddr(r.Gateway); err != nil || !a.Is4() {
+			// the next hop is of the family of the destination
+			if a, err := netip.ParseAddr(r.Gateway); err != nil || a.Is4In6() || a.Zone() != "" || perr != nil || a.Is4() != p.Addr().Is4() {
 				ok = false
 			}
 		}

@@ -35,7 +35,9 @@ Go (1.24), TUI на bubbletea. Утилита сплит-туннелинга д
 - `internal/router` — ядро:
   - `manager.go` — `Manager`/`Session`: `Acquire` (lock + recover + снимок), `Apply`, `Reset`, `Cleanup`/`CleanupUntil`, `Report`;
   - `backend.go` — интерфейс `Backend` (маршруты, правила, DNS, чтение таблиц), `osBackend`;
-  - `router.go` — `applyEnv`, Sig (имя + индекс + хеш адресов), детект;
+  - `router.go` — `applyEnv`, Sig (имя + индекс + хеш адресов + признак v6), детект;
+  - `tun6.go` + `tun6_windows.go` — Teredo/6to4/ISATAP (Windows): прежнее состояние в журнал до смены, откат в Cleanup/Recover;
+  - `v6.go` — `V6Status` (подсветка v6 мимо дом. VPN);
   - `plan.go` — желаемое состояние: маршруты, правила, пины (endpoints), `policyFor`, `pickOwnTable`;
   - `reconcile.go` — diff и согласование: write-ahead pending, add→del, replace, `Drifted`;
   - `table.go` — `OSRoute`/`OSRule`, метки владения;
@@ -67,7 +69,7 @@ Go (1.24), TUI на bubbletea. Утилита сплит-туннелинга д
   - Контейнер `--privileged`, внутри netns client/isp/inet/corp-gw/home-gw, WireGuard wgcorp/wghome, dnsmasq.
   - Адрес 203.0.113.x отвечает именем сети, так curl показывает путь трафика.
   - Варианты домашнего VPN: a — 0/1+128/1 в main; b — `ip rule` + table 2022 (как sing-box); c — wg-quick `suppress_prefixlength 0`.
-  - Сценарии S0–S18:
+  - Сценарии S0–S26:
     - сигналы и выход TUI (S1/S2/S6);
     - kill -9 → Recover (S3);
     - persistent (S4/S7);
@@ -79,7 +81,9 @@ Go (1.24), TUI на bubbletea. Утилита сплит-туннелинга д
     - endpoint (S12);
     - истёкший бюджет (S14);
     - старая версия (S15);
-    - маршруты «клиента» не трогаются (S16–S18).
+    - маршруты «клиента» не трогаются (S16–S18);
+    - пути DNS, fake-ip, `~.` и его восстановление, IPv6, «Остальной трафик» = напрямую / не трогать (S19–S23; в контейнере нет resolved, на эти сценарии ставится заглушка `fake-resolvectl.sh`, она же считает вызовы);
+    - DNS провайдера пересекается с DNS дом. VPN (S24), чужая `~.` не флапает (S25), клиент b/c забрал только v4 — подсветка v6 (S26).
   - Критерий: после выхода `ip route show table all` + `ip rule` совпадают со снимком.
 - Linux-тесты можно запускать внутри контейнера стенда (`go test -c` под linux).
 
@@ -121,7 +125,7 @@ Go (1.24), TUI на bubbletea. Утилита сплит-туннелинга д
   - `119570f` — этап 1, жизненный цикл;
   - `a7f9f7c` — этап 2, нативные маршруты, согласование, «как до запуска».
 - Открыто: третий раунд reviewer + security по `a7f9f7c`. Windows-бэкенд вживую не проверялся, macOS — только компиляция.
-- Этап 3 — DNS и утечки: «напрямую» через DNS провайдера + /32, /32 до корп. DNS, NRPT «.», IPv6, enum «Остальной трафик».
+- Этап 3 — DNS и утечки: готов. «Напрямую» через DNS провайдера + /32 (`directServers`, `physicalDNS`; единый фильтр адресов `badAddr`/`avoid`: loopback, link-local, multicast, fake-ip, корп. префиксы, DNS корп./дом. VPN, endpoint), /32 до корп. DNS, зоны direct-доменов → DNS провайдера при `rest=home` (`plan.direct`), NRPT «.» / `~.` на линке дом. VPN (`plan.rest`, `restDNS`; не ставится при `apply` без `watch` (`SetOneShot`), без корп. зон при корп. VPN, macOS не делается; чужая запись — «выполнено, не наше», без флапа), IPv6 (`::/1`+`8000::/1` через дом. VPN при его глобальном v6; на macOS пока не планируются; `V6Status` с признаком `Env.V6Cap`: на Linux читаются v6-правила), Windows Teredo/6to4/ISATAP (`tun6.go`, `State.Tun6`, повторное отключение, предупреждение о незнакомом значении), enum `Config.Rest` (`home`/`direct`/`keep`, миграция `home_default`), правила `--home`. Старый журнал из профиля: `Tun6` и зона «.» отбрасываются. Стенд S19–S26. Не проверено вживую: Windows (NRPT, Tun6, SOCKADDR_INET v6, scope_id link-local next hop), macOS (`-inet6`), настоящий systemd-resolved.
 - Этап 4 — детект и предупреждения: Прокси, strict_route, fake-ip, WG 0/0, block-outside-dns, GPO NRPT, full-tunnel корп., пересечения подсетей.
 - Этап 5 — меню, «Дополнительно», авторесайз окна.
 - Трей — отдельный поздний этап.

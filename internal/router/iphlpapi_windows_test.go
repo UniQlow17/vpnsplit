@@ -280,3 +280,99 @@ func TestNrptNamespaces(t *testing.T) {
 		t.Error("garbage")
 	}
 }
+
+// IPv6 in the union: the address sits at 8..24, the scope id at 24..28 (zero
+// unless a link-local next hop sets it), and the family decides what is read.
+func TestSockaddrInetV6(t *testing.T) {
+	for _, in := range []string{"::", "::1", "8000::", "fe80::1", "2001:db8::77"} {
+		a := netip.MustParseAddr(in)
+		var s sockaddrInet
+		s.setAddr(a)
+		if s[0] != winAfInet6 || s[1] != 0 {
+			t.Errorf("%s: family %x", in, s[:2])
+		}
+		b := a.As16()
+		for i := range 16 {
+			if s[8+i] != b[i] {
+				t.Errorf("%s: byte %d", in, i)
+			}
+		}
+		for i := 24; i < 28; i++ {
+			if s[i] != 0 {
+				t.Errorf("%s: scope id byte %d is %x", in, i, s[i])
+			}
+		}
+		if got, ok := s.addr(); !ok || got != a {
+			t.Errorf("%s: read back %v %v", in, got, ok)
+		}
+		if _, ok := s.v4(); ok {
+			t.Errorf("%s: an IPv6 address is not IPv4", in)
+		}
+	}
+	// a row of family 0 (no next hop, a destination of another kind) is skipped
+	var zero sockaddrInet
+	if _, ok := zero.addr(); ok {
+		t.Error("AF_UNSPEC must not read as an address")
+	}
+	// the setter of an IPv4 address clears what an IPv6 one left
+	var s sockaddrInet
+	s.setAddr(netip.MustParseAddr("fe80::1"))
+	s.setScope(7)
+	s.setAddr(netip.MustParseAddr("10.0.0.1"))
+	if a, ok := s.addr(); !ok || a != netip.MustParseAddr("10.0.0.1") || s.scopeID() != 0 || s[8] != 0 {
+		t.Errorf("%x", s[:])
+	}
+}
+
+// The key of a route in IPv6: the halves of the default route on-link, a
+// link-local next hop with the zone of the adapter, a global one without.
+func TestForwardKeyV6(t *testing.T) {
+	var row mibIPForwardRow2
+	for _, d := range []string{"::/1", "8000::/1"} {
+		p := netip.MustParsePrefix(d)
+		fillForwardKey(&row, 0x1234, 12, p, netip.Addr{})
+		dst, ok := row.DestinationPrefix.Prefix.addr()
+		if !ok || dst != p.Addr() || int(row.DestinationPrefix.PrefixLength) != p.Bits() {
+			t.Errorf("%s: %v %v %d", d, dst, ok, row.DestinationPrefix.PrefixLength)
+		}
+		if gw, ok := row.NextHop.addr(); !ok || gw != netip.IPv6Unspecified() || row.NextHop.scopeID() != 0 {
+			t.Errorf("%s: on-link next hop is %v %v scope %d", d, gw, ok, row.NextHop.scopeID())
+		}
+		if row.InterfaceLuid != 0x1234 || row.InterfaceIndex != 12 {
+			t.Errorf("%s: adapter %x %d", d, row.InterfaceLuid, row.InterfaceIndex)
+		}
+	}
+	p := netip.MustParsePrefix("2001:db8:ff::/48")
+	fillForwardKey(&row, 1, 12, p, netip.MustParseAddr("fe80::1"))
+	if gw, ok := row.NextHop.addr(); !ok || gw != netip.MustParseAddr("fe80::1") || row.NextHop.scopeID() != 12 {
+		t.Errorf("link-local next hop: %v %v scope %d", gw, ok, row.NextHop.scopeID())
+	}
+	fillForwardKey(&row, 1, 12, p, netip.MustParseAddr("2001:db8::1"))
+	if gw, _ := row.NextHop.addr(); gw != netip.MustParseAddr("2001:db8::1") || row.NextHop.scopeID() != 0 {
+		t.Errorf("global next hop: %v scope %d", gw, row.NextHop.scopeID())
+	}
+	// IPv4 is as before
+	fillForwardKey(&row, 1, 12, netip.MustParsePrefix("10.0.0.0/8"), netip.Addr{})
+	if gw, ok := row.NextHop.v4(); !ok || gw != netip.IPv4Unspecified() {
+		t.Errorf("v4 on-link: %v %v", gw, ok)
+	}
+}
+
+// What listRoutes makes of the next hop: the scope id of a link-local address
+// does not take part, an unspecified one is on-link.
+func TestNextHopComparisonIgnoresScope(t *testing.T) {
+	var a, b sockaddrInet
+	a.setAddr(netip.MustParseAddr("fe80::1"))
+	b.setAddr(netip.MustParseAddr("fe80::1"))
+	b.setScope(14)
+	ga, _ := a.addr()
+	gb, _ := b.addr()
+	if ga != gb {
+		t.Errorf("%v != %v: the scope id must not matter", ga, gb)
+	}
+	o := OSRoute{Dest: netip.MustParsePrefix("2001:db8::/32"), Iface: "wg", Gateway: gb, Metric: ownMetric}
+	r := config.Route{Dest: "2001:db8::/32", Iface: "wg", Gateway: "fe80::1", Metric: ownMetric}
+	if !newTable([]OSRoute{o}).has(r) {
+		t.Error("the route with a link-local next hop is not found as ours")
+	}
+}

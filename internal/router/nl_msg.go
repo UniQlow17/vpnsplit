@@ -64,6 +64,7 @@ const (
 	rtnUnicast  = 1
 	rtTableMain = 254
 	afInet      = 2
+	afInet6     = 10
 
 	scopeUniverse = 0
 	scopeLink     = 253
@@ -97,8 +98,20 @@ func attrU32(typ uint16, v uint32) []byte {
 }
 
 func attrAddr(typ uint16, a netip.Addr) []byte {
+	if a.Is6() {
+		b := a.As16()
+		return nlAttr(typ, b[:])
+	}
 	b := a.As4()
 	return nlAttr(typ, b[:])
+}
+
+// familyOf is the address family byte of a prefix.
+func familyOf(p netip.Prefix) byte {
+	if p.Addr().Is6() {
+		return afInet6
+	}
+	return afInet
 }
 
 // nlMessage is a netlink header followed by hdr (rtmsg or fib_rule_hdr) and attributes.
@@ -159,11 +172,14 @@ func routeAttrs(s routeSpec) [][]byte {
 // that the route in the way is ours (a move of our own route to another device).
 func buildAddRoute(seq uint32, s routeSpec) []byte {
 	hdr := make([]byte, 12)
-	hdr[0] = afInet
+	hdr[0] = familyOf(s.dest)
 	hdr[1] = byte(s.dest.Bits())
 	hdr[4] = tableByte(s.tableID())
 	hdr[5] = s.proto
 	hdr[6] = scopeLink
+	if s.dest.Addr().Is6() {
+		hdr[6] = scopeUniverse
+	}
 	if s.gw.IsValid() {
 		hdr[6] = scopeUniverse
 	}
@@ -181,7 +197,7 @@ func buildAddRoute(seq uint32, s routeSpec) []byte {
 // (another metric or protocol) stays.
 func buildDelRoute(seq uint32, s routeSpec) []byte {
 	hdr := make([]byte, 12)
-	hdr[0] = afInet
+	hdr[0] = familyOf(s.dest)
 	hdr[1] = byte(s.dest.Bits())
 	hdr[4] = tableByte(s.tableID())
 	hdr[5] = s.proto
@@ -189,16 +205,19 @@ func buildDelRoute(seq uint32, s routeSpec) []byte {
 	return nlMessage(rtmDelRoute, nlmFRequest|nlmFAck, seq, hdr, routeAttrs(s)...)
 }
 
-// buildDumpRoutes asks for all IPv4 routes of all tables.
-func buildDumpRoutes(seq uint32) []byte {
+// buildDumpRoutes asks for all routes of a family (afInet, afInet6) of all tables.
+func buildDumpRoutes(seq uint32, family byte) []byte {
 	hdr := make([]byte, 12)
-	hdr[0] = afInet
+	hdr[0] = family
 	return nlMessage(rtmGetRoute, nlmFRequest|nlmFDump, seq, hdr)
 }
 
-func buildDumpRules(seq uint32) []byte {
+func buildDumpRules(seq uint32) []byte { return buildDumpRulesFor(seq, afInet) }
+
+// buildDumpRulesFor is the dump of the rules of one family (afInet, afInet6).
+func buildDumpRulesFor(seq uint32, family byte) []byte {
 	hdr := make([]byte, 12)
-	hdr[0] = afInet
+	hdr[0] = family
 	return nlMessage(rtmGetRule, nlmFRequest|nlmFDump, seq, hdr)
 }
 
@@ -365,6 +384,17 @@ func parseAttrs(b []byte) map[uint16][]byte {
 	return out
 }
 
+// addrOf reads an address attribute of the family of the message.
+func addrOf(family byte, b []byte) netip.Addr {
+	if family == afInet6 {
+		if len(b) < 16 {
+			return netip.Addr{}
+		}
+		return netip.AddrFrom16([16]byte(b[:16]))
+	}
+	return addr4(b)
+}
+
 func addr4(b []byte) netip.Addr {
 	if len(b) < 4 {
 		return netip.Addr{}
@@ -379,10 +409,10 @@ func u32(b []byte) (uint32, bool) {
 	return nlEnd.Uint32(b), true
 }
 
-// parseRoute reads an RTM_NEWROUTE message of a dump. Routes that are not
-// IPv4 unicast, cache entries and multipath routes (no single device) are skipped.
+// parseRoute reads an RTM_NEWROUTE message of a dump (IPv4 or IPv6). Routes that are not
+// unicast, cache entries and multipath routes (no single device) are skipped.
 func parseRoute(payload []byte) (OSRoute, bool) {
-	if len(payload) < 12 || payload[0] != afInet || payload[7] != rtnUnicast {
+	if len(payload) < 12 || (payload[0] != afInet && payload[0] != afInet6) || payload[7] != rtnUnicast {
 		return OSRoute{}, false
 	}
 	if nlEnd.Uint32(payload[8:])&rtmFCloned != 0 {
@@ -393,9 +423,12 @@ func parseRoute(payload []byte) (OSRoute, bool) {
 	if !ok {
 		return OSRoute{}, false
 	}
-	dst := addr4(a[rtaDst])
+	dst := addrOf(payload[0], a[rtaDst])
 	if !dst.IsValid() {
 		dst = netip.IPv4Unspecified()
+		if payload[0] == afInet6 {
+			dst = netip.IPv6Unspecified()
+		}
 	}
 	p, err := dst.Prefix(int(payload[1]))
 	if err != nil {
@@ -410,14 +443,15 @@ func parseRoute(payload []byte) (OSRoute, bool) {
 	}
 	metric, _ := u32(a[rtaPriority])
 	return OSRoute{
-		Dest: p, IfIndex: int(oif), Gateway: addr4(a[rtaGateway]), Metric: int(metric),
+		Dest: p, IfIndex: int(oif), Gateway: addrOf(payload[0], a[rtaGateway]), Metric: int(metric),
 		Table: table, Ours: payload[5] == routeProto, Proto: int(payload[5]),
 	}, true
 }
 
-// parseRule reads an RTM_NEWRULE message of a dump.
+// parseRule reads an RTM_NEWRULE message of a dump (IPv4, or IPv6 where the
+// dump of that family was asked for).
 func parseRule(payload []byte) (OSRule, bool) {
-	if len(payload) < 12 || payload[0] != afInet {
+	if len(payload) < 12 || (payload[0] != afInet && payload[0] != afInet6) {
 		return OSRule{}, false
 	}
 	a := parseAttrs(payload[12:])
@@ -431,10 +465,10 @@ func parseRule(payload []byte) (OSRule, bool) {
 	if v, ok := u32(a[fraSuppressPrefix]); ok {
 		r.Suppress = int(int32(v))
 	}
-	if d := addr4(a[fraDst]); d.IsValid() && payload[1] > 0 {
+	if d := addrOf(payload[0], a[fraDst]); d.IsValid() && payload[1] > 0 {
 		r.Dest, _ = d.Prefix(int(payload[1]))
 	}
-	if s := addr4(a[fraSrc]); s.IsValid() && payload[2] > 0 {
+	if s := addrOf(payload[0], a[fraSrc]); s.IsValid() && payload[2] > 0 {
 		r.Src, _ = s.Prefix(int(payload[2]))
 	}
 	// The fwmark is the selector clients use to tell their own packets ("not

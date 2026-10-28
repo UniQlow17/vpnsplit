@@ -68,7 +68,7 @@ func TestViewFitsTerminalHeight(t *testing.T) {
 func TestSelectedRowStaysVisible(t *testing.T) {
 	m := manyRules(richModel(80))
 	m.height, m.sc = 24, scRules
-	for _, cur := range []int{0, 5, 17, ruleRows + 30, len(m.ruleItems()) + ruleRows - 1} {
+	for _, cur := range []int{0, 5, 17, m.ruleRows() + 30, len(m.ruleItems()) + m.ruleRows() - 1} {
 		m.cursor = cur
 		if !strings.Contains(m.View(), "▸") {
 			t.Errorf("cursor %d: the selected row is not shown", cur)

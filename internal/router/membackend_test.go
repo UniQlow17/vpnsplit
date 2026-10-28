@@ -254,3 +254,15 @@ func (b *memBackend) reset() {
 // plainBackend hides the optional methods of the backend inside: no
 // ReplaceRoute, no MissingResolvers (what Windows and macOS have).
 type plainBackend struct{ Backend }
+
+// dnsLogHas reports whether the DNS log has the entry.
+func (b *memBackend) dnsLogHas(s string) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	for _, l := range b.dnsLog {
+		if l == s {
+			return true
+		}
+	}
+	return false
+}

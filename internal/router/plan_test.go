@@ -111,10 +111,10 @@ func TestPlanDropsCorpRuleOverEndpoint(t *testing.T) {
 
 func TestPinnedHosts(t *testing.T) {
 	tbl := newTable([]OSRoute{main("198.51.100.7/32", "eth0"), main("203.0.113.1/32", "wgcorp"), main("10.0.0.0/8", "eth0")})
-	if n := pinnedHosts(tbl); n != 1 {
+	if n := pinnedHosts(tbl, nil); n != 1 {
 		t.Errorf("pinned %d", n)
 	}
-	if n := pinnedHosts(&table{}); n != 0 {
+	if n := pinnedHosts(&table{}, nil); n != 0 {
 		t.Errorf("unknown table: %d", n)
 	}
 }
@@ -257,20 +257,20 @@ func TestPlanDedupAndCanonical(t *testing.T) {
 func TestBootstrapPlan(t *testing.T) {
 	e := *testEnv()
 	cfg := testCfg()
-	if bootstrapPlan(cfg, e, &table{}, &ruleSet{}) != nil {
+	if newTestMgr().bootstrapPlan(cfg, e, nil, &table{}, &ruleSet{}) != nil {
 		t.Error("no corp domains: nothing to resolve, nothing to bootstrap")
 	}
 	cfg.CorpDNS, cfg.Domains = "10.200.0.1", []string{"corp.example"}
-	p := bootstrapPlan(cfg, e, &table{}, &ruleSet{known: true})
+	p := newTestMgr().bootstrapPlan(cfg, e, nil, &table{}, &ruleSet{known: true})
 	if p == nil || len(p.routes) != 1 || p.routes[0].Dest != "10.200.0.1/32" || p.routes[0].Iface != "wgcorp" || p.routes[0].Via != ViaCorp {
 		t.Fatalf("%+v", p)
 	}
 	rs := newRuleSet([]OSRule{{Pref: 9000, Table: 2022, Suppress: -1, ToTable: true, Fwmark: true, Inv: true}})
-	if p = bootstrapPlan(cfg, e, &table{}, rs); len(p.rules) != 1 || p.rules[0].Table != config.OwnTable || p.rules[0].Pref != rulePrefBase || p.routes[0].Table != config.OwnTable {
+	if p = newTestMgr().bootstrapPlan(cfg, e, nil, &table{}, rs); len(p.rules) != 1 || p.rules[0].Table != config.OwnTable || p.rules[0].Pref != rulePrefBase || p.routes[0].Table != config.OwnTable {
 		t.Errorf("the DNS must be reachable past the client's rule: %+v", p.rules)
 	}
 	e.CorpOK = false
-	if bootstrapPlan(cfg, e, &table{}, rs) != nil {
+	if newTestMgr().bootstrapPlan(cfg, e, nil, &table{}, rs) != nil {
 		t.Error("corp is not connected")
 	}
 }
@@ -301,5 +301,23 @@ func TestPartialReconcileKeepsTheRest(t *testing.T) {
 	a.apply(t, cfg)
 	if a.mb.adds != 0 {
 		t.Errorf("the route of the bootstrap was added again: %d", a.mb.adds)
+	}
+}
+
+// newTestMgr is a Manager over fakes with no DNS the OS could tell about.
+func newTestMgr() *Manager {
+	m := newRig(nil).m
+	m.dnsOf = func(string) ([]string, []string) { return nil, nil }
+	m.physDNS = nil
+	return m
+}
+
+// corpOnly is a dnsOf that knows the DNS of the corp adapter only.
+func corpOnly(servers, zones []string) func(string) ([]string, []string) {
+	return func(iface string) ([]string, []string) {
+		if iface == "wgcorp" {
+			return servers, zones
+		}
+		return nil, nil
 	}
 }

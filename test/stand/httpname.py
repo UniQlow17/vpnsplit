@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
-"""Answers every HTTP GET with its own name: which network a request came through."""
+"""Answers every HTTP GET with its own name: which network a request came through.
+Listens on IPv4 and, where the namespace has IPv6, on IPv6 too (one dual-stack socket)."""
+import socket
 import sys
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
@@ -18,4 +20,16 @@ class H(BaseHTTPRequestHandler):
         pass
 
 
-HTTPServer(("0.0.0.0", 80), H).serve_forever()
+class Dual(HTTPServer):
+    address_family = socket.AF_INET6
+
+    def server_bind(self):
+        self.socket.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+        super().server_bind()
+
+
+try:
+    srv = Dual(("::", 80), H)
+except OSError:
+    srv = HTTPServer(("0.0.0.0", 80), H)
+srv.serve_forever()

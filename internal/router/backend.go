@@ -45,6 +45,24 @@ func (osBackend) AddResolver(id string, servers []string) error { return addReso
 func (osBackend) DelResolver(id string) error                   { return delResolver(id) }
 func (osBackend) FlushDNS()                                     { flushDNS() }
 
+// tunnels6 is implemented by a Backend that can turn the automatic IPv6
+// tunnelling (Teredo, 6to4, ISATAP) off and back on: Windows. Linux and macOS
+// do not have it on by default.
+type tunnels6 interface {
+	// Tunnels6 reads the settings; a value is the name the cmdlets use. What is not
+	// a value of the known ones is left out and named in unknown.
+	Tunnels6() (cur config.Tunnels6, unknown []string, err error)
+	// SetTunnels6 sets the ones that are not empty; the values come from the
+	// lists of config (see config.Tunnels6), nothing else.
+	SetTunnels6(config.Tunnels6) error
+}
+
+// canTun6 reports whether this OS has settings of the kind (see tunnels6).
+func (m *Manager) canTun6() bool {
+	_, ok := m.b.(tunnels6)
+	return ok
+}
+
 // Store is the journal.
 type Store interface {
 	Load() (*config.State, []string, config.JournalStatus)

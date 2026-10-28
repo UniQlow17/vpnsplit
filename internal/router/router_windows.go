@@ -176,7 +176,7 @@ func (osBackend) ReplaceRoute(old, next config.Route) error {
 
 var _ replacer = osBackend{}
 
-// listRoutes reads the IPv4 routing table.
+// listRoutes reads the routing table (IPv4 and IPv6).
 // The metric of the adapter (adapterMetrics) is not read here: only the choice
 // of the physical gateway needs it, and the table is read for every drift check.
 func listRoutes() ([]OSRoute, error) {
@@ -190,7 +190,7 @@ func listRoutes() ([]OSRoute, error) {
 	}
 	var out []OSRoute
 	err = forwardRows(func(row *mibIPForwardRow2) {
-		dst, ok := row.DestinationPrefix.Prefix.v4()
+		dst, ok := row.DestinationPrefix.Prefix.addr()
 		if !ok {
 			return
 		}
@@ -198,7 +198,7 @@ func listRoutes() ([]OSRoute, error) {
 		if err != nil {
 			return
 		}
-		gw, _ := row.NextHop.v4()
+		gw, _ := row.NextHop.addr()
 		if gw.IsUnspecified() {
 			gw = netip.Addr{}
 		}
@@ -258,3 +258,6 @@ const _ = uint(ownMetric-winOwnMetric) + uint(winOwnMetric-ownMetric)
 
 // the same for the protocol of the routes we create
 const _ = uint(mibIPProtoNetMgmt-mibNetMgmt) + uint(mibNetMgmt-mibIPProtoNetMgmt)
+
+// v6Halves: ::/1 and 8000::/1 are planned for a home VPN that has IPv6.
+const v6Halves = true

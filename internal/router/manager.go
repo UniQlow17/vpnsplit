@@ -71,12 +71,16 @@ type Manager struct {
 	force  bool                         // see SetForce
 
 	// the OS-dependent inputs of Apply; tests replace them
-	detect func(*config.Config) Env
-	dnsOf  func(iface string) (servers, zones []string)
+	detect  func(*config.Config) Env
+	dnsOf   func(iface string) (servers, zones []string)
+	physDNS func(iface string) []string                                         // the DNS servers of the physical adapter
+	lookup  func(ctx context.Context, dns, domain string) ([]netip.Addr, error) // nil: lookupIPv4
+	memo    *dnsMemo                                                            // answers of dnsOf and physDNS during one apply
 
 	goos       string                   // the OS whose rules tell a route of ours from a client's (runtime.GOOS; tests set it)
 	providerOf func() map[string]string // adapter name -> VPN client behind it, for the report
 	snapOff    bool                     // see NoSnapshot
+	oneShot    bool                     // see SetOneShot
 
 	mu        sync.Mutex
 	mode      string          // what Cleanup does: config.ModeSession or config.ModePersistent
@@ -103,7 +107,7 @@ func NewManagerFor(b Backend, s Store, p Procs, l LockFunc) *Manager {
 func newManager(b Backend, s Store, p Procs, l LockFunc) *Manager {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &Manager{b: b, store: s, procs: p, lock: l, sem: make(chan struct{}, 1), ctx: ctx, cancel: cancel,
-		detect: Detect, dnsOf: corpDNS, goos: runtime.GOOS, providerOf: providersByName, planned: map[string]bool{}, kept: map[string]bool{}}
+		detect: Detect, dnsOf: corpDNS, physDNS: physicalDNS, goos: runtime.GOOS, providerOf: providersByName, planned: map[string]bool{}, kept: map[string]bool{}}
 }
 
 // NoSnapshot makes Acquire leave the snapshot of the state before the start
@@ -177,6 +181,7 @@ func (m *Manager) saveBare(st *config.State) error {
 type Report struct {
 	Routes, Resolvers int
 	Rules             int
+	Tun6              bool      // the settings of the automatic IPv6 tunnels (Windows) were put back
 	Forgotten         int       // journal routes dropped without removal: gone with a reboot
 	Left              []string  // journal routes found in the table but not removed because they are not ours (or may not be); dropped from the journal
 	FullTunnel        bool      // 0.0.0.0/1 and 128.0.0.0/1 of the home VPN were removed
@@ -188,7 +193,7 @@ func (r Report) Total() int { return r.Routes + r.Resolvers + r.Rules }
 
 // Describe tells what was removed, in English or Russian.
 func (r Report) Describe(ru bool) string {
-	if r.Total() == 0 && r.Forgotten == 0 && len(r.Left) == 0 {
+	if r.Total() == 0 && !r.Tun6 && r.Forgotten == 0 && len(r.Left) == 0 {
 		if ru {
 			return "ничего снимать не пришлось"
 		}
@@ -199,6 +204,9 @@ func (r Report) Describe(ru bool) string {
 		s = fmt.Sprintf("снято: маршрутов %d, DNS-записей %d", r.Routes, r.Resolvers)
 		if r.Rules > 0 {
 			s += fmt.Sprintf(", правил маршрутизации %d", r.Rules)
+		}
+		if r.Tun6 {
+			s += "; IPv6-туннели Windows (Teredo, 6to4, ISATAP) возвращены"
 		}
 		if r.FullTunnel {
 			s += "; полный туннель 0/1+128/1 снят"
@@ -214,6 +222,9 @@ func (r Report) Describe(ru bool) string {
 	s = fmt.Sprintf("removed: %d routes, %d DNS entries", r.Routes, r.Resolvers)
 	if r.Rules > 0 {
 		s += fmt.Sprintf(", %d policy rules", r.Rules)
+	}
+	if r.Tun6 {
+		s += "; Windows IPv6 tunnels (Teredo, 6to4, ISATAP) put back"
 	}
 	if r.FullTunnel {
 		s += "; full tunnel 0/1+128/1 removed"
@@ -252,6 +263,7 @@ func (r *Report) add(o Report) {
 	r.Routes += o.Routes
 	r.Resolvers += o.Resolvers
 	r.Rules += o.Rules
+	r.Tun6 = r.Tun6 || o.Tun6
 	r.Forgotten += o.Forgotten
 	r.Left = append(r.Left, o.Left...)
 	r.FullTunnel = r.FullTunnel || o.FullTunnel
@@ -377,6 +389,16 @@ func statusErr(s config.JournalStatus) error {
 	return nil
 }
 
+// SetOneShot says that nothing watches what is applied: `vpnsplit apply`, which
+// leaves the entries and exits. The DNS rule for everything else (NRPT "." or
+// "~.") is not made then: if the home VPN fell, every name would stop
+// resolving, and nobody would be there to take the rule away before `reset`.
+func (m *Manager) SetOneShot() {
+	m.mu.Lock()
+	m.oneShot = true
+	m.mu.Unlock()
+}
+
 // Mode is what Cleanup does with what was applied: config.ModeSession
 // removes it, config.ModePersistent leaves it.
 func (m *Manager) Mode() string {
@@ -480,11 +502,11 @@ func (m *Manager) recover(ctx context.Context, st *config.State, self config.Own
 	switch {
 	case rebooted:
 		fmt.Fprintln(w, "the computer was restarted since the routes were applied: removing DNS entries, forgetting routes")
-		dns := &config.State{Resolvers: st.Resolvers}
+		dns := &config.State{Resolvers: st.Resolvers, Tun6: st.Tun6} // both survive a reboot
 		r, keep, errs := m.removeEntries(ctx, dns, nil)
 		rep.add(r)
 		rep.Forgotten = len(st.Routes) + len(st.Rules)
-		st.Resolvers, st.Routes, st.Rules, st.Sig, st.DNSSig = keep.Resolvers, nil, nil, "", ""
+		st.Resolvers, st.Routes, st.Rules, st.Sig, st.DNSSig, st.Tun6 = keep.Resolvers, nil, nil, "", "", keep.Tun6
 		if err := m.saveBare(st); err != nil {
 			errs = append(errs, fmt.Errorf("journal not updated: %w", err))
 		}
@@ -534,6 +556,14 @@ func (m *Manager) removeEntries(ctx context.Context, st *config.State, progress 
 	}
 	dctx, dcancel := dnsContext(ctx)
 	defer dcancel()
+	// the automatic IPv6 tunnels (Windows) are put back alongside the DNS entries,
+	// under the same share of the time
+	tunDone := make(chan error, 1)
+	tunWanted := !st.Tun6.Empty()
+	if tunWanted {
+		total++
+		go func() { tunDone <- m.restoreTun6(dctx, *st.Tun6) }()
+	}
 	var dnsErrs []error
 	if bulk, ok := m.b.(resolverBulkDeleter); ok && len(st.Resolvers) > 0 {
 		// one call for all of them, see DelResolvers
@@ -563,6 +593,19 @@ func (m *Manager) removeEntries(ctx context.Context, st *config.State, progress 
 			continue
 		}
 		rep.Resolvers++
+	}
+	if tunWanted {
+		err := <-tunDone
+		step()
+		if err != nil {
+			errs = append(errs, entryErr("IPv6 tunnels (Teredo, 6to4, ISATAP)", err))
+			if !errors.Is(err, errTun6) { // a value that is not valid is never handed on: it is dropped
+				c := *st.Tun6
+				keep.Tun6 = &c
+			}
+		} else {
+			rep.Tun6 = true
+		}
 	}
 	ruleErrs := runAll(ctx, st.Rules, removeWorkers, func(r config.Rule) error {
 		defer step()

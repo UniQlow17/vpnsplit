@@ -30,3 +30,6 @@ func physicalGateway() (Gateway, bool) {
 
 // the baseline code tells our routes by this metric on every build
 const _ = uint(ownMetric-linOwnMetric) + uint(linOwnMetric-ownMetric)
+
+// v6Halves: ::/1 and 8000::/1 are planned for a home VPN that has IPv6.
+const v6Halves = true

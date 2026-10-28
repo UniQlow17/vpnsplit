@@ -60,6 +60,25 @@ func ParseCIDR4(s string) (string, error) {
 	return p.Masked().String(), nil
 }
 
+// ParseCIDR parses an IPv4 or IPv6 network in canonical form (host bits
+// cleared). IPv4-in-IPv6 and zones are rejected.
+func ParseCIDR(s string) (netip.Prefix, error) {
+	p, err := netip.ParsePrefix(s)
+	if err != nil || p.Addr().Is4In6() || p.Addr().Zone() != "" {
+		return netip.Prefix{}, fmt.Errorf("%q is not an IP network", clip(s))
+	}
+	return p.Masked(), nil
+}
+
+// ParseIP parses an IPv4 or IPv6 address (no zone, not IPv4-in-IPv6).
+func ParseIP(s string) (netip.Addr, error) {
+	a, err := netip.ParseAddr(s)
+	if err != nil || a.Is4In6() || a.Zone() != "" {
+		return netip.Addr{}, fmt.Errorf("%q is not an IP address", clip(s))
+	}
+	return a, nil
+}
+
 // ValidIface reports whether s can be used as an adapter selector or name.
 // Real adapter names may contain Unicode and spaces (Windows), so only what
 // could confuse a command line or a journal is rejected: control characters,
@@ -83,15 +102,17 @@ func validVia(s string) bool {
 
 // ValidateRoute checks a journal entry before anything is executed for it.
 func ValidateRoute(r Route) error {
-	if _, err := ParseCIDR4(r.Dest); err != nil {
+	dest, err := ParseCIDR(r.Dest)
+	if err != nil {
 		return fmt.Errorf("route destination: %w", err)
 	}
 	if !ValidIface(r.Iface) {
 		return fmt.Errorf("route %s: invalid adapter name", r.Dest)
 	}
 	if r.Gateway != "" {
-		if _, err := ParseIPv4(r.Gateway); err != nil {
-			return fmt.Errorf("route %s gateway: %w", r.Dest, err)
+		gw, err := ParseIP(r.Gateway)
+		if err != nil || gw.Is4() != dest.Addr().Is4() || gw.IsUnspecified() {
+			return fmt.Errorf("route %s gateway: %q is not a next hop of the family of the route", r.Dest, clip(r.Gateway))
 		}
 	}
 	if !validVia(r.Via) {
@@ -178,6 +199,26 @@ func (c *Config) Sanitize() (warnings []string) {
 	c.Domains = clean("domains", c.Domains, false)
 	c.DirectNetworks = clean("direct_networks", c.DirectNetworks, true)
 	c.DirectDomains = clean("direct_domains", c.DirectDomains, false)
+	c.HomeNetworks = clean("home_networks", c.HomeNetworks, true)
+	c.HomeDomains = clean("home_domains", c.HomeDomains, false)
+	switch {
+	case ValidRest(c.Rest):
+	case c.Rest == "" && c.HomeDefault != nil:
+		// home_default=true always meant "everything else into the home VPN"; false
+		// meant that nothing was added for the rest, and it is left to the client
+		if *c.HomeDefault {
+			c.Rest = RestHome
+		} else {
+			c.Rest = RestKeep
+		}
+		warn("config: home_default=%v is now rest=%q", *c.HomeDefault, c.Rest)
+	case c.Rest == "":
+		c.Rest = RestHome
+	default:
+		warn("config: invalid rest %q, using %q", clip(c.Rest), RestHome)
+		c.Rest = RestHome
+	}
+	c.HomeDefault = nil
 	// the file on disk still has what was dropped; Save keeps a copy of it
 	c.lossy = len(warnings) > 0
 	return warnings

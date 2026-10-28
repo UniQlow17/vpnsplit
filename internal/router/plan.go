@@ -20,7 +20,10 @@ const ViaPin = "pin"
 type plan struct {
 	routes []config.Route
 	rules  []config.Rule
-	dns    *dnsPlan
+	dns    *dnsPlan // the corp zones, to the corp DNS
+	direct *dnsPlan // the zones that go direct, to the DNS of the provider (with the rest going home)
+	rest   *dnsPlan // everything else ("."), to the DNS of the home VPN
+	tun6   bool     // Windows: Teredo, 6to4 and ISATAP are turned off
 	warns  []string
 }
 
@@ -37,6 +40,47 @@ func (d *dnsPlan) sig() string {
 		return ""
 	}
 	return fmt.Sprintf("%s|%s|%s", d.iface, strings.Join(d.servers, ","), strings.Join(d.ids, ","))
+}
+
+// dnsItem is one DNS entry to make and the servers it points to.
+type dnsItem struct {
+	id      string
+	servers []string
+}
+
+// dnsItems lists every DNS entry of the plan: the corp zones, then the one for the rest.
+func (p *plan) dnsItems() []dnsItem {
+	var out []dnsItem
+	for _, g := range []*dnsPlan{p.dns, p.direct, p.rest} {
+		if g == nil {
+			continue
+		}
+		for _, id := range g.ids {
+			out = append(out, dnsItem{id, g.servers})
+		}
+	}
+	return out
+}
+
+// dnsIDs are the ids of dnsItems.
+func (p *plan) dnsIDs() []string {
+	var ids []string
+	for _, it := range p.dnsItems() {
+		ids = append(ids, it.id)
+	}
+	return ids
+}
+
+// dnsSig identifies all the DNS entries of the plan (one signature per group,
+// ";" between them).
+func (p *plan) dnsSig() string {
+	var parts []string
+	for _, g := range []*dnsPlan{p.dns, p.direct, p.rest} {
+		if g != nil {
+			parts = append(parts, g.sig())
+		}
+	}
+	return strings.Join(parts, ";")
 }
 
 // Policy routing (Linux). A VPN client may send everything into its own
@@ -143,7 +187,7 @@ func captured(rules []OSRule, tbl *table, home string) (int, bool) {
 	}
 	for _, d := range diverting(rules) {
 		for _, r := range tbl.all {
-			if r.Table == d.Table && r.Dest.Bits() <= 1 && r.Iface == home {
+			if r.Table == d.Table && r.Dest.Addr().Is4() && r.Dest.Bits() <= 1 && r.Iface == home {
 				return d.Table, true
 			}
 		}
@@ -185,18 +229,40 @@ func planPins(gw Gateway, gwOK bool, tbl *table, cands []netip.Addr, corp []neti
 }
 
 // pinnedHosts counts /32 routes through physical adapters: what clients add
-// to keep their servers off their own tunnel.
-func pinnedHosts(tbl *table) int {
+// to keep their servers off their own tunnel. Routes of ours (the journal lists
+// them, or the OS tags them) are not a client's.
+func pinnedHosts(tbl *table, st *config.State) int {
 	n := 0
 	if tbl == nil || !tbl.known {
 		return 0
 	}
+	mine := mineRoutes(st)
 	for _, r := range tbl.routes {
-		if r.Dest.Bits() == 32 && r.Iface != "" && netif.Classify(r.Iface) == netif.KindPhysical {
+		if r.Dest.Addr().Is4() && r.Dest.Bits() == 32 && r.Iface != "" && netif.Classify(r.Iface) == netif.KindPhysical && !isMine(r, mine) {
 			n++
 		}
 	}
 	return n
+}
+
+// mineRoutes are the destinations of the journal: pins, /32 routes to DNS
+// servers and the rest, ours and not a client's.
+func mineRoutes(st *config.State) map[netip.Prefix]bool {
+	mine := map[netip.Prefix]bool{}
+	if st != nil {
+		for _, r := range st.Routes {
+			if p, err := netip.ParsePrefix(r.Dest); err == nil {
+				mine[p.Masked()] = true
+			}
+		}
+	}
+	return mine
+}
+
+// isMine reports whether an OS route is ours: Linux tags ours, on Windows and
+// macOS the journal is compared.
+func isMine(r OSRoute, mine map[netip.Prefix]bool) bool {
+	return mine[r.Dest] || (routesTagged && r.Ours)
 }
 
 // endpointCandidates are the addresses of the servers of the VPNs that must
@@ -211,23 +277,14 @@ func endpointCandidates(e Env, tbl *table, st *config.State) []netip.Addr {
 	if tbl == nil || !tbl.known {
 		return nil
 	}
-	mine := map[netip.Prefix]bool{}
-	if st != nil {
-		for _, r := range st.Routes {
-			if r.Via == ViaPin {
-				if p, err := netip.ParsePrefix(r.Dest); err == nil {
-					mine[p.Masked()] = true
-				}
-			}
-		}
-	}
+	mine := mineRoutes(st) // pins, and the /32 routes to DNS servers: ours, not a client's
 	gw := addrOrZero(e.GW.Router)
 	var out []netip.Addr
 	seen := map[netip.Addr]bool{}
 	for _, r := range tbl.routes {
 		a := r.Dest.Addr()
-		if r.Dest.Bits() != 32 || !r.Gateway.IsValid() || r.Iface == "" || netif.Classify(r.Iface) != netif.KindPhysical ||
-			a == gw || mine[r.Dest] || (routesTagged && r.Ours) || seen[a] {
+		if !r.Dest.Addr().Is4() || r.Dest.Bits() != 32 || !r.Gateway.IsValid() || r.Iface == "" || netif.Classify(r.Iface) != netif.KindPhysical ||
+			a == gw || isMine(r, mine) || seen[a] {
 			continue
 		}
 		seen[a] = true
@@ -235,6 +292,216 @@ func endpointCandidates(e Env, tbl *table, st *config.State) []netip.Addr {
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Less(out[j]) })
 	return out
+}
+
+// fakeIPNet is the range (RFC 2544, 198.18.0.0/15) that a "fake-ip" DNS (Clash,
+// sing-box, some other clients) answers from: an address that exists only inside
+// the client, to be turned back into the real name there. A route to it, or a
+// rule that takes it for the real address of the name, would be wrong.
+var fakeIPNet = netip.MustParsePrefix("198.18.0.0/15")
+
+// ownTableRoute reports whether r goes into our table when the rule that makes
+// the table visible is needed: routes of the corp and direct kinds (the
+// halves of "the rest goes direct" included) and the user's rules of the home
+// kind. The halves of the home tunnel stay in main (see the comment at rulePrefBase).
+func ownTableRoute(r config.Route) bool {
+	switch r.Via {
+	case ViaCorp, ViaDirect:
+		return true
+	case ViaHome:
+		p, err := netip.ParsePrefix(r.Dest)
+		return err == nil && p.Addr().Is4() && p.Bits() > 1
+	}
+	return false
+}
+
+// dnsMemo remembers what the OS said about DNS servers during one apply: the
+// answer takes a PowerShell call or a tool run, and the bootstrap and the full
+// plan both need it.
+type dnsMemo struct {
+	dns  map[string][2][]string
+	phys map[string][]string
+}
+
+func newDNSMemo() *dnsMemo {
+	return &dnsMemo{dns: map[string][2][]string{}, phys: map[string][]string{}}
+}
+
+func (m *Manager) dnsOfMemo(iface string) (servers, zones []string) {
+	if m.memo == nil {
+		return m.dnsOf(iface)
+	}
+	if v, ok := m.memo.dns[iface]; ok {
+		return v[0], v[1]
+	}
+	servers, zones = m.dnsOf(iface)
+	m.memo.dns[iface] = [2][]string{servers, zones}
+	return servers, zones
+}
+
+func (m *Manager) physDNSMemo(iface string) []string {
+	if m.physDNS == nil {
+		return nil
+	}
+	if m.memo == nil {
+		return validServers(m.physDNS(iface))
+	}
+	if v, ok := m.memo.phys[iface]; ok {
+		return v
+	}
+	v := validServers(m.physDNS(iface))
+	m.memo.phys[iface] = v
+	return v
+}
+
+// corpServers are the DNS servers of the corp VPN: the one the user set, or what
+// the corp client put on its adapter.
+func (m *Manager) corpServers(cfg *config.Config, e Env) (servers, zones []string) {
+	servers, zones = m.dnsOfMemo(e.Corp.Name)
+	servers = validServers(servers)
+	if cfg.CorpDNS != "" {
+		servers = []string{cfg.CorpDNS}
+	}
+	return servers, zones
+}
+
+// directServers are the DNS servers of the provider on the physical adapter,
+// the ones that may resolve the domains that go direct.
+func (m *Manager) directServers(e Env) []string {
+	if !e.GWOK {
+		return nil
+	}
+	return m.physDNSMemo(e.GW.Iface)
+}
+
+// hostRoutes makes a /32 route to each server through the adapter (and the
+// next hop, if there is one), except to the next hop itself: that one is
+// reached on the link. A server in one of the networks of the adapter (onlink)
+// is reached on the link too: its route has no next hop.
+func hostRoutes(servers []string, iface, gateway, via string, onlink []netip.Prefix) []config.Route {
+	var out []config.Route
+	for _, s := range servers {
+		if s == gateway {
+			continue
+		}
+		gw := gateway
+		if a, err := netip.ParseAddr(s); err == nil {
+			for _, n := range onlink {
+				if n.Contains(a) {
+					gw = ""
+					break
+				}
+			}
+		}
+		out = append(out, config.Route{Dest: s + "/32", Iface: iface, Gateway: gw, Via: via})
+	}
+	return out
+}
+
+// badAddr says why no route and no DNS entry is made for the address a (""
+// when it is fine): it is not an address of one host in the network, or it is
+// the fake one of a client.
+func badAddr(a netip.Addr) string {
+	a = a.Unmap()
+	switch {
+	case !a.IsValid():
+		return "not an address"
+	case a.IsLoopback():
+		return "loopback"
+	case a.IsUnspecified():
+		return "unspecified"
+	case a.IsMulticast():
+		return "multicast"
+	case a.IsLinkLocalUnicast():
+		return "link-local"
+	case a.Is4() && a == netip.AddrFrom4([4]byte{255, 255, 255, 255}):
+		return "broadcast"
+	case fakeIPNet.Contains(a):
+		return "in the fake-ip range (198.18.0.0/15)"
+	}
+	return ""
+}
+
+// avoid is what the addresses of the provider's DNS and the answers for the
+// names that go direct must stay clear of: a /32 route to one of them would
+// cut into what another rule or a tunnel needs.
+type avoid struct {
+	addrs map[netip.Addr]string
+	nets  []avoidNet
+}
+
+type avoidNet struct {
+	p   netip.Prefix
+	why string
+}
+
+func newAvoid() *avoid { return &avoid{addrs: map[netip.Addr]string{}} }
+
+func (v *avoid) addAddrs(why string, list ...string) {
+	for _, s := range list {
+		if a, err := netip.ParseAddr(s); err == nil {
+			if _, dup := v.addrs[a]; !dup {
+				v.addrs[a] = why
+			}
+		}
+	}
+}
+
+func (v *avoid) addAddrList(why string, list []netip.Addr) {
+	for _, a := range list {
+		if _, dup := v.addrs[a]; !dup {
+			v.addrs[a] = why
+		}
+	}
+}
+
+func (v *avoid) addNets(why string, list ...netip.Prefix) {
+	for _, p := range list {
+		v.nets = append(v.nets, avoidNet{p.Masked(), why})
+	}
+}
+
+// why says why a has to be left alone ("" if it does not).
+func (v *avoid) why(a netip.Addr) string {
+	a = a.Unmap()
+	if w := badAddr(a); w != "" {
+		return w
+	}
+	if w, ok := v.addrs[a]; ok {
+		return w
+	}
+	for _, n := range v.nets {
+		if n.p.Contains(a) {
+			return n.why
+		}
+	}
+	return ""
+}
+
+// filterServers drops the DNS servers of the provider that must be left alone;
+// a note says why for each.
+func (v *avoid) filterServers(servers []string) (kept, notes []string) {
+	for _, s := range servers {
+		a, err := netip.ParseAddr(s)
+		if err != nil {
+			continue
+		}
+		if w := v.why(a); w != "" {
+			notes = append(notes, fmt.Sprintf("the DNS server %s of the provider is %s: no direct route to it, it is not asked about the names that go direct", s, w))
+			continue
+		}
+		kept = append(kept, s)
+	}
+	return kept, notes
+}
+
+func has(list []string, v string) bool {
+	for _, x := range list {
+		if x == v {
+			return true
+		}
+	}
+	return false
 }
 
 // buildPlan works out what routing should be for the connected VPNs and the
@@ -249,7 +516,8 @@ func (m *Manager) buildPlan(cfg *config.Config, e Env, st *config.State, tbl *ta
 			p.warns = append(p.warns, fmt.Sprintf("%s: %v", r.Dest, err))
 			return
 		}
-		r.Dest, _ = config.ParseCIDR4(r.Dest) // canonical: a prefix is one entry however it is written
+		pf, _ := config.ParseCIDR(r.Dest)
+		r.Dest = pf.String() // canonical: a prefix is one entry however it is written
 		if i, ok := seen[r.Dest]; ok {
 			if p.routes[i].Via != r.Via {
 				fmt.Fprintf(w, "  = %-18s is both %s and %s: %s wins\n", r.Dest, p.routes[i].Via, r.Via, p.routes[i].Via)
@@ -259,18 +527,37 @@ func (m *Manager) buildPlan(cfg *config.Config, e Env, st *config.State, tbl *ta
 		seen[r.Dest] = len(p.routes)
 		p.routes = append(p.routes, r)
 	}
+	kinds := cfg.Kinds()
+	unused := 0 // rules of a kind that does not matter with this setting of the rest
+	for _, k := range []string{config.DestDirect, config.DestHome} {
+		if !has(kinds, k) {
+			n, d := cfg.ListsOf(k)
+			unused += len(*n) + len(*d)
+		}
+	}
+	if unused > 0 {
+		fmt.Fprintf(w, "%d rules of a kind that has no meaning with \"rest: %s\" are kept in the config and not applied\n", unused, cfg.Rest)
+	}
+
+	restHome := e.HomeOK && cfg.Rest == config.RestHome
+	cands := endpointCandidates(e, tbl, st)
+	var homeDNS []string // the DNS of the home VPN: no provider's /32 may point at it
+	if e.HomeOK {
+		homeDNS, _ = m.dnsOfMemo(e.Home.Name)
+		homeDNS = validServers(homeDNS)
+	}
 
 	var corpPrefixes []netip.Prefix
 	var corpRoutes []config.Route
+	var corpSrv []string
 	if e.CorpOK {
 		corp := func(dest string) {
 			corpRoutes = append(corpRoutes, config.Route{Dest: dest, Iface: e.Corp.Name, Gateway: cfg.CorpGateway, Via: ViaCorp})
 		}
-		servers, zones := m.dnsOf(e.Corp.Name)
-		servers = validServers(servers)
-		if cfg.CorpDNS != "" {
-			servers = []string{cfg.CorpDNS}
-			corp(cfg.CorpDNS + "/32") // the corp DNS itself must be reachable through corp
+		servers, zones := m.corpServers(cfg, e)
+		corpSrv = servers
+		for _, s := range servers {
+			corp(s + "/32") // the corp DNS itself must be reachable through corp
 		}
 		if len(servers) > 0 {
 			fmt.Fprintf(w, "corp DNS: %s\n", strings.Join(servers, ", "))
@@ -280,7 +567,9 @@ func (m *Manager) buildPlan(cfg *config.Config, e Env, st *config.State, tbl *ta
 		}
 		if len(cfg.Domains) > 0 {
 			fmt.Fprintln(w, "resolving corp domains...")
-			for _, ip := range resolveDomains(m.ctx, cfg.Domains, first(servers), w) {
+			ips, dropped := m.resolveDomains(cfg.Domains, servers, nil, w)
+			p.warns = append(p.warns, dropped...)
+			for _, ip := range ips {
 				corp(ip)
 			}
 		}
@@ -288,9 +577,40 @@ func (m *Manager) buildPlan(cfg *config.Config, e Env, st *config.State, tbl *ta
 			p.dns = cleanZones(e.Corp.Name, servers, append(zones, cfg.Domains...), cfg.DirectDomains)
 		}
 	}
+	for _, r := range corpRoutes {
+		if pf, err := netip.ParsePrefix(r.Dest); err == nil {
+			corpPrefixes = append(corpPrefixes, pf.Masked())
+		}
+	}
+
+	// the rules "through the home VPN" come before the direct ones are worked out:
+	// an address that is both must not get a /32 around the tunnel
+	var homeRoutes []config.Route
+	var homePrefixes []netip.Prefix
+	if e.HomeOK && has(kinds, config.DestHome) {
+		home := func(dest string) {
+			homeRoutes = append(homeRoutes, config.Route{Dest: dest, Iface: e.Home.Name, Via: ViaHome})
+		}
+		for _, n := range expandNets(cfg.HomeNetworks, w) {
+			home(n)
+		}
+		if len(cfg.HomeDomains) > 0 {
+			fmt.Fprintln(w, "resolving home domains...")
+			ips, dropped := m.resolveDomains(cfg.HomeDomains, nil, nil, w)
+			p.warns = append(p.warns, dropped...)
+			for _, ip := range ips {
+				home(ip)
+			}
+		}
+		for _, r := range homeRoutes {
+			homePrefixes = append(homePrefixes, pfx1(r.Dest)...)
+		}
+	} else if !e.HomeOK && has(kinds, config.DestHome) && len(cfg.HomeNetworks)+len(cfg.HomeDomains) > 0 {
+		fmt.Fprintln(w, "home VPN is not connected, its rules are skipped")
+	}
 
 	var directRoutes []config.Route
-	if e.GWOK {
+	if e.GWOK && has(kinds, config.DestDirect) {
 		direct := func(dest string) {
 			directRoutes = append(directRoutes, config.Route{Dest: dest, Iface: e.GW.Iface, Gateway: e.GW.Router, Via: ViaDirect})
 		}
@@ -298,9 +618,34 @@ func (m *Manager) buildPlan(cfg *config.Config, e Env, st *config.State, tbl *ta
 			direct(n)
 		}
 		if len(cfg.DirectDomains) > 0 {
+			av := newAvoid()
+			av.addAddrs("the corp DNS server", corpSrv...)
+			av.addAddrs("the DNS server of the home VPN", homeDNS...)
+			av.addAddrList("the address of a VPN server", cands)
+			av.addNets("covered by a corp rule", corpPrefixes...)
+			av.addNets("covered by a rule through the home VPN", homePrefixes...)
+			// the names that go direct are asked of the DNS of the provider, not of
+			// whatever the system would pick (that may be a VPN's)
+			servers, notes := av.filterServers(m.directServers(e))
+			p.warns = append(p.warns, notes...)
+			if len(servers) > 0 {
+				fmt.Fprintf(w, "direct DNS (provider): %s\n", strings.Join(servers, ", "))
+				directRoutes = append(directRoutes, hostRoutes(servers, e.GW.Iface, e.GW.Router, ViaDirect, e.GWNets)...)
+			} else if len(notes) == 0 {
+				p.warns = append(p.warns, "the DNS servers of the provider are unknown: the domains that go direct are resolved by the system resolver")
+			} else {
+				p.warns = append(p.warns, "no DNS server of the provider is usable: the domains that go direct are resolved by the system resolver")
+			}
 			fmt.Fprintln(w, "resolving direct domains...")
-			for _, ip := range resolveDomains(m.ctx, cfg.DirectDomains, "", w) {
+			ips, dropped := m.resolveDomains(cfg.DirectDomains, servers, av.why, w)
+			p.warns = append(p.warns, dropped...)
+			for _, ip := range ips {
 				direct(ip)
+			}
+			// with the rest going home the applications must ask the same server, or they
+			// get another address than the one the route was made for
+			if restHome && len(servers) > 0 {
+				p.direct = cleanZones(e.GW.Iface, servers, cfg.DirectDomains, nil)
 			}
 		}
 	}
@@ -309,22 +654,25 @@ func (m *Manager) buildPlan(cfg *config.Config, e Env, st *config.State, tbl *ta
 	if rs != nil && rs.known {
 		rules = rs.all
 	}
-	homeFull := e.HomeOK && cfg.HomeDefault
+	homeFull := restHome
 	if homeFull {
 		if t, ok := captured(rules, tbl, e.Home.Name); ok {
 			homeFull = false
 			fmt.Fprintf(w, "home VPN: its own policy routing (table %d) already sends everything into the tunnel, 0/1 + 128/1 not added\n", t)
 		}
 	}
+	restDirect := cfg.Rest == config.RestDirect && e.GWOK
+	if cfg.Rest == config.RestDirect && !e.GWOK {
+		p.warns = append(p.warns, "the rest of the traffic should go direct, but no Wi-Fi/Ethernet gateway was found")
+	}
+	if restDirect {
+		for _, r := range foreignHalves(tbl, st, e.GW.Iface) {
+			p.warns = append(p.warns, fmt.Sprintf("%s is routed through %s by somebody else: the rest may not go direct if that route wins", r.Dest, r.Iface))
+		}
+	}
 
 	// the servers of VPNs: no corp rule over them; with the halves, a pin each
 	var pins []config.Route
-	for _, r := range corpRoutes {
-		if pf, err := netip.ParsePrefix(r.Dest); err == nil {
-			corpPrefixes = append(corpPrefixes, pf.Masked())
-		}
-	}
-	cands := endpointCandidates(e, tbl, st)
 	if len(cands) > 0 || homeFull {
 		var drop map[netip.Prefix]bool
 		var warns []string
@@ -341,7 +689,7 @@ func (m *Manager) buildPlan(cfg *config.Config, e Env, st *config.State, tbl *ta
 			corpRoutes = kept
 		}
 	}
-	if homeFull && tbl != nil && tbl.known && len(pins) == 0 && pinnedHosts(tbl) == 0 {
+	if homeFull && tbl != nil && tbl.known && len(pins) == 0 && pinnedHosts(tbl, st) == 0 {
 		p.warns = append(p.warns, "endpoint not pinned: no /32 route to a VPN server through the physical gateway was found; "+
 			"if the VPN client does not keep its own packets off the tunnel, 0/1 + 128/1 may loop them into it")
 	}
@@ -352,6 +700,9 @@ func (m *Manager) buildPlan(cfg *config.Config, e Env, st *config.State, tbl *ta
 	for _, r := range directRoutes {
 		add(r)
 	}
+	for _, r := range homeRoutes {
+		add(r)
+	}
 	for _, r := range pins {
 		add(r)
 	}
@@ -360,12 +711,49 @@ func (m *Manager) buildPlan(cfg *config.Config, e Env, st *config.State, tbl *ta
 		for _, d := range []string{"0.0.0.0/1", "128.0.0.0/1"} {
 			add(config.Route{Dest: d, Iface: e.Home.Name, Via: ViaHome})
 		}
+		// the same for IPv6, when the home VPN has any: otherwise it would go
+		// around the tunnel (see V6Status). Not on macOS until it is tried there.
+		if e.Home.HasV6() && v6Halves {
+			for _, d := range []string{"::/1", "8000::/1"} {
+				add(config.Route{Dest: d, Iface: e.Home.Name, Via: ViaHome})
+			}
+		}
+	}
+	if restDirect {
+		for _, d := range []string{"0.0.0.0/1", "128.0.0.0/1"} {
+			add(config.Route{Dest: d, Iface: e.GW.Iface, Gateway: e.GW.Router, Via: ViaDirect})
+		}
+	}
+
+	// the DNS of everything else: the home VPN's, wherever the home VPN takes the rest
+	switch {
+	case !restHome:
+	case !restDNS:
+		p.warns = append(p.warns, "this OS cannot send the rest of the DNS queries to the home VPN: they stay with the system")
+	case m.oneShot:
+		p.warns = append(p.warns, "the DNS of the rest of the traffic is not sent to the home VPN by \"apply\": if the home VPN fell, "+
+			"all the names would stop resolving until \"reset\"; use \"run\" or \"watch\" for it")
+	case e.CorpOK && p.dns == nil:
+		p.warns = append(p.warns, "the corp zones are not set up (split DNS is off, or the corp DNS or its zones are unknown): "+
+			"the DNS of the rest of the traffic is not sent to the home VPN, it would take the corp names too")
+	case len(homeDNS) == 0:
+		p.warns = append(p.warns, "the DNS servers of the home VPN are unknown: the DNS of the rest of the traffic stays with the system")
+	default:
+		if ids := resolverPlan(e.Home.Name, homeDNS, []string{"."}); len(ids) > 0 {
+			fmt.Fprintf(w, "home DNS: %s (for everything else)\n", strings.Join(homeDNS, ", "))
+			p.rest = &dnsPlan{iface: e.Home.Name, servers: homeDNS, ids: ids}
+		} else {
+			p.warns = append(p.warns, "the system cannot send the rest of the DNS queries to the home VPN (no systemd-resolved)")
+		}
+	}
+	if restHome && m.canTun6() {
+		p.tun6 = true
 	}
 
 	var pfx []netip.Prefix
 	for _, r := range p.routes {
-		if r.Via == ViaCorp || r.Via == ViaDirect {
-			if pf, err := netip.ParsePrefix(r.Dest); err == nil {
+		if ownTableRoute(r) {
+			if pf, err := netip.ParsePrefix(r.Dest); err == nil && pf.Addr().Is4() {
 				pfx = append(pfx, pf)
 			}
 		}
@@ -388,7 +776,7 @@ func policyFor(routes []config.Route, pfx []netip.Prefix, tbl *table, rs *ruleSe
 	}
 	if len(out) > 0 {
 		for i := range routes {
-			if routes[i].Via == ViaCorp || routes[i].Via == ViaDirect {
+			if ownTableRoute(routes[i]) {
 				routes[i].Table = n
 			}
 		}
@@ -418,23 +806,75 @@ func cleanZones(iface string, servers, zones, skip []string) *dnsPlan {
 	return &dnsPlan{iface: iface, servers: servers, ids: ids}
 }
 
-// bootstrapPlan is the part of the plan the rest depends on: corp domains
-// are resolved through the corp DNS, so a route to it (and, with policy
-// routing, a rule) must exist before the full plan can be made. nil if no
-// corp domain needs resolving.
-func bootstrapPlan(cfg *config.Config, e Env, tbl *table, rs *ruleSet) *plan {
-	if !e.CorpOK || cfg.CorpDNS == "" || len(cfg.Domains) == 0 {
+// bootstrapPlan is the part of the plan the rest depends on: the domains are
+// resolved through the corp DNS (corp ones) and the DNS of the provider (direct
+// ones), so a route to each of them must exist before the full plan can be
+// made, and with policy routing a rule too. nil if no domain needs resolving
+// that way.
+func (m *Manager) bootstrapPlan(cfg *config.Config, e Env, st *config.State, tbl *table, rs *ruleSet) *plan {
+	var routes []config.Route
+	add := func(list []config.Route) {
+		for _, r := range list {
+			r.Metric = ownMetric
+			if config.ValidateRoute(r) == nil {
+				routes = append(routes, r)
+			}
+		}
+	}
+	var corpSrv, homeDNS []string
+	if e.CorpOK {
+		corpSrv, _ = m.corpServers(cfg, e)
+	}
+	if e.HomeOK {
+		homeDNS, _ = m.dnsOfMemo(e.Home.Name)
+		homeDNS = validServers(homeDNS)
+	}
+	if e.CorpOK && len(cfg.Domains) > 0 {
+		add(hostRoutes(corpSrv, e.Corp.Name, cfg.CorpGateway, ViaCorp, nil))
+	}
+	if e.GWOK && len(cfg.DirectDomains) > 0 && has(cfg.Kinds(), config.DestDirect) {
+		// the same servers the full plan will ask (see buildPlan): not the corp DNS, not the home VPN's
+		av := newAvoid()
+		av.addAddrs("the corp DNS server", corpSrv...)
+		av.addAddrs("the DNS server of the home VPN", homeDNS...)
+		av.addAddrList("the address of a VPN server", endpointCandidates(e, tbl, st))
+		// the networks written out are known without asking RIPE
+		if e.CorpOK {
+			av.addNets("covered by a corp rule", literalNets(cfg.Networks)...)
+		}
+		if e.HomeOK && has(cfg.Kinds(), config.DestHome) {
+			av.addNets("covered by a rule through the home VPN", literalNets(cfg.HomeNetworks)...)
+		}
+		servers, _ := av.filterServers(m.directServers(e))
+		add(hostRoutes(servers, e.GW.Iface, e.GW.Router, ViaDirect, e.GWNets))
+	}
+	if len(routes) == 0 {
 		return nil
 	}
-	r := config.Route{Dest: cfg.CorpDNS + "/32", Iface: e.Corp.Name, Gateway: cfg.CorpGateway, Via: ViaCorp, Metric: ownMetric}
-	if config.ValidateRoute(r) != nil {
-		return nil
-	}
-	p := &plan{routes: []config.Route{r}}
+	p := &plan{routes: routes}
 	if rs != nil && rs.known {
-		p.rules, p.warns = policyFor(p.routes, pfx1(r.Dest), tbl, rs, rs.all, nil, io.Discard)
+		var pfx []netip.Prefix
+		for _, r := range routes {
+			pfx = append(pfx, pfx1(r.Dest)...)
+		}
+		p.rules, p.warns = policyFor(p.routes, pfx, tbl, rs, rs.all, nil, io.Discard)
 	}
 	return p
+}
+
+// literalNets are the networks of rules that are written out (an autonomous
+// system needs RIPE, and is not among them).
+func literalNets(rules []string) []netip.Prefix {
+	var out []netip.Prefix
+	for _, r := range rules {
+		if config.IsAS(r) {
+			continue
+		}
+		if pf, err := config.ParseCIDR(r); err == nil {
+			out = append(out, pf.Masked())
+		}
+	}
+	return out
 }
 
 func pfx1(s string) []netip.Prefix {
@@ -443,4 +883,29 @@ func pfx1(s string) []netip.Prefix {
 		return nil
 	}
 	return []netip.Prefix{p.Masked()}
+}
+
+// foreignHalves lists the routes of the two halves of the address space (0/1
+// and 128/1) in the main table that are neither ours nor through the adapter
+// iface: a VPN client that takes the default route that way competes with ours.
+func foreignHalves(tbl *table, st *config.State, iface string) []OSRoute {
+	if tbl == nil || !tbl.known {
+		return nil
+	}
+	mine := map[netip.Prefix]string{}
+	if st != nil {
+		for _, r := range st.Routes {
+			if p, err := netip.ParsePrefix(r.Dest); err == nil {
+				mine[p.Masked()] = r.Iface
+			}
+		}
+	}
+	var out []OSRoute
+	for _, r := range tbl.routes {
+		if !r.Dest.Addr().Is4() || r.Dest.Bits() != 1 || r.Iface == iface || (routesTagged && r.Ours) || mine[r.Dest] == r.Iface {
+			continue
+		}
+		out = append(out, r)
+	}
+	return out
 }

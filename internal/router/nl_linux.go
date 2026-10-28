@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
+	"os"
 	"sync/atomic"
 	"time"
 
@@ -216,9 +217,19 @@ func delRoute(r config.Route) error {
 }
 
 func listRoutes() ([]OSRoute, error) {
-	msgs, err := nlDumpRun(buildDumpRoutes)
+	msgs, err := nlDumpRun(func(seq uint32) []byte { return buildDumpRoutes(seq, afInet) })
 	if err != nil {
 		return nil, fmt.Errorf("read routes: %w", err)
+	}
+	// IPv6 is read as well; a kernel without it (EAFNOSUPPORT) has no such routes.
+	// With ipv6.disable=1 there is no /proc/net/if_inet6 and the dump may answer
+	// with the IPv4 table again: it is not asked for then.
+	if hasIPv6() {
+		m6, err := nlDumpRun(func(seq uint32) []byte { return buildDumpRoutes(seq, afInet6) })
+		if err != nil && !errors.Is(err, unix.EAFNOSUPPORT) {
+			return nil, fmt.Errorf("read IPv6 routes: %w", err)
+		}
+		msgs = append(msgs, m6...)
 	}
 	ifs, err := net.Interfaces()
 	if err != nil {
@@ -229,9 +240,41 @@ func listRoutes() ([]OSRoute, error) {
 		names[i.Index] = i.Name
 	}
 	var out []OSRoute
+	seen := map[OSRoute]bool{} // a dump that came twice (see above) must not list a route twice
 	for _, m := range msgs {
 		if r, ok := parseRoute(m); ok {
 			r.Iface = names[r.IfIndex]
+			if seen[r] {
+				continue
+			}
+			seen[r] = true
+			out = append(out, r)
+		}
+	}
+	return out, nil
+}
+
+// hasIPv6 reports whether the kernel has IPv6 (ipv6.disable=1 removes the files).
+func hasIPv6() bool {
+	_, err := os.Stat("/proc/net/if_inet6")
+	return err == nil
+}
+
+// Rules6 reads the IPv6 policy rules.
+func (osBackend) Rules6() ([]OSRule, error) {
+	if !hasIPv6() {
+		return nil, nil
+	}
+	msgs, err := nlDumpRun(func(seq uint32) []byte { return buildDumpRulesFor(seq, afInet6) })
+	if err != nil {
+		if errors.Is(err, unix.EAFNOSUPPORT) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("read IPv6 rules: %w", err)
+	}
+	var out []OSRule
+	for _, m := range msgs {
+		if r, ok := parseRule(m); ok {
 			out = append(out, r)
 		}
 	}

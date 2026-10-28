@@ -4,8 +4,10 @@ package router
 
 import (
 	"fmt"
+	"net/netip"
 	"os"
 	"strings"
+	"sync"
 
 	"github.com/UniQlow17/vpnsplit/internal/config"
 	"github.com/UniQlow17/vpnsplit/internal/sysexec"
@@ -48,9 +50,12 @@ func ifaceFor(ip string) string {
 	return ""
 }
 
+// hasResolved reports whether systemd-resolved answers; asked once per apply.
 func hasResolved() bool {
-	_, err := sysexec.LookPath("resolvectl")
-	return err == nil && sysexec.Command("resolvectl", "status").Run() == nil
+	return probes.get("resolved", func() bool {
+		_, err := sysexec.LookPath("resolvectl")
+		return err == nil && sysexec.Command("resolvectl", "status").Run() == nil
+	})
 }
 
 func resolvectl(args ...string) error {
@@ -134,7 +139,14 @@ func resolverPlan(iface string, _, zones []string) []string {
 	return ids
 }
 
+// resolvedMu serializes the changes of the DNS settings of the links: the domains
+// of a link are read, changed and written back as a whole, and two of them at the
+// same time (the entries are removed by several workers) would lose one change.
+var resolvedMu sync.Mutex
+
 func addResolver(id string, servers []string) error {
+	resolvedMu.Lock()
+	defer resolvedMu.Unlock()
 	if !config.ValidResolverEntry(id) {
 		return fmt.Errorf("invalid DNS entry %q", id)
 	}
@@ -158,6 +170,8 @@ func addResolver(id string, servers []string) error {
 }
 
 func delResolver(id string) error {
+	resolvedMu.Lock()
+	defer resolvedMu.Unlock()
 	if !config.ValidResolverEntry(id) {
 		return fmt.Errorf("invalid DNS entry %q", id)
 	}
@@ -193,3 +207,50 @@ func flushDNS() { _ = sysexec.Command("resolvectl", "flush-caches").Run() }
 // ListResolvers: the per-link DNS settings of systemd-resolved are not part of
 // the baseline; the journal is the record of what vpnsplit set.
 func (osBackend) ListResolvers() ([]OSResolver, error) { return nil, ErrNoTable }
+
+// restDNS: systemd-resolved sends everything else to the home link as the
+// routing domain "~.".
+const restDNS = true
+
+// physicalDNS finds the DNS servers of the provider on the physical link:
+// systemd-resolved first, then NetworkManager, then the servers of resolv.conf
+// (also the upstream list of resolved) that are reached through that link. The
+// stub of resolved (127.0.0.53) and other loopback addresses are not a provider's.
+func physicalDNS(iface string) []string {
+	var out []string
+	keep := func(list []string) {
+		for _, s := range validServers(list) {
+			if a, err := netip.ParseAddr(s); err == nil && !a.IsLoopback() && !a.IsUnspecified() {
+				out = config.AddUnique(out, s)
+			}
+		}
+	}
+	if hasResolved() {
+		keep(resolvectlList("dns", iface))
+	}
+	if len(out) == 0 {
+		if o, err := sysexec.Command("nmcli", "-g", "IP4.DNS", "device", "show", iface).Output(); err == nil {
+			keep(strings.FieldsFunc(string(o), func(r rune) bool { return r == '\n' || r == ' ' || r == '|' }))
+		}
+	}
+	if len(out) == 0 {
+		for _, p := range []string{"/run/systemd/resolve/resolv.conf", "/etc/resolv.conf"} {
+			b, err := os.ReadFile(p)
+			if err != nil {
+				continue
+			}
+			all, _ := parseResolvConf(string(b))
+			var mine []string
+			for _, s := range all {
+				if ifaceFor(s) == iface {
+					mine = append(mine, s)
+				}
+			}
+			keep(mine)
+			if len(out) > 0 {
+				break
+			}
+		}
+	}
+	return out
+}

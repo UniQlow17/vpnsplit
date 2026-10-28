@@ -443,7 +443,7 @@ func TestPlanNotesAreBatchedAndRaceFree(t *testing.T) {
 func dnsRig(t *testing.T, zones ...string) (*applyRig, *config.Config) {
 	t.Helper()
 	a := newApplyRig(t)
-	a.m.dnsOf = func(string) ([]string, []string) { return []string{"10.200.0.1"}, zones }
+	a.m.dnsOf = corpOnly([]string{"10.200.0.1"}, zones)
 	cfg := testCfg()
 	cfg.SplitDNS = true
 	return a, cfg
@@ -474,9 +474,7 @@ func TestDNSPlanChangeAddsBeforeItRemoves(t *testing.T) {
 		t.Skip("this OS has no per-domain DNS here (systemd-resolved)")
 	}
 	a.mb.dnsLog = nil
-	a.m.dnsOf = func(string) ([]string, []string) {
-		return []string{"10.200.0.1"}, []string{"corp.example", "new.example"}
-	}
+	a.m.dnsOf = corpOnly([]string{"10.200.0.1"}, []string{"corp.example", "new.example"})
 	a.apply(t, cfg)
 	var add, del []string
 	firstDel, lastAdd := len(a.mb.dnsLog), -1
@@ -503,9 +501,7 @@ func TestDNSPlanChangeAddsBeforeItRemoves(t *testing.T) {
 	}
 	// other servers: all entries point to the new ones
 	a.mb.dnsLog = nil
-	a.m.dnsOf = func(string) ([]string, []string) {
-		return []string{"10.200.0.9"}, []string{"corp.example", "new.example"}
-	}
+	a.m.dnsOf = corpOnly([]string{"10.200.0.9"}, []string{"corp.example", "new.example"})
 	a.apply(t, cfg)
 	adds := 0
 	for _, l := range a.mb.dnsLog {

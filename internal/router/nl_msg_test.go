@@ -160,7 +160,6 @@ func TestParseRoute(t *testing.T) {
 		"local table route":    dumpRoute(32, 255, 2, 2, 0, attr(1, 1, 1, 1, 1), attr(4, 1, 0, 0, 0)), // RTN_LOCAL
 		"multipath":            dumpRoute(24, 254, 3, 1, 0, attr(1, 1, 1, 1, 0)),
 		"truncated":            {2, 24, 0},
-		"IPv6":                 append([]byte{10, 64, 0, 0, 254, 3, 0, 1, 0, 0, 0, 0}, attr(4, 2, 0, 0, 0)...),
 	} {
 		if r, ok := parseRoute(msg); ok {
 			t.Errorf("%s: parsed as %+v", name, r)
@@ -321,5 +320,74 @@ func TestRouteProtoIsFree(t *testing.T) {
 		if routeProto == used {
 			t.Errorf("protocol %d is taken", used)
 		}
+	}
+}
+
+// IPv6 routes are read with their 16-byte addresses; a route with the IPv4
+// family byte and an IPv6 length of address is not.
+func TestParseRouteIPv6(t *testing.T) {
+	dst := netip.MustParseAddr("8000::").As16()
+	gw := netip.MustParseAddr("fe80::1").As16()
+	msg := append([]byte{afInet6, 1, 0, 0, 254, routeProto, 0, 1, 0, 0, 0, 0},
+		append(append(nlAttr(rtaDst, dst[:]), nlAttr(rtaGateway, gw[:])...), attrU32(rtaOif, 6)...)...)
+	r, ok := parseRoute(msg)
+	if !ok || r.Dest != netip.MustParsePrefix("8000::/1") || r.Gateway != netip.MustParseAddr("fe80::1") || r.IfIndex != 6 || !r.Ours {
+		t.Fatalf("%+v %v", r, ok)
+	}
+	def := append([]byte{afInet6, 0, 0, 0, 254, 3, 0, 1, 0, 0, 0, 0}, attrU32(rtaOif, 2)...)
+	if r, ok := parseRoute(def); !ok || r.Dest != netip.MustParsePrefix("::/0") {
+		t.Errorf("default: %+v %v", r, ok)
+	}
+}
+
+// The request for a route of IPv6 carries the family, a 16-byte destination and
+// universe scope, and the dump asks for the family it is told.
+func TestBuildRouteIPv6(t *testing.T) {
+	s := routeSpec{dest: netip.MustParsePrefix("::/1"), ifIndex: 6, metric: ownMetric, proto: routeProto}
+	m := buildAddRoute(1, s)
+	if m[16] != afInet6 || m[17] != 1 || m[22] != scopeUniverse {
+		t.Errorf("header: % x", m[16:28])
+	}
+	a := parseAttrs(m[28:])
+	if len(a[rtaDst]) != 16 {
+		t.Errorf("destination: % x", a[rtaDst])
+	}
+	if d := buildDelRoute(2, s); d[16] != afInet6 {
+		t.Errorf("del: % x", d[16:28])
+	}
+	if d := buildDumpRoutes(3, afInet6); d[16] != afInet6 {
+		t.Errorf("dump: % x", d[16:28])
+	}
+	if d := buildDumpRoutes(3, afInet); d[16] != afInet {
+		t.Errorf("dump: % x", d[16:28])
+	}
+}
+
+// The rules of the IPv6 family are read the same way (a client that takes IPv6
+// by its rules is told from one that takes IPv4 only), and the dump of them is
+// asked for by family.
+func TestParseRulesV6(t *testing.T) {
+	needLE(t)
+	m := dumpRule(0, 252, 1, fibRuleInv, attr(6, 0x28, 0x23, 0, 0), attr(10, 0xE6, 7, 0, 0), attr(15, 0xE6, 7, 0, 0))
+	m[0] = afInet6
+	r, ok := parseRule(m)
+	if !ok || r.Pref != 9000 || r.Table != 2022 || !ruleDiverts(r) {
+		t.Errorf("%+v %v", r, ok)
+	}
+	// a destination of the family is read as an IPv6 prefix
+	dst := append([]byte{afInet6, 32, 0, 0, 254, 0, 0, 1, 0, 0, 0, 0}, attr(1, 0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)...)
+	if r, ok := parseRule(dst); !ok || r.Dest.String() != "2001:db8::/32" || !r.hasSel() {
+		t.Errorf("%+v %v", r, ok)
+	}
+	if d := buildDumpRulesFor(5, afInet6); d[16] != afInet6 {
+		t.Errorf("family %d", d[16])
+	}
+	if d := buildDumpRules(5); d[16] != afInet {
+		t.Errorf("family %d", d[16])
+	}
+	other := dumpRule(0, 254, 1, 0)
+	other[0] = 7
+	if _, ok := parseRule(other); ok {
+		t.Error("another family was read")
 	}
 }

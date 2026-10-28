@@ -435,3 +435,28 @@ func TestLegacyPendingSaysWhy(t *testing.T) {
 		t.Errorf("%q", note)
 	}
 }
+
+// Old versions had neither IPv6 tunnel settings nor the zone ".": a file that
+// has them is not from them, and they never reach the protected journal.
+func TestLegacyDropsTun6AndRootZone(t *testing.T) {
+	e, journal, legacy := testStateEnv(t, true)
+	write(t, legacy, stateFile, `{"routes":[`+goodRoute+`],"resolvers":[".","domain tun0 .","domain tun0 corp.example.com","corp.example.com"],"tun6":{"teredo":"Disabled","sixtofour":"Default"}}`)
+	s, warns, status := e.read(true)
+	if status != JournalOK {
+		t.Fatalf("status %v", status)
+	}
+	if s.Tun6 != nil {
+		t.Errorf("Tun6 kept: %+v", s.Tun6)
+	}
+	for _, r := range s.Resolvers {
+		if r == "." || strings.HasSuffix(r, " .") {
+			t.Errorf("root zone entry kept: %q", r)
+		}
+	}
+	if got := readStr(t, filepath.Join(journal, stateFile)); strings.Contains(got, "tun6") || strings.Contains(got, "teredo") {
+		t.Errorf("Tun6 reached the journal: %s", got)
+	}
+	if j := strings.Join(warns, "|"); !strings.Contains(j, "IPv6 tunnel") {
+		t.Errorf("no warning: %q", warns)
+	}
+}

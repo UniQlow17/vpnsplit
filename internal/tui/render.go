@@ -139,7 +139,7 @@ func (m model) compactDiagram() []string {
 		{"HOME", e.HomeOK, m.vpnName(e.HomeOK, e.Home, homeSel)},
 		{"CORP", e.CorpOK, m.vpnName(e.CorpOK, e.Corp, corpSel)},
 	}
-	if m.cfg != nil && len(m.cfg.DirectNetworks)+len(m.cfg.DirectDomains) > 0 {
+	if m.showsDirect() {
 		gw := "нет Wi-Fi/Ethernet"
 		if e.GWOK {
 			gw = e.GW.Iface + " -> " + e.GW.Router
@@ -190,7 +190,7 @@ func (m model) diagram() string {
 	you := lipgloss.NewStyle().Bold(true).Render("ТЫ")
 	out := row(you, "HOME  ", home, e.HomeOK, name(e.HomeOK, e.Home, sel.home), "интернет") + "\n" +
 		row("  ", "CORP  ", corp, e.CorpOK, name(e.CorpOK, e.Corp, sel.corp), "интранет")
-	if m.cfg != nil && len(m.cfg.DirectNetworks)+len(m.cfg.DirectDomains) > 0 {
+	if m.showsDirect() {
 		gw := "нет Wi-Fi/Ethernet"
 		if e.GWOK {
 			gw = e.GW.Iface + " -> " + e.GW.Router

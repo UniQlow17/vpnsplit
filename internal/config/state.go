@@ -101,11 +101,67 @@ type State struct {
 	Resolvers []string `json:"resolvers,omitempty"` // per-domain DNS entries we created
 	Sig       string   `json:"sig,omitempty"`       // what was connected when applied
 	DNSSig    string   `json:"dns_sig,omitempty"`   // what the DNS entries were created for
+	// Tun6 is the state of the automatic IPv6 tunnels of Windows (Teredo, 6to4,
+	// ISATAP) as it was before they were turned off; they are put back at the end.
+	Tun6 *Tunnels6 `json:"tun6,omitempty"`
+}
+
+// Tunnels6 holds the settings of the automatic IPv6 tunnelling of Windows that
+// were turned off: the value each had before, "" for one that was not touched.
+// The values are the names the cmdlets use (see Canon); nothing else is ever
+// handed to them.
+type Tunnels6 struct {
+	Teredo    string `json:"teredo,omitempty"`    // Get-NetTeredoConfiguration .Type
+	SixToFour string `json:"sixtofour,omitempty"` // Get-Net6to4Configuration .State
+	ISATAP    string `json:"isatap,omitempty"`    // Get-NetIsatapConfiguration .State
+}
+
+var (
+	teredoTypes = []string{"Default", "Disabled", "Client", "EnterpriseClient", "Server", "NATAwareClient", "NATAwareServer"}
+	tunStates6  = []string{"Default", "Automatic", "Enabled", "Disabled"}
+	isatapState = []string{"Default", "Enabled", "Disabled"}
+)
+
+func canonOf(list []string, v string) (string, bool) {
+	for _, c := range list {
+		if strings.EqualFold(c, v) {
+			return c, true
+		}
+	}
+	return "", false
+}
+
+// CanonTeredo, CanonSixToFour and CanonISATAP return the canonical spelling of a
+// value a cmdlet reported or the journal holds; ok is false for anything else.
+func CanonTeredo(v string) (string, bool)    { return canonOf(teredoTypes, v) }
+func CanonSixToFour(v string) (string, bool) { return canonOf(tunStates6, v) }
+func CanonISATAP(v string) (string, bool)    { return canonOf(isatapState, v) }
+
+// Empty reports whether no setting is recorded.
+func (t *Tunnels6) Empty() bool { return t == nil || *t == Tunnels6{} }
+
+// Sanitize keeps the values that are in the lists above and clears the rest.
+func (t *Tunnels6) Sanitize() (dropped int) {
+	for _, f := range []struct {
+		p    *string
+		list []string
+	}{{&t.Teredo, teredoTypes}, {&t.SixToFour, tunStates6}, {&t.ISATAP, isatapState}} {
+		if *f.p == "" {
+			continue
+		}
+		if c, ok := canonOf(f.list, *f.p); ok {
+			*f.p = c
+		} else {
+			*f.p = ""
+			dropped++
+		}
+	}
+	return dropped
 }
 
 // Empty reports whether nothing is applied.
 func (s *State) Empty() bool {
-	return len(s.Routes) == 0 && len(s.Rules) == 0 && len(s.Resolvers) == 0 && s.Sig == ""
+	return len(s.Routes) == 0 && len(s.Rules) == 0 && len(s.Resolvers) == 0 && s.Sig == "" && s.Tun6.Empty()
 }
 
 // ValidResolverEntry reports whether id is a DNS journal entry in the format
@@ -114,8 +170,8 @@ func ValidResolverEntry(id string) bool { return validResolverEntry(runtime.GOOS
 
 func validResolverEntry(goos, id string) bool {
 	switch goos {
-	case "windows": // the zone
-		return ValidZone(id)
+	case "windows": // the zone, or "." for the rule that sends everything else to the home DNS
+		return ValidZone(id) || id == "."
 	case "darwin": // /etc/resolver/<zone>
 		zone := filepath.Base(id)
 		return id == "/etc/resolver/"+zone && ValidZone(zone)
@@ -128,7 +184,7 @@ func validResolverEntry(goos, id string) bool {
 		case len(f) == 2 && f[0] == "dns":
 			return ValidIface(f[1])
 		case len(f) == 3 && f[0] == "domain":
-			return ValidIface(f[1]) && ValidZone(f[2])
+			return ValidIface(f[1]) && (ValidZone(f[2]) || f[2] == ".") // "." is the routing domain "~." of everything else
 		}
 		return false
 	}
@@ -164,6 +220,14 @@ func (s *State) Sanitize() (warnings []string) {
 		res = append(res, id)
 	}
 	s.Resolvers = res
+	if s.Tun6 != nil {
+		if n := s.Tun6.Sanitize(); n > 0 {
+			warnings = append(warnings, fmt.Sprintf("journal: %d unexpected IPv6 tunnel setting(s) dropped", n))
+		}
+		if s.Tun6.Empty() {
+			s.Tun6 = nil
+		}
+	}
 	if len(s.Sig) > 1024 || hasControl(s.Sig) {
 		s.Sig = ""
 	}
@@ -248,5 +312,9 @@ func (s *State) merge(o *State) {
 	}
 	if s.Sig == "" {
 		s.Sig = o.Sig
+	}
+	if s.Tun6.Empty() && !o.Tun6.Empty() {
+		c := *o.Tun6
+		s.Tun6 = &c
 	}
 }

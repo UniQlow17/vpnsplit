@@ -13,7 +13,7 @@ import (
 
 func testModel() model {
 	return model{
-		cfg:   &config.Config{Corp: "corp0", Home: "home0", HomeDefault: true, Networks: []string{"10.0.0.0/8"}, Domains: []string{"a.example.com"}},
+		cfg:   &config.Config{Corp: "corp0", Home: "home0", Networks: []string{"10.0.0.0/8"}, Domains: []string{"a.example.com"}},
 		ifs:   []netif.Info{{Name: "home0", Up: true, Kind: netif.KindVPN}},
 		input: newInput(),
 	}
@@ -71,7 +71,7 @@ func TestRulesAddAndDelete(t *testing.T) {
 	if mm := got.(model); mm.purpose != "import" {
 		t.Fatalf("enter on row 2 must ask for a file to import, got %q", mm.purpose)
 	}
-	m.cursor = ruleRows
+	m.cursor = m.ruleRows()
 	got, _ = m.updateKeys(keyMsg("enter"))
 	mm := got.(model)
 	if !mm.delAsk || len(mm.cfg.Networks) != 1 {

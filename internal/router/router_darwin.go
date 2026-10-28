@@ -57,15 +57,20 @@ func addRoute(r config.Route) error {
 	return err
 }
 
+// v6Halves: whether ::/1 and 8000::/1 are planned for the home VPN. Not on
+// macOS until route(8) with -inet6 has been tried there (the commands below are
+// ready for it): the leak is announced instead (see V6Status).
+const v6Halves = false
+
 // addRouteCmd runs `route add`; -proto2 sets RTF_PROTO2 (0x4000), a flag the
 // kernel keeps and `netstat -rn` shows as "2". Nothing else in the system
 // sets it for routes of this kind, which tells our routes from the clients'.
 func addRouteCmd(r config.Route, tag bool) error {
-	var args []string
+	args := append([]string{"add"}, netArgs(r.Dest)...)
 	if r.Gateway != "" {
-		args = []string{"add", "-net", r.Dest, r.Gateway}
+		args = append(args, r.Gateway)
 	} else {
-		args = []string{"add", "-net", r.Dest, "-interface", r.Iface}
+		args = append(args, "-interface", r.Iface)
 	}
 	if tag {
 		args = append(args, "-proto2")
@@ -88,7 +93,7 @@ func delRoute(r config.Route) error {
 	} else if !found && r.Gateway == "" {
 		return nil // the tunnel is gone and took its routes with it
 	}
-	out, err := sysexec.Command("route", "-n", "get", "-net", r.Dest).CombinedOutput()
+	out, err := sysexec.Command("route", append([]string{"-n", "get"}, netArgs(r.Dest)...)...).CombinedOutput()
 	if err != nil {
 		if strings.Contains(string(out), "not in table") {
 			return nil
@@ -99,9 +104,9 @@ func delRoute(r config.Route) error {
 		return nil // not the route we added: somebody else's to the same place
 	}
 	if r.Gateway != "" {
-		err = routeCmd("delete", "-net", r.Dest, r.Gateway)
+		err = routeCmd(append(append([]string{"delete"}, netArgs(r.Dest)...), r.Gateway)...)
 	} else {
-		err = routeCmd("delete", "-net", r.Dest, "-interface", r.Iface)
+		err = routeCmd(append(append([]string{"delete"}, netArgs(r.Dest)...), "-interface", r.Iface)...)
 	}
 	if err != nil && strings.Contains(err.Error(), "not in table") {
 		return nil
@@ -328,4 +333,20 @@ func (osBackend) ListResolvers() ([]OSResolver, error) {
 		res = append(res, OSResolver{ID: p, Ours: ours})
 	}
 	return res, nil
+}
+
+// restDNS is false: /etc/resolver holds domains only ("." is not one of them),
+// and the other way to send everything else to the DNS of a VPN is to change
+// the DNS of a network service with scutil/networksetup, which belongs to the
+// VPN client and the user and cannot be put back reliably after a crash. The
+// rest of the DNS stays with the system.
+const restDNS = false
+
+// physicalDNS reads the DNS servers of the adapter from `scutil --dns`.
+func physicalDNS(iface string) []string {
+	out, err := sysexec.Command("scutil", "--dns").Output()
+	if err != nil {
+		return nil
+	}
+	return parseScutilDNS(string(out), iface)
 }

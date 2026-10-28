@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -23,13 +24,16 @@ const usage = `vpnsplit - corp traffic through the corp VPN, chosen sites past e
   vpnsplit add <cidr|ip|domain|AS>...        send these to the corp VPN
                                  (AS49675 = every network the AS announces, from RIPE)
   vpnsplit add --direct <cidr|ip|domain>...  send these past every VPN (Wi-Fi/Ethernet)
-  vpnsplit remove [--direct] <cidr|ip|domain>...
+  vpnsplit add --home <cidr|ip|domain>...    send these into the home VPN (when the rest goes direct)
+  vpnsplit remove [--direct|--home] <cidr|ip|domain>...
   vpnsplit rules                 show current rules
   vpnsplit import <file>         add the rules of a rules file (from export or someone else)
   vpnsplit export [file]         write the rules as a rules file (stdout by default)
   vpnsplit set <key> <value>     corp | home (auto, client or adapter name),
                                  corp-dns | corp-gateway ("none" clears),
-                                 home-default | split-dns (yes/no, true/false, 1/0, on/off, да/нет)
+                                 rest (home = through the home VPN, direct = past every VPN,
+                                 keep = as the VPN client set it up), split-dns (yes/no, ...),
+                                 home-default (old name: yes = rest home, no = rest keep)
   vpnsplit apply                 add routes and leave them in place (needs admin/root)
   vpnsplit watch                 keep routes in sync when VPNs connect, switch or disconnect;
                                  routes stay after Ctrl+C
@@ -214,14 +218,19 @@ func cmdRules(op string, items []string) error {
 	if err != nil {
 		return err
 	}
-	direct := len(items) > 0 && items[0] == "--direct"
-	if direct {
+	kind := config.DestCorp
+	for len(items) > 0 && (items[0] == "--direct" || items[0] == "--home") {
+		kind = strings.TrimPrefix(items[0], "--")
 		items = items[1:]
 	}
 	if len(items) == 0 {
-		return fmt.Errorf("usage: vpnsplit %s [--direct] <cidr|ip|domain>...", op)
+		return fmt.Errorf("usage: vpnsplit %s [--direct|--home] <cidr|ip|domain>...", op)
 	}
-	nets, domains := cfg.Lists(direct)
+	if op == "add" && !slices.Contains(cfg.Kinds(), kind) {
+		return fmt.Errorf("--%s rules have no meaning while the rest of the traffic is set to %q (%s); change it first: vpnsplit set rest <home|direct|keep>",
+			kind, cfg.Rest, restWhy(cfg.Rest, kind))
+	}
+	nets, domains := cfg.ListsOf(kind)
 	for _, it := range items {
 		isNet, v, err := config.NormalizeRule(it)
 		if err != nil {
@@ -247,15 +256,33 @@ func cmdRules(op string, items []string) error {
 	return nil
 }
 
+// restWhy says why a kind of rules does not matter with a setting of the rest.
+func restWhy(rest, kind string) string {
+	switch {
+	case rest == config.RestDirect && kind == config.DestDirect:
+		return "everything else goes direct anyway"
+	case rest == config.RestHome && kind == config.DestHome:
+		return "everything else goes into the home VPN anyway"
+	}
+	return "not applicable"
+}
+
 func cmdRulesShow() error {
 	cfg, err := loadConfig()
 	if err != nil {
 		return err
 	}
-	fmt.Println("corp networks:  ", strings.Join(cfg.Networks, ", "))
-	fmt.Println("corp domains:   ", strings.Join(cfg.Domains, ", "))
-	fmt.Println("direct networks:", strings.Join(cfg.DirectNetworks, ", "))
-	fmt.Println("direct domains: ", strings.Join(cfg.DirectDomains, ", "))
+	fmt.Printf("rest of the traffic: %s\n", config.RestLabel(cfg.Rest, false))
+	for _, k := range cfg.Kinds() {
+		nets, domains := cfg.ListsOf(k)
+		fmt.Printf("%-7s networks: %s\n", k, strings.Join(*nets, ", "))
+		fmt.Printf("%-7s domains:  %s\n", k, strings.Join(*domains, ", "))
+	}
+	for _, k := range []string{config.DestDirect, config.DestHome} {
+		if nets, domains := cfg.ListsOf(k); !slices.Contains(cfg.Kinds(), k) && len(*nets)+len(*domains) > 0 {
+			fmt.Printf("(%d %s rules are kept but not applied with this setting of the rest)\n", len(*nets)+len(*domains), k)
+		}
+	}
 	return nil
 }
 
@@ -296,7 +323,7 @@ func cmdExport(a []string) error {
 
 func cmdSet(a []string) error {
 	if len(a) != 2 {
-		return fmt.Errorf("usage: vpnsplit set <corp|home|corp-dns|corp-gateway|home-default|split-dns> <value>")
+		return fmt.Errorf("usage: vpnsplit set <corp|home|corp-dns|corp-gateway|rest|split-dns|home-default> <value>")
 	}
 	cfg, err := loadConfig()
 	if err != nil {
@@ -329,20 +356,35 @@ func cmdSet(a []string) error {
 		} else {
 			cfg.CorpGateway = val
 		}
+	case "rest":
+		r, err := config.ParseRest(a[1])
+		if err != nil {
+			return err
+		}
+		cfg.Rest = r
 	case "home-default", "split-dns":
 		b, err := config.ParseBool(a[1])
 		if err != nil {
 			return fmt.Errorf("%s: %w", a[0], err)
 		}
 		if a[0] == "home-default" {
-			cfg.HomeDefault = b
+			cfg.Rest = config.RestKeep
+			if b {
+				cfg.Rest = config.RestHome
+			}
 		} else {
 			cfg.SplitDNS = b
 		}
 	default:
 		return fmt.Errorf("unknown key %q", a[0])
 	}
-	return config.Save(cfg)
+	if err := config.Save(cfg); err != nil {
+		return err
+	}
+	if a[0] == "rest" || a[0] == "home-default" {
+		fmt.Printf("rest of the traffic: %s. Rules that matter now: %s\n", config.RestLabel(cfg.Rest, false), strings.Join(cfg.Kinds(), ", "))
+	}
+	return nil
 }
 
 func cmdStatus() error {
@@ -365,7 +407,12 @@ func cmdStatus() error {
 	} else {
 		fmt.Println("direct: no Wi-Fi/Ethernet gateway found")
 	}
-	fmt.Printf("corp-dns=%q corp-gateway=%q home-default=%v split-dns=%v\n", cfg.CorpDNS, cfg.CorpGateway, cfg.HomeDefault, cfg.SplitDNS)
+	fmt.Printf("corp-dns=%q corp-gateway=%q rest=%s split-dns=%v\n", cfg.CorpDNS, cfg.CorpGateway, cfg.Rest, cfg.SplitDNS)
+	if lvl, text := router.V6Status(cfg, e); lvl == router.V6Leaks {
+		fmt.Println("!!! " + text)
+	} else if lvl == router.V6Info {
+		fmt.Println(text)
+	}
 	st, warns, jstatus := config.LoadStateStatus()
 	printWarnings(warns)
 	if n := config.LegacyNote(false); n != "" {

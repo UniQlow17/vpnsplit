@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 )
 
@@ -19,12 +20,18 @@ type Config struct {
 	Home           string   `json:"home_iface"`
 	CorpGateway    string   `json:"corp_gateway,omitempty"` // optional, on-link if empty
 	CorpDNS        string   `json:"corp_dns,omitempty"`     // used to resolve corp domains; detected if empty
-	SplitDNS       bool     `json:"split_dns"`              // macOS: corp zones resolve through corp DNS
-	HomeDefault    bool     `json:"home_default"`           // push everything else into home VPN
+	SplitDNS       bool     `json:"split_dns"`              // corp zones resolve through corp DNS
+	Rest           string   `json:"rest,omitempty"`         // where the traffic no rule names goes: RestHome, RestDirect or RestKeep
 	Networks       []string `json:"networks"`
 	Domains        []string `json:"domains"`
 	DirectNetworks []string `json:"direct_networks,omitempty"` // bypass every VPN
 	DirectDomains  []string `json:"direct_domains,omitempty"`
+	HomeNetworks   []string `json:"home_networks,omitempty"` // into the home VPN (the list that matters when the rest goes elsewhere)
+	HomeDomains    []string `json:"home_domains,omitempty"`
+
+	// HomeDefault is the setting of versions before Rest. It is read from an
+	// old file only (Sanitize turns it into Rest and clears it).
+	HomeDefault *bool `json:"home_default,omitempty"`
 
 	// lossy: Sanitize dropped or changed something that is still in the file
 	// on disk. The next Save keeps a copy of that file first (see Save).
@@ -32,14 +39,96 @@ type Config struct {
 }
 
 // New returns a Config with defaults: both VPNs detected automatically.
-func New() *Config { return &Config{Corp: "auto", Home: "auto", SplitDNS: true, HomeDefault: true} }
+func New() *Config { return &Config{Corp: "auto", Home: "auto", SplitDNS: true, Rest: RestHome} }
+
+// Where the traffic that no rule names goes (Config.Rest).
+const (
+	// RestHome: into the home VPN (0/1 + 128/1 through it, the DNS of the home VPN).
+	RestHome = "home"
+	// RestDirect: past every VPN, through the physical gateway (0/1 + 128/1
+	// through it); the rules "through the home VPN" say what still goes there.
+	RestDirect = "direct"
+	// RestKeep: left to the VPN client and the OS; no default routes and no
+	// DNS for the rest are set. This is what HomeDefault=false always meant.
+	RestKeep = "keep"
+)
+
+// Where a rule sends traffic (the lists of Config).
+const (
+	DestCorp   = "corp"
+	DestDirect = "direct"
+	DestHome   = "home"
+)
+
+// ValidRest reports whether s is a value of Config.Rest.
+func ValidRest(s string) bool { return s == RestHome || s == RestDirect || s == RestKeep }
+
+// ParseRest understands the spellings of the CLI and returns the canonical value.
+func ParseRest(s string) (string, error) {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "home", "дом", "домашний", "vpn":
+		return RestHome, nil
+	case "direct", "напрямую":
+		return RestDirect, nil
+	case "keep", "client", "не-трогать", "не трогать":
+		return RestKeep, nil
+	}
+	return "", fmt.Errorf("%q is not a value for rest (home, direct or keep)", clip(s))
+}
+
+// RestLabel names the setting for people.
+func RestLabel(rest string, ru bool) string {
+	switch rest {
+	case RestDirect:
+		if ru {
+			return "Напрямую"
+		}
+		return "direct"
+	case RestKeep:
+		if ru {
+			return "Не трогать (как настроил клиент)"
+		}
+		return "keep (as the VPN client set it up)"
+	}
+	if ru {
+		return "Домашний VPN"
+	}
+	return "home VPN"
+}
+
+// Kinds returns the kinds of rules that matter with the setting Rest: corp
+// always; direct where the rest does not go direct anyway; home where the rest
+// does not go into the home VPN anyway.
+func (c *Config) Kinds() []string {
+	switch c.Rest {
+	case RestDirect:
+		return []string{DestCorp, DestHome}
+	case RestKeep:
+		return []string{DestCorp, DestDirect, DestHome}
+	}
+	return []string{DestCorp, DestDirect}
+}
+
+// ListsOf returns the network and domain lists of rules of a kind (DestCorp,
+// DestDirect or DestHome); nil, nil for an unknown kind.
+func (c *Config) ListsOf(kind string) (nets, domains *[]string) {
+	switch kind {
+	case DestCorp:
+		return &c.Networks, &c.Domains
+	case DestDirect:
+		return &c.DirectNetworks, &c.DirectDomains
+	case DestHome:
+		return &c.HomeNetworks, &c.HomeDomains
+	}
+	return nil, nil
+}
 
 // Lists returns the network and domain lists of corp or direct rules.
 func (c *Config) Lists(direct bool) (nets, domains *[]string) {
 	if direct {
-		return &c.DirectNetworks, &c.DirectDomains
+		return c.ListsOf(DestDirect)
 	}
-	return &c.Networks, &c.Domains
+	return c.ListsOf(DestCorp)
 }
 
 // Dir returns (and creates) the user's directory that holds the config and
@@ -123,9 +212,10 @@ func SaveCache(name string, v any) error {
 // reported in warnings.
 func LoadChecked() (c *Config, warnings []string, err error) {
 	c = New()
+	c.Rest = "" // a file without "rest" is one of an older version: Sanitize migrates home_default
 	if err := load("config.json", c); err != nil {
 		if os.IsNotExist(err) {
-			return c, nil, nil
+			return New(), nil, nil
 		}
 		return nil, nil, fmt.Errorf("read config: %w", err)
 	}

@@ -393,7 +393,7 @@ func (discard) Write(b []byte) (int, error) { return len(b), nil }
 // Failures of AddResolver are failures; "already there" is not.
 func TestResolverFailuresAreCounted(t *testing.T) {
 	a := newApplyRig(t)
-	a.m.dnsOf = func(string) ([]string, []string) { return []string{"10.200.0.1"}, []string{"corp.example"} }
+	a.m.dnsOf = corpOnly([]string{"10.200.0.1"}, []string{"corp.example"})
 	rb := &resolverBackend{memBackend: a.mb}
 	a.m.b = rb
 	cfg := testCfg()
@@ -493,7 +493,7 @@ func TestDriftedChecksDNSRarely(t *testing.T) {
 // A DNS entry removed behind our back is made again by the next apply.
 func TestApplyRestoresMissingDNS(t *testing.T) {
 	a := newApplyRig(t)
-	a.m.dnsOf = func(string) ([]string, []string) { return []string{"10.200.0.1"}, []string{"corp.example"} }
+	a.m.dnsOf = corpOnly([]string{"10.200.0.1"}, []string{"corp.example"})
 	cfg := testCfg()
 	cfg.SplitDNS = true
 	a.apply(t, cfg)

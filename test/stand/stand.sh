@@ -147,7 +147,7 @@ setup() {
     ip netns exec $n python3 $STAND/httpname.py $n >/dev/null 2>&1 &
   done
   ip netns exec inet dnsmasq --user=root --conf-file=/dev/null --no-resolv --no-hosts --bind-interfaces \
-    --listen-address=1.1.1.1 --address=/direct.example/203.0.113.12 --pid-file=$WORK/dns-inet.pid
+    --listen-address=1.1.1.1 --address=/direct.example/203.0.113.12 --address=/fake.example/198.19.5.5 --pid-file=$WORK/dns-inet.pid
   ip netns exec corp dnsmasq --user=root --conf-file=/dev/null --no-resolv --no-hosts --bind-interfaces \
     --listen-address=10.200.0.1 --address=/corp.example/10.10.1.1 --pid-file=$WORK/dns-corp.pid
   mkdir -p /etc/netns/client
@@ -157,7 +157,7 @@ setup() {
 
 configure() {
   vs set corp wgcorp && vs set home wghome && vs set corp-dns 10.200.0.1 &&
-    vs set home-default yes && vs set split-dns yes &&
+    vs set rest home && vs set split-dns yes &&
     vs add 203.0.113.11 corp.example && vs add --direct direct.example
 }
 
@@ -828,6 +828,378 @@ s_tag_on_client() {
   show_log
 }
 
+# ------------------------------------------------------------ stage 3: DNS and IPv6
+# A stand-in for systemd-resolved (the container has none): `resolvectl` keeps the per-link DNS servers and
+# domains in files. vpnsplit asks it the way it asks the real one, so what it sets can be seen and "the
+# network manager overwrote it" can be played. It exists only inside the stage-3 scenarios.
+fake_resolved_on() {
+  local d=$WORK/resolved
+  rm -rf "$d"
+  mkdir -p "$d"
+  echo "1.1.1.1" > "$d/eth0.dns"
+  echo "10.200.0.1" > "$d/wgcorp.dns"
+  echo "10.201.0.1" > "$d/wghome.dns"
+  : > "$d/eth0.domain"
+  : > "$d/wgcorp.domain"
+  : > "$d/wghome.domain"
+  cp "$STAND/fake-resolvectl.sh" /usr/sbin/resolvectl
+  chmod +x /usr/sbin/resolvectl
+}
+fake_resolved_off() { rm -f /usr/sbin/resolvectl; rm -rf "$WORK/resolved"; }
+rdns() { cat "$WORK/resolved/$1.dns" 2>/dev/null; }
+rdomain() { cat "$WORK/resolved/$1.domain" 2>/dev/null; }
+resolved_base() { [ "$(rdns eth0)|$(rdns wgcorp)|$(rdns wghome)|$(rdomain eth0)|$(rdomain wgcorp)|$(rdomain wghome)" = "1.1.1.1|10.200.0.1|10.201.0.1|||" ]; }
+has_dom() { # link domain
+  grep -q -F -- "$2" "$WORK/resolved/$1.domain" 2>/dev/null
+}
+
+# packets seen on an interface of the client: cap_start <name> <iface> <tcpdump filter>; cap_stop <name>; cap_count <name>
+cap_start() {
+  : > "$WORK/cap.$1"
+  ip netns exec client tcpdump -i "$2" -nn -l -U "$3" > "$WORK/cap.$1" 2> "$WORK/cap.$1.err" &
+  eval "CAP_$1=$!"
+}
+cap_stop() {
+  eval "local p=\$CAP_$1"
+  kill "$p" 2>/dev/null
+  wait "$p" 2>/dev/null
+  return 0
+}
+cap_count() { grep -c . "$WORK/cap.$1"; }
+cap_has() { grep -q -- "$2" "$WORK/cap.$1"; }
+
+snap6() { { ip -n client -6 route show table all | grep -v -E "^(local|broadcast|multicast|anycast)|^fe80:"; ip -n client -6 rule show; } | sort; }
+v6_on() { # the home VPN has a global IPv6 address and a host in its network; "v4only": its client takes IPv4 by its rules, not IPv6
+  ip -n client addr add 2001:db8:77::2/64 dev wghome nodad
+  ip -n home addr add 2001:db8:77::1/64 dev wghome nodad
+  ip -n home addr add 2001:db8:ff::10/128 dev lo
+  ip netns exec client wg set wghome peer "$(cat $WORK/keys/home.pub)" allowed-ips 0.0.0.0/0,::/0
+  ip netns exec home wg set wghome peer "$(cat $WORK/keys/client_home.pub)" allowed-ips 10.201.0.2/32,2001:db8:77::2/128
+  [ "${1:-}" = v4only ] && return 0
+  case "$VARIANT" in
+    b) ip -n client -6 route add default dev wghome table 2022; ip -n client -6 rule add pref 9000 not fwmark 2022 table 2022 ;;
+    c) ip -n client -6 route add default dev wghome table 51820; ip -n client -6 rule add not fwmark 51820 table 51820; ip -n client -6 rule add table main suppress_prefixlength 0 ;;
+  esac
+}
+v6_off() {
+  case "$VARIANT" in
+    b) ip -n client -6 rule del pref 9000 not fwmark 2022 table 2022 2>/dev/null; ip -n client -6 route del default dev wghome table 2022 2>/dev/null ;;
+    c) ip -n client -6 rule del not fwmark 51820 table 51820 2>/dev/null; ip -n client -6 rule del table main suppress_prefixlength 0 2>/dev/null; ip -n client -6 route del default dev wghome table 51820 2>/dev/null ;;
+  esac
+  ip -n client addr del 2001:db8:77::2/64 dev wghome 2>/dev/null
+  ip -n home addr del 2001:db8:77::1/64 dev wghome 2>/dev/null
+  ip -n home addr del 2001:db8:ff::10/128 dev lo 2>/dev/null
+  ip netns exec client wg set wghome peer "$(cat $WORK/keys/home.pub)" allowed-ips 0.0.0.0/0
+  ip netns exec home wg set wghome peer "$(cat $WORK/keys/client_home.pub)" allowed-ips 10.201.0.2/32
+}
+path6() { ip netns exec client curl -6 -s --max-time 4 "http://[$1]/" 2>/dev/null; }
+
+# S19: the names that go direct are asked of the provider's DNS, over the physical adapter; the corp names of
+# the corp DNS, through the corp tunnel; no DNS question goes into the home VPN; a fake-ip answer
+# (198.18.0.0/15) is dropped and reported, and no route is made for it.
+s_dns_paths() {
+  CUR=S19
+  say "S19: DNS paths: direct names -> the provider's DNS (/32 over eth0), corp names -> the corp DNS (/32 over wgcorp), fake-ip dropped"
+  fresh
+  fake_resolved_on
+  vs add --direct fake.example >/dev/null
+  cap_start eth0 eth0 'udp port 53'
+  cap_start home wghome 'udp port 53'
+  cap_start corp wgcorp 'udp port 53'
+  sleep 1
+  start_run s19 run
+  check "routes applied" wait_for 20 applied
+  sleep 1
+  cap_stop eth0
+  cap_stop home
+  cap_stop corp
+  check "a /32 route to the provider's DNS 1.1.1.1 over eth0 and the gateway" bash -c "ip -n client -4 route show table all | grep -E '^1\.1\.1\.1 via 192\.168\.1\.1 dev eth0.*proto 247'"
+  check "a /32 route to the corp DNS 10.200.0.1 over wgcorp" bash -c "ip -n client -4 route show table all | grep -E '^10\.200\.0\.1 dev wgcorp.*proto 247'"
+  check "direct.example was asked of 1.1.1.1 on eth0" cap_has eth0 "direct.example"
+  check "fake.example was asked of 1.1.1.1 on eth0" cap_has eth0 "fake.example"
+  check "the questions on eth0 went to 1.1.1.1" cap_has eth0 "1.1.1.1.53"
+  check "corp.example was asked of 10.200.0.1 on wgcorp" cap_has corp "10.200.0.1.53"
+  check "no DNS question went into the home VPN (0 packets on wghome)" test "$(cap_count home)" = 0
+  check "no question to 1.1.1.1 went into the corp tunnel" bash -c "! grep -q '1.1.1.1.53' $WORK/cap.corp"
+  check "no question to the corp DNS went to eth0" bash -c "! grep -q '10.200.0.1' $WORK/cap.eth0"
+  check "the fake-ip answer 198.19.5.5 got no route of its own" bash -c "! ip -n client -4 route show table all | grep -E '^198\.19\.5\.5'"
+  check "the zone of the direct name is routed to the provider's DNS (domain ~direct.example on eth0)" has_dom eth0 "~direct.example"
+  check "the journal lists the zone on eth0" grep -q 'domain eth0 direct.example' /var/lib/vpnsplit/state.json
+  check "the provider's own DNS server of eth0 is kept" test "$(rdns eth0)" = 1.1.1.1
+  grep -q "fake-ip answers (198.18.0.0/15) dropped" "$RLOG" && ok "the report names the fake-ip answer" || bad "no fake-ip note in the output"
+  grep -q "fake.example=198.19.5.5" "$RLOG" && ok "the report names the name and the address" || bad "name and address not in the output"
+  kill -TERM "$RPID"
+  reap
+  check "exit code 0 (got $RCODE)" test "$RCODE" = 0
+  check "the routing table equals the snapshot" base_state
+  check "the DNS of the links is as before" resolved_base
+  vs remove --direct fake.example >/dev/null
+  fake_resolved_off
+  show_log
+}
+
+# S20: DNS of the rest goes to the home VPN (~. on its link, systemd-resolved), the corp zone to the corp link;
+# a network manager that wipes the domain is answered by a repair in the loop of `run`; the end restores the links.
+s_dns_rest() {
+  CUR=S20
+  say "S20: '~.' on the home link, repair after the domain is wiped, clean end"
+  fresh
+  fake_resolved_on
+  start_run s20 run
+  check "routes applied" wait_for 20 applied
+  check "the home link routes everything else (~.)" has_dom wghome "~."
+  check "the home link kept its own DNS server" test "$(rdns wghome)" = 10.201.0.1
+  check "the corp zone is on the corp link" has_dom wgcorp "~corp.example"
+  check "the journal lists the entry for the rest" grep -q 'domain wghome \.' /var/lib/vpnsplit/state.json
+  : > "$WORK/resolved/wghome.domain" # the network manager rewrites the link
+  check "the domain was put back by the loop (<= 45 s)" wait_for 45 has_dom wghome "~."
+  check "the journal lists the entry once" test "$(tr ',' '\n' < /var/lib/vpnsplit/state.json | grep -c '^ *"domain wghome \.\"')" = 1
+  kill -TERM "$RPID"
+  reap
+  check "exit code 0 (got $RCODE)" test "$RCODE" = 0
+  check "the routing table equals the snapshot" base_state
+  check "the DNS of the links is as before" resolved_base
+  fake_resolved_off
+  show_log
+}
+
+# S21: the home VPN has a global IPv6 address: ::/1 and 8000::/1 go through it, a host reachable only over it
+# answers (curl -6), and the end restores the IPv6 table. Without IPv6 on the home VPN and with it on eth0 `status`
+# announces the leak and nothing is made for IPv6.
+s_ipv6() {
+  CUR=S21
+  say "S21: IPv6 into the home VPN, and the announced leak"
+  fresh
+  v6_on
+  local base6
+  base6=$(snap6)
+  if [ "$VARIANT" = a ]; then
+    check "without vpnsplit the v6-only host is unreachable" test -z "$(path6 2001:db8:ff::10)"
+  else
+    check "without vpnsplit the home client takes IPv6 itself" test "$(path6 2001:db8:ff::10)" = home
+  fi
+  cap_start h6 wghome 'ip6 and host 2001:db8:ff::10'
+  cap_start e6 eth0 'ip6 and host 2001:db8:ff::10'
+  sleep 1
+  start_run s21 run
+  check "routes applied" wait_for 20 applied
+  if [ "$VARIANT" = a ]; then
+    check "::/1 through wghome, tagged" bash -c "ip -n client -6 route show table all | grep -E '^::/1 dev wghome.*proto 247'"
+    check "8000::/1 through wghome, tagged" bash -c "ip -n client -6 route show table all | grep -E '^8000::/1 dev wghome.*proto 247'"
+  else # the home client has taken IPv6 itself (as it takes IPv4): no halves of ours
+    check "no IPv6 route of ours (the home client has them)" bash -c "! ip -n client -6 route show table all | grep -q 'proto 247'"
+  fi
+  check "the v6 host is routed through wghome" bash -c "ip -n client -6 route get 2001:db8:ff::10 | grep -q 'dev wghome'"
+  check "curl -6 answers home" test "$(path6 2001:db8:ff::10)" = home
+  sleep 1
+  cap_stop h6
+  cap_stop e6
+  check "the IPv6 packets to the v6 host were seen on wghome" cap_has h6 "2001:db8:ff::10"
+  check "no IPv6 packet to the v6 host went out of eth0" test "$(cap_count e6)" = 0
+  vs status 2>&1 | grep -q 'IPv6 goes into the home VPN' && ok "status says IPv6 is tunnelled" || bad "status does not mention the IPv6 tunnel"
+  kill -TERM "$RPID"
+  reap
+  check "exit code 0 (got $RCODE)" test "$RCODE" = 0
+  check "the IPv4 routing table equals the snapshot" base_state
+  check "the IPv6 routing table equals the snapshot" test "$(snap6)" = "$base6"
+  v6_off
+
+  say "S21b: the home VPN has no IPv6, eth0 has: the leak is announced, no IPv6 route is made"
+  ip -n client addr add 2001:db8:1::2/64 dev eth0 nodad
+  ip -n isp addr add 2001:db8:1::1/64 dev c0 nodad
+  base6=$(snap6)
+  out=$(vs status 2>&1)
+  echo "$out" | grep -E "IPv6|!!!" | sed 's/^/        | /'
+  echo "$out" | grep -q "IPv6 goes past the home VPN" && ok "status announces that IPv6 goes past the home VPN" || bad "status does not announce the IPv6 leak"
+  start_run s21b run
+  check "routes applied" wait_for 20 applied
+  check "no IPv6 route through wghome" bash -c "! ip -n client -6 route show table all | grep -q 'dev wghome.*proto 247'"
+  kill -TERM "$RPID"
+  reap
+  check "exit code 0 (got $RCODE)" test "$RCODE" = 0
+  check "the IPv6 routing table equals the snapshot" test "$(snap6)" = "$base6"
+  ip -n client addr del 2001:db8:1::2/64 dev eth0
+  ip -n isp addr del 2001:db8:1::1/64 dev c0
+  check "the routing table equals the snapshot" base_state
+}
+
+# the rest goes direct: corp and --home rules are in place
+rest_direct_ready() {
+  dev_is 203.0.113.11 wgcorp && dev_is 203.0.113.13 wghome && dev_is 203.0.113.10 eth0 && ! grep -q pending /var/lib/vpnsplit/state.json
+}
+# the rest is left to the client: corp and direct rules are in place
+rest_keep_ready() {
+  dev_is 203.0.113.11 wgcorp && dev_is 203.0.113.12 eth0 && ! grep -q pending /var/lib/vpnsplit/state.json
+}
+
+# S22: "the rest" goes direct, the rules "through the home VPN" decide what still goes there; direct rules do not
+# apply (everything else is direct anyway) and cannot be added.
+s_rest_direct() {
+  CUR=S22
+  say "S22: rest = direct: 0/1 + 128/1 over eth0, --home rules into wghome, the home VPN gets no DNS"
+  fresh
+  fake_resolved_on
+  vs set rest direct >/dev/null
+  vs add --home 203.0.113.13 >/dev/null
+  out=$(vs add --direct 192.0.2.77 2>&1)
+  rc=$?
+  check "a --direct rule is refused while the rest goes direct (exit $rc)" test "$rc" != 0
+  echo "$out" | grep -q "no meaning" && ok "the refusal says why" || bad "no explanation for the refused rule"
+  cap_start home wghome 'host 203.0.113.10 or host 203.0.113.13'
+  cap_start eth0 eth0 'host 203.0.113.10'
+  sleep 1
+  start_run s22 run
+  check "routes applied" wait_for 20 rest_direct_ready
+  check "203.0.113.10 (the rest) goes over eth0" bash -c "ip -n client -4 route get 203.0.113.10 | grep -q 'dev eth0'"
+  check "curl 203.0.113.10 answers inet" test "$(path_of 203.0.113.10)" = inet
+  check "curl 203.0.113.13 (--home rule) answers home" test "$(path_of 203.0.113.13)" = home
+  check "curl 203.0.113.11 (corp) answers corp" test "$(path_of 203.0.113.11)" = corp
+  sleep 1 # tcpdump reads what the kernel queued before it is stopped
+  cap_stop eth0
+  cap_stop home
+  check "the capture on wghome works (it saw the packets to 203.0.113.13)" cap_has home 203.0.113.13
+  check "no packet to 203.0.113.10 went into the home VPN" bash -c "! grep -q '203.0.113.10' $WORK/cap.home"
+  check "the packets to 203.0.113.10 went over eth0 ($(cap_count eth0) seen)" test "$(cap_count eth0)" -gt 0
+  check "the home link has no routing domain for everything" bash -c "! grep -q -F '~.' $WORK/resolved/wghome.domain"
+  check "the journal has no DNS entry for the rest" bash -c "! grep -q 'domain wghome' /var/lib/vpnsplit/state.json"
+  vs rules 2>&1 | grep -q "^direct" && bad "rules shows the kind that does not matter" || ok "rules shows only the kinds that matter"
+  kill -TERM "$RPID"
+  reap
+  check "exit code 0 (got $RCODE)" test "$RCODE" = 0
+  check "the routing table equals the snapshot" base_state
+  check "the DNS of the links is as before" resolved_base
+  vs remove --home 203.0.113.13 >/dev/null
+  vs set rest home >/dev/null
+  fake_resolved_off
+  show_log
+}
+
+# S23: "do not touch": the corp and direct rules apply, no 0/1 + 128/1 and no DNS for the rest; whatever the home
+# client does stays as it is (variant a: nothing, so the rest goes over eth0, as in S0).
+s_rest_keep() {
+  CUR=S23
+  say "S23: rest = keep: no default halves, no DNS for the rest, the rules apply"
+  fresh
+  fake_resolved_on
+  vs set rest keep >/dev/null
+  start_run s23 run
+  check "routes applied" wait_for 20 rest_keep_ready
+  check "no 0.0.0.0/1 or 128.0.0.0/1 of ours" bash -c "! ip -n client -4 route show table all | grep -E '^(0.0.0.0/1|128.0.0.0/1) .*proto 247'"
+  local want=inet
+  [ "$VARIANT" = a ] || want=home
+  check "the rest is left to the client: curl 203.0.113.10 answers $want" test "$(path_of 203.0.113.10)" = $want
+  check "curl 203.0.113.11 answers corp" test "$(path_of 203.0.113.11)" = corp
+  check "curl 203.0.113.12 answers inet (direct)" test "$(path_of 203.0.113.12)" = inet
+  check "the home link has no routing domain for everything" bash -c "! grep -q -F '~.' $WORK/resolved/wghome.domain"
+  kill -TERM "$RPID"
+  reap
+  check "exit code 0 (got $RCODE)" test "$RCODE" = 0
+  check "the routing table equals the snapshot" base_state
+  check "the DNS of the links is as before" resolved_base
+  vs set rest home >/dev/null
+  fake_resolved_off
+  show_log
+}
+
+# S24: the DNS servers of the provider include the DNS of the home VPN (a router that hands out whatever it was told):
+# no /32 route around the tunnel is made for it, the report says so, and the names that go direct are asked of the
+# other server of the provider.
+s_dns_overlap() {
+  CUR=S24
+  say "S24: the provider's DNS list holds the home VPN's DNS: no route for it, a warning, the other server is used"
+  fresh
+  fake_resolved_on
+  echo "1.1.1.1 10.201.0.1" > "$WORK/resolved/eth0.dns"
+  cap_start eth0 eth0 'udp port 53'
+  sleep 1
+  start_run s24 run
+  check "routes applied" wait_for 20 applied
+  sleep 1
+  cap_stop eth0
+  check "the report names the overlap" grep -q "10.201.0.1 of the provider is the DNS server of the home VPN" "$RLOG"
+  check "no /32 route to 10.201.0.1 over eth0" bash -c "! ip -n client -4 route show table all | grep -E '^10\.201\.0\.1 .*dev eth0'"
+  check "the route to the other server 1.1.1.1 over eth0 is there" bash -c "ip -n client -4 route show table all | grep -E '^1\.1\.1\.1 via 192\.168\.1\.1 dev eth0.*proto 247'"
+  check "direct.example was asked of 1.1.1.1 on eth0" cap_has eth0 "1.1.1.1.53"
+  check "the zone of the direct name is set up on eth0" grep -q 'direct.example' "$WORK/resolved/eth0.domain"
+  kill -TERM "$RPID"
+  reap
+  check "exit code 0 (got $RCODE)" test "$RCODE" = 0
+  check "the routing table equals the snapshot" base_state
+  echo "1.1.1.1" > "$WORK/resolved/eth0.dns"
+  check "the DNS of the links is as before" resolved_base
+  fake_resolved_off
+  show_log
+}
+
+# S25: somebody else has "~." on the home link already: it is left as it is and never taken away, and it is not a
+# reason to redo the DNS entries and flush the cache at every apply (a second apply is forced by a changed rule).
+s_dns_foreign() {
+  CUR=S25
+  say "S25: a '~.' that is not ours: left alone, not remade (no repeated '=' and no more flushes), never removed"
+  fresh
+  fake_resolved_on
+  echo "~." > "$WORK/resolved/wghome.domain"
+  start_run s25 run
+  check "routes applied" wait_for 20 applied
+  check "the report says the entry was there already" grep -q "= domain wghome \.: " "$RLOG"
+  check "the journal does not list the entry as ours" bash -c "! grep -E '^ +\"domain wghome \.\",?$' /var/lib/vpnsplit/state.json"
+  check "the corp zone is set up as usual" has_dom wgcorp "~corp.example"
+  local f1 f2 n1 n2 w1 w2
+  f1=$(grep -c flush "$WORK/resolved/calls.log")
+  w1=$(grep -c wghome "$WORK/resolved/calls.log")
+  n1=$(grep -c "= domain wghome \." "$RLOG")
+  vs add 192.0.2.0/24 >/dev/null # the rules changed: run applies again
+  check "run applied the changed rules" wait_for 20 bash -c "ip -n client -4 route show table all | grep -q '^192\.0\.2\.0/24'"
+  sleep 6
+  f2=$(grep -c flush "$WORK/resolved/calls.log")
+  w2=$(grep -c wghome "$WORK/resolved/calls.log")
+  n2=$(grep -c "= domain wghome \." "$RLOG")
+  check "the second apply did not flush the DNS cache again ($f1 -> $f2)" test "$f1" = "$f2"
+  check "the second apply did not report the foreign entry again ($n1 -> $n2)" test "$n1" = "$n2"
+  check "the second apply did not write the home link again ($w1 -> $w2)" test "$w1" = "$w2"
+  kill -TERM "$RPID"
+  reap
+  check "exit code 0 (got $RCODE)" test "$RCODE" = 0
+  check "the foreign '~.' is still on the home link" has_dom wghome "~."
+  vs remove 192.0.2.0/24 >/dev/null
+  check "the routing table equals the snapshot" base_state
+  : > "$WORK/resolved/wghome.domain"
+  check "the DNS of the links is as before" resolved_base
+  fake_resolved_off
+  show_log
+}
+
+# S26 (variants b and c): the home VPN has IPv6 but its client takes only IPv4 by its rules. IPv6 of eth0 goes past
+# the tunnel; `status` announces it prominently; vpnsplit makes no IPv6 routes of its own.
+s_ipv6_v4only() {
+  CUR=S26
+  say "S26: the home client takes IPv4 by its rules, not IPv6: the leak is announced"
+  if [ "$VARIANT" = a ]; then
+    echo "   (variant a: the halves are vpnsplit's own, covered by S21)"
+    return 0
+  fi
+  fresh
+  v6_on v4only
+  ip -n client addr add 2001:db8:1::2/64 dev eth0 nodad
+  ip -n isp addr add 2001:db8:1::1/64 dev c0 nodad
+  local base6
+  base6=$(snap6)
+  out=$(vs status 2>&1)
+  echo "$out" | grep -E "IPv6|!!!" | sed 's/^/        | /'
+  echo "$out" | grep -q "!!!.*only IPv4" && ok "status announces that IPv6 goes past the home VPN (its client takes IPv4 only)" || bad "no highlighted IPv6 leak in status"
+  start_run s26 run
+  check "routes applied" wait_for 20 applied
+  check "no IPv6 route of ours" bash -c "! ip -n client -6 route show table all | grep -q 'proto 247'"
+  kill -TERM "$RPID"
+  reap
+  check "exit code 0 (got $RCODE)" test "$RCODE" = 0
+  check "the IPv6 routing table equals the snapshot" test "$(snap6)" = "$base6"
+  ip -n client addr del 2001:db8:1::2/64 dev eth0
+  ip -n isp addr del 2001:db8:1::1/64 dev c0
+  v6_off
+  check "the routing table equals the snapshot" base_state
+}
+
 # --------------------------------------------------------------------- main
 say "setting up the network (home VPN variant: $VARIANT)"
 setup
@@ -853,6 +1225,14 @@ want S15 && s_legacy_base
 want S16 && s_client_route
 want S17 && s_same_key
 want S18 && s_tag_on_client
+want S19 && s_dns_paths
+want S20 && s_dns_rest
+want S21 && s_ipv6
+want S22 && s_rest_direct
+want S23 && s_rest_keep
+want S24 && s_dns_overlap
+want S25 && s_dns_foreign
+want S26 && s_ipv6_v4only
 
 say "result: $PASS ok, $FAIL failed"
 for f in "${FAILED[@]+"${FAILED[@]}"}"; do echo "  FAIL $f"; done

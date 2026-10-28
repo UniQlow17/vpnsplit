@@ -144,7 +144,6 @@ func TestValidateRoute(t *testing.T) {
 		{Dest: "10.0.0.0/8", Iface: "x", Gateway: "1.1.1.1'; calc; '"},
 		{Dest: "10.0.0.0/8", Iface: "x", Gateway: "::1"},
 		{Dest: "10.0.0.0/8", Iface: "x", Via: "elsewhere"},
-		{Dest: "::/0", Iface: "x"},
 	}
 	for _, r := range bad {
 		if err := ValidateRoute(r); err == nil {

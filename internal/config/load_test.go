@@ -82,7 +82,7 @@ func TestLoadCheckedFromDisk(t *testing.T) {
 func TestLoadCheckedMissingGivesDefaults(t *testing.T) {
 	userHome(t)
 	c, warns, err := LoadChecked()
-	if err != nil || len(warns) != 0 || c.Corp != "auto" || !c.HomeDefault {
+	if err != nil || len(warns) != 0 || c.Corp != "auto" || c.Rest != RestHome {
 		t.Errorf("%+v %q %v", c, warns, err)
 	}
 }

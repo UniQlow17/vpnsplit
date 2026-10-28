@@ -138,6 +138,7 @@ func cmdApply() (err error) {
 		return err
 	}
 	defer end(sess, noSignal, &err, os.Stdout)
+	mgr.SetOneShot() // nothing watches what apply leaves: no DNS rule for everything else
 	return mgr.Apply(cfg, os.Stdout)
 }
 

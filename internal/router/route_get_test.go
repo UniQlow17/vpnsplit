@@ -1,6 +1,7 @@
 package router
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/UniQlow17/vpnsplit/internal/config"
@@ -62,6 +63,20 @@ func TestBSDOwnership(t *testing.T) {
 	} {
 		if got := bsdOwns(c.ri, c.r, c.supported); got != c.want {
 			t.Errorf("%s: %v, want %v", c.name, got, c.want)
+		}
+	}
+}
+
+// route(8) needs -inet6 for an IPv6 network, in add, delete and get alike.
+func TestNetArgs(t *testing.T) {
+	for dest, want := range map[string]string{
+		"10.0.0.0/8":    "-net 10.0.0.0/8",
+		"::/1":          "-inet6 -net ::/1",
+		"8000::/1":      "-inet6 -net 8000::/1",
+		"2001:db8::/32": "-inet6 -net 2001:db8::/32",
+	} {
+		if got := strings.Join(netArgs(dest), " "); got != want {
+			t.Errorf("%s: %q, want %q", dest, got, want)
 		}
 	}
 }

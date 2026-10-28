@@ -80,3 +80,12 @@ func bsdOwns(ri routeInfo, r config.Route, tagSupported bool) bool {
 	}
 	return ri.hasFlag("PROTO2") || !tagSupported
 }
+
+// netArgs are the arguments that name a destination for route(8): "-inet6" for
+// an IPv6 network, then "-net <dest>".
+func netArgs(dest string) []string {
+	if strings.Contains(dest, ":") {
+		return []string{"-inet6", "-net", dest}
+	}
+	return []string{"-net", dest}
+}

@@ -84,7 +84,7 @@ func TestViewFitsTerminalWidth(t *testing.T) {
 		}
 		// delete confirmation and the scrolled status screen
 		m := richModel(w)
-		m.sc, m.delAsk, m.cursor = scRules, true, ruleRows
+		m.sc, m.delAsk, m.cursor = scRules, true, m.ruleRows()
 		assertFits(t, "rules/delete", m.View(), w)
 		m = richModel(w)
 		m.sc, m.scroll = scStatus, 3
