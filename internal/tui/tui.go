@@ -79,6 +79,34 @@ type model struct {
 	flashAt    int
 	spin       spinner.Model
 	refreshing bool
+
+	width, height int // terminal size from tea.WindowSizeMsg; 0 until known
+	prompt        string
+	inputDef      string    // prefilled text of the input, to tell whether it was touched
+	lastKey       time.Time // when the previous key reached the input (paste detection)
+	skipRest      bool      // dropping the lines of a pasted block after the first one
+	burstText     bool      // the current key burst has already carried text
+	streamPaste   bool      // a paste arrives as a key stream: Enter inside it is not a submit
+	inputGen      int       // generation of the input, to drop a late clipboard answer
+	hist          history   // undo and redo of the input field
+	now           func() time.Time
+	readFile      func(string) ([]byte, error)
+}
+
+// clock is the current time; tests replace it.
+func (m model) clock() time.Time {
+	if m.now != nil {
+		return m.now()
+	}
+	return time.Now()
+}
+
+// open reads a file for import; tests replace it.
+func (m model) open(path string) ([]byte, error) {
+	if m.readFile != nil {
+		return m.readFile(path)
+	}
+	return os.ReadFile(path)
 }
 
 var (
@@ -89,7 +117,7 @@ var (
 	cGray   = lipgloss.Color("244")
 	cDim    = lipgloss.Color("238")
 
-	sBox   = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(lipgloss.Color("39")).Padding(1, 3)
+	sBox   = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(lipgloss.Color("39"))
 	sSel   = lipgloss.NewStyle().Foreground(lipgloss.Color("16")).Background(cCyan).Bold(true)
 	sGray  = lipgloss.NewStyle().Foreground(cGray)
 	sDim   = lipgloss.NewStyle().Foreground(cDim)
@@ -110,16 +138,21 @@ func rainbow(s string, frame int) string {
 	return b.String()
 }
 
+// newInput is the text field used for all prompts.
+func newInput() textinput.Model {
+	ti := textinput.New()
+	ti.CharLimit = 1024 // a long path in quotes must not be cut silently
+	ti.Width = 40
+	return ti
+}
+
 // Run starts the interactive menu.
 func Run() error {
-	ti := textinput.New()
-	ti.CharLimit = 120
-	ti.Width = 40
 	sp := spinner.New(spinner.WithSpinner(spinner.Dot))
 	sp.Style = lipgloss.NewStyle().Foreground(cCyan)
 	admin := router.IsPrivileged()
 	// with rights, keep routes in sync from the start: nothing to think about
-	m := model{admin: admin, auto: admin, input: ti, spin: sp}
+	m := model{admin: admin, auto: admin, input: newInput(), spin: sp, streamPaste: streamPasteDefault, now: time.Now}
 	_, err := tea.NewProgram(m, tea.WithAltScreen()).Run()
 	return err
 }
@@ -232,13 +265,30 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.setFlash("Авто-режим: маршруты синхронизированы")
 			}
 		} else {
-			m.sc, m.resTitle, m.resText, m.resErr = scResult, msg.title, msg.text, msg.err != nil
+			m.sc, m.resTitle, m.resText, m.resErr, m.scroll = scResult, msg.title, msg.text, msg.err != nil, 0
 			if msg.err != nil {
 				m.resText += "\n\nОшибка: " + msg.err.Error()
 			}
 		}
 		m.refreshing = true
 		return m, refreshCmd()
+
+	case tea.WindowSizeMsg:
+		m.width, m.height = msg.Width, msg.Height
+		m.fitInput()
+		m.scroll = min(m.scroll, m.scrollMax())
+		return m, nil
+
+	case clipMsg:
+		if !m.inputting || msg.gen != m.inputGen {
+			return m, nil
+		}
+		if msg.err != nil {
+			m.setFlash("Буфер обмена недоступен: " + msg.err.Error())
+			return m, nil
+		}
+		m.insertPasted(msg.text)
+		return m, nil
 
 	case tea.KeyMsg:
 		if msg.String() == "ctrl+c" {
@@ -266,8 +316,16 @@ func (m model) updateKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 	}
-	if m.sc == scStatus {
-		return m.updateStatus(k)
+	if m.sc == scStatus || m.sc == scHelp || m.sc == scResult {
+		if m.scrollKey(k) {
+			return m, nil
+		}
+		if m.sc == scStatus {
+			if k == "esc" || k == "q" || k == "enter" {
+				m.sc, m.cursor = scMenu, itemStatus
+			}
+			return m, nil
+		}
 	}
 	if m.sc == scRules && m.delAsk {
 		m.delAsk = false
@@ -326,7 +384,7 @@ func (m model) updateKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			case itemStatus:
 				m.sc, m.scroll = scStatus, 0
 			case itemHelp:
-				m.sc = scHelp
+				m.sc, m.scroll = scHelp, 0
 			case itemExit:
 				return m, tea.Quit
 			}
@@ -431,24 +489,29 @@ func (m *model) deleteRule() {
 	}
 }
 
-// statusHeight is how many lines of the status screen fit at once.
-const statusHeight = 18
-
-func (m model) updateStatus(k string) (tea.Model, tea.Cmd) {
-	maxScroll := max(len(m.statusLines())-statusHeight, 0)
+// scrollKey scrolls the status, help and result screens and reports whether
+// the key was a scrolling key.
+func (m *model) scrollKey(k string) bool {
+	page := max(m.listHeight()-1, 1)
 	switch k {
 	case "up", "k":
-		m.scroll = max(m.scroll-1, 0)
+		m.scroll--
 	case "down", "j":
-		m.scroll = min(m.scroll+1, maxScroll)
+		m.scroll++
 	case "pgup":
-		m.scroll = max(m.scroll-statusHeight, 0)
-	case "pgdown", " ":
-		m.scroll = min(m.scroll+statusHeight, maxScroll)
-	case "esc", "q", "enter":
-		m.sc, m.cursor = scMenu, itemStatus
+		m.scroll -= page
+	case "pgdown":
+		m.scroll += page
+	case " ":
+		if m.sc != scStatus {
+			return false
+		}
+		m.scroll += page
+	default:
+		return false
 	}
-	return m, nil
+	m.scroll = max(min(m.scroll, m.scrollMax()), 0)
+	return true
 }
 
 // statusLines is the content of the status screen: what is connected, the
@@ -459,7 +522,7 @@ func (m model) statusLines() []string {
 	line := func(format string, a ...any) { out = append(out, fmt.Sprintf(format, a...)) }
 	c, e := m.cfg, m.env
 	if c == nil {
-		return []string{sRed.Render("Конфиг повреждён: исправьте или удалите его (vpnsplit reset --purge)")}
+		return wrapIndent(sRed.Render("Конфиг повреждён: исправьте или удалите его (vpnsplit reset --purge)"), m.contentW()-textIndent)
 	}
 	vpn := func(ok bool, i netif.Info, sel string) string {
 		mode := sGray.Render(" (выбран: " + sel + ")")
@@ -475,7 +538,7 @@ func (m model) statusLines() []string {
 	line("  Корп. VPN:  %s", vpn(e.CorpOK, e.Corp, c.Corp))
 	line("  Домашний:   %s", vpn(e.HomeOK, e.Home, c.Home))
 	if e.GWOK {
-		line("  Напрямую:   %s", sGreen.Render(e.GW.Iface+" → "+e.GW.Router))
+		line("  Напрямую:   %s", sGreen.Render(e.GW.Iface+" -> "+e.GW.Router))
 	} else {
 		line("  Напрямую:   %s", sRed.Render("нет Wi-Fi/Ethernet шлюза"))
 	}
@@ -497,7 +560,7 @@ func (m model) statusLines() []string {
 	}
 	list("Через корп. VPN", c.Networks, c.Domains)
 	list("Напрямую, мимо VPN", c.DirectNetworks, c.DirectDomains)
-	line("  Остальное → домашний VPN: %s", map[bool]string{true: "да", false: "нет"}[c.HomeDefault])
+	line("  Остальное -> домашний VPN: %s", map[bool]string{true: "да", false: "нет"}[c.HomeDefault])
 	line("  Корп. домены через корп. DNS: %s", map[bool]string{true: "да", false: "нет"}[c.SplitDNS])
 
 	out = append(out, "")
@@ -527,7 +590,7 @@ func (m model) statusLines() []string {
 			if r.Gateway != "" {
 				via += " через " + r.Gateway
 			}
-			line("    %-20s → %s", r.Dest, sGray.Render(via))
+			line("    %-20s -> %s", r.Dest, sGray.Render(via))
 		}
 	}
 	if len(st.Resolvers) > 0 {
@@ -539,14 +602,21 @@ func (m model) statusLines() []string {
 	if m.needApply && !st.Empty() {
 		out = append(out, "", sYel.Render("VPN или правила изменились после применения — нужно применить заново"))
 	}
-	return out
+	// long lines (adapter names, rules) wrap instead of running off the screen
+	var wrapped []string
+	for _, l := range out {
+		wrapped = append(wrapped, wrapIndent(l, m.contentW()-textIndent)...)
+	}
+	return wrapped
 }
 
-// expandHome turns "~/x" into a path in the home directory.
+// expandHome turns a leading "~/" or tilde-backslash into a path in the home directory.
 func expandHome(p string) string {
-	if rest, ok := strings.CutPrefix(p, "~/"); ok {
-		if h, err := os.UserHomeDir(); err == nil {
-			return filepath.Join(h, rest)
+	for _, pre := range []string{"~/", `~\`} {
+		if rest, ok := strings.CutPrefix(p, pre); ok {
+			if h, err := os.UserHomeDir(); err == nil {
+				return filepath.Join(h, rest)
+			}
 		}
 	}
 	return p
@@ -609,27 +679,80 @@ func (m *model) save() {
 
 func (m *model) beginInput(purpose, val, prompt string) {
 	m.inputting, m.purpose = true, purpose
-	m.input.Prompt, m.input.Placeholder = prompt, ""
+	m.inputGen++
+	m.prompt, m.inputDef, m.skipRest, m.burstText, m.lastKey = prompt, val, false, false, m.clock()
+	m.hist.reset()
+	// the prompt is drawn on its own line: it may be longer than the screen
+	m.input.Prompt, m.input.Placeholder = "> ", ""
+	m.fitInput()
 	m.input.SetValue(val)
 	m.input.CursorEnd()
 	m.input.Focus()
 }
 
+// fitInput sizes the text field to the terminal.
+func (m *model) fitInput() {
+	m.input.Width = min(max(m.contentW()-inputReserve, 8), 100)
+}
+
+// closeInput closes the input and forgets the paste state; a clipboard answer
+// that is still on its way is dropped by the new generation.
+func (m *model) closeInput() {
+	m.inputting, m.skipRest, m.burstText = false, false, false
+	m.inputGen++
+	m.hist.reset()
+}
+
 func (m model) updateInput(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	now := m.clock()
+	// On Windows a paste arrives as plain key events, line breaks included.
+	// An Enter right behind another key is part of the paste, not a submit.
+	d := now.Sub(m.lastKey)
+	burst := m.streamPaste && d >= 0 && d < pasteBurst
+	m.lastKey = now
+	if !burst { // a new burst starts here
+		m.skipRest, m.burstText = false, false
+	}
+	if msg.Paste { // bracketed paste (terminals that support it)
+		m.insertPasted(string(msg.Runes))
+		return m, nil
+	}
 	switch msg.String() {
 	case "esc":
-		m.inputting = false
+		m.closeInput()
+		return m, nil
+	case "ctrl+v":
+		return m, clipboardCmd(m.inputGen)
+	case "ctrl+z":
+		m.undoInput()
+		return m, nil
+	case "ctrl+y":
+		// bubbletea v1 cannot tell ctrl+shift+z from ctrl+z (the shift state
+		// is lost on every OS), so redo lives on ctrl+y only
+		m.redoInput()
 		return m, nil
 	case "enter":
+		if burst {
+			// only the first non-blank line of a pasted block is wanted:
+			// leading blank lines are skipped, what follows the first line is dropped
+			if m.burstText && !m.skipRest {
+				m.skipRest = true
+				m.setFlash(flashPasted)
+			}
+			return m, nil
+		}
 		v := strings.TrimSpace(m.input.Value())
-		m.inputting = false
+		if pathPurpose(m.purpose) {
+			v = resolvePath(m.input.Value(), m.inputDef)
+		}
+		m.closeInput()
 		switch m.purpose {
 		case "pick":
 			if v != "" {
 				m.choose(v)
 			}
 		case "import":
-			b, err := os.ReadFile(expandHome(v))
+			b, err := m.open(expandHome(v))
 			if err != nil {
 				m.setFlash("Не прочитать файл: " + err.Error())
 				break
@@ -670,8 +793,18 @@ func (m model) updateInput(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 	}
+	isText := msg.Type == tea.KeyRunes && strings.TrimSpace(string(msg.Runes)) != ""
+	if m.skipRest {
+		if isText && !pathPurpose(m.purpose) {
+			m.setFlash(flashFirstLineOnly)
+		}
+		return m, nil
+	}
+	m.burstText = m.burstText || isText
+	before := m.snapshot()
 	var c tea.Cmd
 	m.input, c = m.input.Update(msg)
+	m.recordKey(before, burst, now)
 	return m, c
 }
 
@@ -710,254 +843,4 @@ func (m model) listLen() int {
 		return 4
 	}
 	return 0
-}
-
-// ---------- rendering ----------
-
-func (m model) pulse(up bool) string {
-	if !up {
-		return sRed.Render("○")
-	}
-	if (m.frame/5)%2 == 0 {
-		return sGreen.Render("●")
-	}
-	return lipgloss.NewStyle().Foreground(lipgloss.Color("29")).Render("●")
-}
-
-// flow draws a link between nodes; chevrons run along it while it is active.
-func (m model) flow(n int, active bool) string {
-	var b strings.Builder
-	for i := 0; i < n; i++ {
-		switch {
-		case active && (i+m.frame/2)%5 == 0:
-			b.WriteString(lipgloss.NewStyle().Foreground(cCyan).Bold(true).Render("›"))
-		case active:
-			b.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color("31")).Render("─"))
-		default:
-			b.WriteString(sDim.Render("╌"))
-		}
-	}
-	return b.String()
-}
-
-func (m model) diagram() string {
-	applied := m.routes > 0
-	e := m.env
-	// a connected VPN shows as "Check Point (utun4)", a missing one as what is awaited
-	name := func(ok bool, i netif.Info, sel string) string {
-		switch {
-		case ok:
-			return i.Label()
-		case m.cfg == nil:
-			return "—"
-		case netif.IsAuto(sel):
-			return "ждёт подключения"
-		}
-		return sel + " не подключён"
-	}
-	home := e.HomeOK && applied
-	corp := e.CorpOK && applied
-	var sel struct{ corp, home string }
-	if m.cfg != nil {
-		sel.corp, sel.home = m.cfg.Corp, m.cfg.Home
-	}
-	node := func(tag, label string) string {
-		return lipgloss.NewStyle().Width(28).Render(tag + " " + sGray.Render(trunc(label, 22)))
-	}
-	l1 := fmt.Sprintf("  %s %s %s %s %s", lipgloss.NewStyle().Bold(true).Render("ТЫ"), m.flow(8, home),
-		m.pulse(e.HomeOK), node("HOME  ", name(e.HomeOK, e.Home, sel.home)), m.flow(6, home)+" интернет")
-	l2 := fmt.Sprintf("  %s %s %s %s %s", "  ", m.flow(8, corp),
-		m.pulse(e.CorpOK), node("CORP  ", name(e.CorpOK, e.Corp, sel.corp)), m.flow(6, corp)+" интранет")
-	out := l1 + "\n" + l2
-	if m.cfg != nil && len(m.cfg.DirectNetworks)+len(m.cfg.DirectDomains) > 0 {
-		gw := "нет Wi-Fi/Ethernet"
-		if e.GWOK {
-			gw = e.GW.Iface + " → " + e.GW.Router
-		}
-		direct := e.GWOK && applied
-		out += "\n" + fmt.Sprintf("  %s %s %s %s %s", "  ", m.flow(8, direct),
-			m.pulse(e.GWOK), node("DIRECT", gw), m.flow(6, direct)+" мимо VPN")
-	}
-	return out
-}
-
-func trunc(s string, n int) string {
-	r := []rune(s)
-	if len(r) > n {
-		return string(r[:n-1]) + "…"
-	}
-	return s
-}
-
-func (m model) View() string {
-	var b strings.Builder
-	b.WriteString(rainbow("  ▌ VPN SPLIT ▐  ", m.frame) + sGray.Render(" корп. VPN + домашний VPN + напрямую") + "\n\n")
-	b.WriteString(m.diagram() + "\n\n")
-
-	status := sGray.Render("маршрутов: ") + fmt.Sprint(m.routes)
-	switch {
-	case m.needApply && m.routes > 0:
-		status = sYel.Render("VPN или правила изменились, нужно применить ") + status
-	case m.routes > 0:
-		status = sGreen.Render("активно ") + status
-	default:
-		status = sYel.Render("не применено ") + status
-	}
-	if !m.admin {
-		status += "  " + sRed.Render("нет прав администратора")
-	}
-	b.WriteString("  " + status + "\n\n")
-
-	switch m.sc {
-	case scMenu:
-		for i, it := range menuItems {
-			label := it.Label
-			if i == itemAuto {
-				label += ": " + map[bool]string{true: "вкл", false: "выкл"}[m.auto]
-			}
-			num := i + 1
-			if i == itemExit {
-				num = 0
-			}
-			extra := ""
-			if it.Admin {
-				extra = sYel.Render("●")
-			}
-			b.WriteString(m.row(i, fmt.Sprintf("%d) %s", num, label), extra) + "\n")
-		}
-		b.WriteString("\n" + panel(menuTips(), m.cursor))
-	case scHelp:
-		for _, l := range helpText {
-			if h, ok := strings.CutPrefix(l, "# "); ok {
-				b.WriteString("  " + lipgloss.NewStyle().Bold(true).Foreground(cCyan).Render(h) + "\n")
-				continue
-			}
-			for _, w := range wrapText(l, tipWidth+4) {
-				b.WriteString("  " + w + "\n")
-			}
-		}
-		b.WriteString("\n  " + sGray.Render("любая клавиша — назад"))
-	case scBusy:
-		b.WriteString("  " + m.spin.View() + " " + m.busy + strings.Repeat(".", m.frame/3%4))
-	case scResult:
-		style := sGreen
-		if m.resErr {
-			style = sRed
-		}
-		b.WriteString("  " + style.Render(m.resTitle) + "\n\n")
-		for _, l := range strings.Split(m.resText, "\n") {
-			b.WriteString("  " + l + "\n")
-		}
-		b.WriteString("\n  " + sGray.Render("любая клавиша — назад"))
-	case scConfirm:
-		b.WriteString("  " + sYel.Render("Удалить все маршруты vpnsplit и вернуть исходную маршрутизацию?") + "\n\n")
-		for _, l := range wrapText(confirmText, tipWidth) {
-			b.WriteString("  " + sGray.Render(l) + "\n")
-		}
-		b.WriteString("\n  " + sGray.Render("y — да, любая другая клавиша — отмена"))
-	case scPick:
-		title := "Корпоративный VPN"
-		hint := netif.KindCorp
-		if m.pickStep == 1 {
-			title, hint = "Домашний VPN", netif.KindVPN
-		}
-		b.WriteString("  " + lipgloss.NewStyle().Bold(true).Render(title) + "\n\n")
-		b.WriteString(m.row(0, "Авто — определять при каждом подключении", sGreen.Render("рекомендуется")) + "\n")
-		for i, f := range m.ifs {
-			st := sRed.Render("откл.")
-			if f.Connected() {
-				st = sGreen.Render("подкл.")
-			}
-			star := " "
-			if f.Kind == hint {
-				star = sYel.Render("★")
-			}
-			line := fmt.Sprintf("%-28s", trunc(f.Label(), 28))
-			b.WriteString(m.row(i+1, line, star+" "+st+" "+sGray.Render(strings.Join(f.Addrs, ","))) + "\n")
-		}
-		b.WriteString(m.row(len(m.ifs)+1, "ввести вручную…") + "\n")
-		b.WriteString("\n" + panel(pickTips[:], m.pickStep))
-		b.WriteString("\n  " + sDim.Render("★ — подходит по типу · enter — выбрать · esc — назад"))
-	case scRules:
-		items := m.ruleItems()
-		b.WriteString(m.row(0, sGreen.Render("+")+" Добавить через корп. VPN…") + "\n")
-		b.WriteString(m.row(1, sGreen.Render("+")+" Добавить напрямую, мимо VPN…") + "\n")
-		b.WriteString(m.row(2, sCyan.Render("↓")+" Импорт из файла…") + "\n")
-		b.WriteString(m.row(3, sCyan.Render("↑")+" Экспорт в файл…") + "\n\n")
-		if len(items) == 0 {
-			b.WriteString("     " + sGray.Render("правил пока нет") + "\n")
-		}
-		for i, it := range items {
-			kind := "домен"
-			switch {
-			case config.IsAS(it.val):
-				kind = "AS   "
-			case it.isNet:
-				kind = "сеть "
-			}
-			where := sCyan.Render("корп.   ")
-			if it.direct {
-				where = sYel.Render("напрямую")
-			}
-			b.WriteString(m.row(i+ruleRows, fmt.Sprintf("%-32s", it.val), where+" "+sGray.Render(kind)) + "\n")
-		}
-		if m.delAsk && m.cursor >= ruleRows && m.cursor-ruleRows < len(items) {
-			b.WriteString("\n  " + sYel.Render("Удалить «"+items[m.cursor-ruleRows].val+"»? y / enter — да, другая клавиша — нет") + "\n")
-		}
-		b.WriteString("\n" + panel([]tip{rulesTip}, 0))
-		b.WriteString("\n  " + sDim.Render("enter — выбрать · d — удалить · esc — назад"))
-	case scStatus:
-		lines := m.statusLines()
-		end := min(m.scroll+statusHeight, len(lines))
-		for _, l := range lines[min(m.scroll, end):end] {
-			b.WriteString("  " + l + "\n")
-		}
-		more := ""
-		if len(lines) > statusHeight {
-			more = fmt.Sprintf("строки %d–%d из %d · ↑↓ / пробел — прокрутка · ", m.scroll+1, end, len(lines))
-		}
-		b.WriteString("\n  " + sDim.Render(more+"esc — назад"))
-	case scSettings:
-		c := m.cfg
-		yesNo := map[bool]string{true: sGreen.Render("да"), false: sRed.Render("нет")}
-		dns := c.CorpDNS
-		if dns == "" {
-			dns = "авто"
-		}
-		b.WriteString(m.row(0, "Корп. DNS", sGray.Render(dns)) + "\n")
-		b.WriteString(m.row(1, "Корп. шлюз", sGray.Render(orDash(c.CorpGateway))) + "\n")
-		b.WriteString(m.row(2, "Остальной трафик → домашний VPN", yesNo[c.HomeDefault]) + "\n")
-		b.WriteString(m.row(3, "Корп. домены через корп. DNS", yesNo[c.SplitDNS]) + "\n")
-		b.WriteString("\n" + panel(settingsTips, m.cursor))
-		b.WriteString("\n  " + sDim.Render("enter — изменить · esc — назад"))
-	}
-
-	if m.inputting {
-		b.WriteString("\n\n  " + m.input.View() + "\n  " + sGray.Render("enter — ок · esc — отмена"))
-	}
-	if m.busy != "" && m.quiet {
-		b.WriteString("\n\n  " + m.spin.View() + " " + m.busy)
-	}
-	if m.flash != "" && m.frame < m.flashAt {
-		b.WriteString("\n\n  " + sYel.Render("› "+m.flash))
-	}
-	if m.sc == scMenu && !m.inputting {
-		b.WriteString("\n\n  " + sDim.Render("↑↓ выбор · enter запуск · цифры — номер · q — выход"+"\n  "+"● — пункт требует прав администратора"))
-	}
-	return sBox.Render(b.String())
-}
-
-func (m model) row(i int, label string, extra ...string) string {
-	e := strings.Join(extra, " ")
-	if i == m.cursor && !m.inputting {
-		return "  " + sSel.Render(" ▸ "+label+" ") + " " + e
-	}
-	return "     " + label + "  " + e
-}
-
-func orDash(s string) string {
-	if s == "" {
-		return "—"
-	}
-	return s
 }

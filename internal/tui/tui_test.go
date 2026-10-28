@@ -4,7 +4,6 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 
 	"github.com/UniQlow17/vpnsplit/internal/config"
@@ -15,7 +14,7 @@ func testModel() model {
 	return model{
 		cfg:   &config.Config{Corp: "corp0", Home: "home0", HomeDefault: true, Networks: []string{"10.0.0.0/8"}, Domains: []string{"a.example.com"}},
 		ifs:   []netif.Info{{Name: "home0", Up: true, Kind: netif.KindVPN}},
-		input: textinput.New(),
+		input: newInput(),
 	}
 }
 
