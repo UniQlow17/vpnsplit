@@ -100,6 +100,9 @@ func TestInstallRecoverArguments(t *testing.T) {
 	if o, err := parseMenu([]string{"--no-resize"}); err != nil || !o.NoResize {
 		t.Errorf("%+v %v", o, err)
 	}
+	if o, err := parseMenu([]string{"--no-tray", "--no-resize"}); err != nil || !o.NoTray || !o.NoResize {
+		t.Errorf("%+v %v", o, err)
+	}
 	if _, err := parseMenu([]string{"--nope"}); err == nil {
 		t.Error("an unknown flag must be refused")
 	}

@@ -20,6 +20,7 @@ import (
 	"github.com/UniQlow17/vpnsplit/internal/netif"
 	"github.com/UniQlow17/vpnsplit/internal/router"
 	"github.com/UniQlow17/vpnsplit/internal/termsize"
+	"github.com/UniQlow17/vpnsplit/internal/tray"
 )
 
 type screen int
@@ -91,6 +92,7 @@ type model struct {
 	diffPartial bool                // the comparison was read while routes were being changed: it may be incomplete
 	fullDiff    *router.Baseline    // the same with the DNS entries, taken when the diagnostics screen is opened
 	diags       []router.Diag       // findings about the environment, from the last refresh
+	tr          *trayLink           // the icon in the notification area; nil without one
 	resize      bool                // tell the user to enlarge a window that is too small
 	refit       func(termsize.Size) // enlarges the window once more after the first status (nil: not at all)
 	refitted    bool                // the window was fitted for the filled-in menu already
@@ -374,7 +376,17 @@ func (m *model) flashWarnings() {
 	m.setFlash(text)
 }
 
+// Update is the step of the program; the icon in the notification area
+// follows the state it leaves behind.
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	nm, cmd := m.update(msg)
+	if mm, ok := nm.(model); ok {
+		mm.tr.push(mm)
+	}
+	return nm, cmd
+}
+
+func (m model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tickMsg:
 		m.frame++
@@ -385,6 +397,22 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			cmds = append(cmds, refreshCmd())
 		}
 		return m, tea.Batch(cmds...)
+
+	case trayToggleMsg:
+		// the menu of the icon: the same switch as the menu item
+		if !m.trayToggleOK() {
+			m.setFlash("Значок: закончите текущее действие в окне, затем переключайте разделение")
+			return m, nil
+		}
+		cmd := m.toggleSplit()
+		return m, cmd
+
+	case trayNoteMsg:
+		m.setFlash(msg.text)
+		return m, nil
+
+	case trayRefreshMsg:
+		return m, nil
 
 	case spinner.TickMsg:
 		var c tea.Cmd
@@ -539,6 +567,10 @@ func (m model) updateKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		switch k {
 		case "q":
 			return m, tea.Quit
+		case "m":
+			if m.tr.canHideNow() {
+				tray.ConsoleHide() // the window comes back from the icon or at exit
+			}
 		case "?":
 			m.sc, m.scroll = scHelp, 0
 		case "t":

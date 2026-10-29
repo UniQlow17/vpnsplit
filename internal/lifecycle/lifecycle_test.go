@@ -87,3 +87,88 @@ func TestNotifierFirstSignalCancelsSecondRepeats(t *testing.T) {
 		t.Error("the first signal stays the reason")
 	}
 }
+
+// The end of the Windows session joins the signals once: a second notice of the
+// same event (CTRL_SHUTDOWN and WM_ENDSESSION both come) is not a repeat.
+func TestInjectIsOnceAndNotARepeat(t *testing.T) {
+	ch := make(chan os.Signal, 2)
+	n := newNotifier(ch, func() {})
+	defer n.Stop()
+	repeat := make(chan os.Signal, 1)
+	n.OnRepeat(func(s os.Signal) { repeat <- s })
+	if !n.Inject(syscall.SIGTERM) {
+		t.Fatal("the first Inject must count")
+	}
+	select {
+	case <-n.Context().Done():
+	default:
+		t.Fatal("Inject must cancel the context")
+	}
+	if n.Inject(syscall.SIGTERM) {
+		t.Error("the second Inject is nothing")
+	}
+	select {
+	case <-repeat:
+		t.Fatal("Inject is not a repeat")
+	case <-time.After(50 * time.Millisecond):
+	}
+	// the system's own SIGTERM of the same event is absorbed ...
+	ch <- syscall.SIGTERM
+	select {
+	case <-repeat:
+		t.Fatal("the own SIGTERM after Inject is the same event")
+	case <-time.After(100 * time.Millisecond):
+	}
+	// ... the next one is a real repeat
+	ch <- syscall.SIGTERM
+	select {
+	case <-repeat:
+	case <-time.After(5 * time.Second):
+		t.Fatal("a real second signal reaches OnRepeat")
+	}
+}
+
+func TestInjectAfterRealSignalAndSigintAfterInject(t *testing.T) {
+	ch := make(chan os.Signal, 2)
+	n := newNotifier(ch, func() {})
+	defer n.Stop()
+	repeat := make(chan os.Signal, 2)
+	n.OnRepeat(func(s os.Signal) { repeat <- s })
+	ch <- syscall.SIGTERM
+	<-n.Context().Done()
+	if n.Inject(syscall.SIGTERM) {
+		t.Error("Inject after a real signal is nothing")
+	}
+	select {
+	case <-repeat:
+		t.Fatal("Inject is not a repeat")
+	case <-time.After(50 * time.Millisecond):
+	}
+	// SIGINT is never absorbed
+	ch2 := make(chan os.Signal, 2)
+	n2 := newNotifier(ch2, func() {})
+	defer n2.Stop()
+	r2 := make(chan os.Signal, 1)
+	n2.OnRepeat(func(s os.Signal) { r2 <- s })
+	n2.Inject(syscall.SIGTERM)
+	ch2 <- os.Interrupt
+	select {
+	case <-r2:
+	case <-time.After(5 * time.Second):
+		t.Fatal("SIGINT after Inject is a repeat")
+	}
+}
+
+func TestAtExitRunsOnceAndCanBeRemoved(t *testing.T) {
+	ran, removed := 0, 0
+	remove := AtExit(func() { ran++ })
+	AtExit(func() { panic("a hook must not take the process down") })
+	rm2 := AtExit(func() { removed++ })
+	rm2()
+	RunAtExit()
+	RunAtExit()
+	remove()
+	if ran != 1 || removed != 0 {
+		t.Errorf("ran %d removed %d", ran, removed)
+	}
+}

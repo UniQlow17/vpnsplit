@@ -8,6 +8,7 @@ import (
 	"runtime"
 	"runtime/debug"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/charmbracelet/bubbles/spinner"
@@ -49,6 +50,9 @@ type Options struct {
 	// NoResize leaves the size of the window alone: it is neither enlarged to fit
 	// the menu nor is the user asked to enlarge it (also VPNSPLIT_NO_RESIZE=1).
 	NoResize bool
+
+	// NoTray keeps the icon out of the notification area (also VPNSPLIT_NO_TRAY=1).
+	NoTray bool
 }
 
 // resizeOff reports whether the window must be left alone.
@@ -112,8 +116,17 @@ func Run(opts Options) (err error) {
 		// an old journal can only be moved with rights: say that it is there and why it is not moved
 		m.flash, m.flashAt = joinNotes(m.readOnly, config.LegacyNote(true)), 100
 	}
+	// The icon in the notification area is removed after the menu ended, in
+	// parallel with the cleanup (it must not eat its budget), and the console
+	// window is brought back first, so that the progress of the cleanup is seen.
+	// cleaned tells the handler of the end of the Windows session that the
+	// cleanup is over.
+	var th *trayHandle
+	cleaned := make(chan struct{})
+	closeCleaned := sync.OnceFunc(func() { close(cleaned) })
 	if sess != nil {
 		defer func() {
+			defer closeCleaned()
 			if r := recover(); r != nil {
 				err = fmt.Errorf("internal error: %v\n%s", r, debug.Stack())
 			}
@@ -122,7 +135,10 @@ func Run(opts Options) (err error) {
 				restore() // before the exit: nothing runs after os.Exit
 				lifecycle.ForceExit("\nvpnsplit: повторный сигнал, выход без ожидания. Журнал сохранён: следующий запуск vpnsplit с правами администратора доделает (или `vpnsplit reset`).")
 			})
+			th.stop()
 			err = finish(sess, exitInfo(n.Signal()), err, os.Stdout, os.Stderr)
+			closeCleaned() // the handler of the end of the session need not wait for the icon
+			th.wait(300 * time.Millisecond)
 		}()
 		if n.Context().Err() != nil { // a signal came as the start was ending
 			return nil
@@ -131,7 +147,15 @@ func Run(opts Options) (err error) {
 
 	// the program does not handle signals itself: a signal asks the menu to
 	// quit, and Cleanup runs after the menu is gone, never next to it
+	link := &trayLink{}
+	m.tr = link
 	p := tea.NewProgram(m, tea.WithAltScreen(), tea.WithoutSignalHandler())
+	// the icon only shows and asks: what it asks for reaches the program as messages
+	var note string
+	th, note = startTray(opts, m, link, p, n, cleaned)
+	if note != "" {
+		lifecycle.SafeGo(func() { p.Send(trayNoteMsg{text: note}) }, nil)
+	}
 	done := make(chan struct{})
 	lifecycle.SafeGo(func() {
 		watchSignals(n.Context().Done(), done, killAfter,

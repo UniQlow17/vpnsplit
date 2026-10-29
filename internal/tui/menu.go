@@ -170,7 +170,7 @@ func (m model) menuLines(l menuLayout) []string {
 	switch l.hint {
 	case hintFull:
 		out = append(out, "")
-		out = append(out, m.blockLines(sDim, menuHint)...)
+		out = append(out, m.blockLines(sDim, m.keysHint())...)
 		out = append(out, m.blockLines(sDim, "● — пункт требует прав администратора")...)
 	case hintShort:
 		out = append(out, "")

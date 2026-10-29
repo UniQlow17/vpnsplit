@@ -57,6 +57,7 @@ type Notifier struct {
 	sig      os.Signal
 	at       time.Time
 	onRepeat func(os.Signal)
+	injected bool // the first signal was Inject, and the system's own copy of it has not come yet
 }
 
 // Notify starts listening for the termination signals.
@@ -83,6 +84,12 @@ func (n *Notifier) loop(ch <-chan os.Signal) {
 				n.sig, n.at = s, time.Now()
 			}
 			f := n.onRepeat
+			if !first && n.injected && (s == syscall.SIGTERM || s == syscall.SIGHUP) && time.Since(n.at) <= AbruptBudget {
+				// the system's own notice of the event that was injected
+				// (CTRL_SHUTDOWN after WM_ENDSESSION): the same event, not a repeat
+				n.injected = false
+				f = nil
+			}
 			n.mu.Unlock()
 			if first {
 				n.cancel()
@@ -126,6 +133,7 @@ func (n *Notifier) Stop() {
 // while the program is cleaning up and the user insists.
 func ForceExit(msg string) {
 	fmt.Fprintln(os.Stderr, msg)
+	RunAtExit()
 	os.Exit(130)
 }
 
@@ -146,4 +154,81 @@ func SafeGo(f func(), onPanic func(error)) {
 		}()
 		f()
 	}()
+}
+
+// Inject makes sig count as the first signal, as if the system had sent it: it
+// is how the end of the Windows session (WM_ENDSESSION) takes the same road as
+// CTRL_SHUTDOWN. If a signal has come already, nothing happens: it is not a
+// repeat, so the second notice of the same event does not make ForceExit cut
+// the cleanup short. The first SIGTERM/SIGHUP of the system within AbruptBudget
+// after an Inject is taken as that same event too (it may come in either order).
+// SIGINT and any later signal are repeats. It reports whether sig was the first.
+func (n *Notifier) Inject(sig os.Signal) bool {
+	n.mu.Lock()
+	if n.sig != nil {
+		n.mu.Unlock()
+		return false
+	}
+	n.sig, n.at, n.injected = sig, time.Now(), true
+	n.mu.Unlock()
+	n.cancel()
+	return true
+}
+
+// Hooks that run when the process is about to end without the usual way out
+// (ForceExit, the last recover of main): removing the icon of the tray, bringing
+// the console window back.
+var (
+	exitMu    sync.Mutex
+	exitHooks []*exitHook
+)
+
+type exitHook struct {
+	f    func()
+	once sync.Once
+}
+
+// exitHookWait is how long RunAtExit waits for the hooks all together.
+const exitHookWait = 700 * time.Millisecond
+
+// AtExit registers f to run at RunAtExit. It returns the function that
+// removes the registration; f runs at most once, whichever way it is called.
+func AtExit(f func()) (remove func()) {
+	h := &exitHook{f: f}
+	exitMu.Lock()
+	exitHooks = append(exitHooks, h)
+	exitMu.Unlock()
+	return func() {
+		exitMu.Lock()
+		defer exitMu.Unlock()
+		for i, x := range exitHooks {
+			if x == h {
+				exitHooks = append(exitHooks[:i:i], exitHooks[i+1:]...)
+				return
+			}
+		}
+	}
+}
+
+// RunAtExit runs the registered hooks (each in its own goroutine, a panic in
+// one is swallowed) and waits for them no longer than a moment.
+func RunAtExit() {
+	exitMu.Lock()
+	hs := append([]*exitHook(nil), exitHooks...)
+	exitMu.Unlock()
+	var wg sync.WaitGroup
+	for _, h := range hs {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			defer func() { _ = recover() }()
+			h.once.Do(h.f)
+		}()
+	}
+	done := make(chan struct{})
+	go func() { wg.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(exitHookWait):
+	}
 }

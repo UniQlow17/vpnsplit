@@ -18,10 +18,12 @@ import (
 
 const usage = `vpnsplit - corp traffic through the corp VPN, chosen sites past every VPN, the rest through the home VPN
 
-  vpnsplit [menu] [--no-resize]  interactive menu (default); keys: digit = run the item, ? help, q quit.
+  vpnsplit [menu] [--no-resize] [--no-tray]  interactive menu (default); keys: digit = run the item, ? help, q quit.
                                  The window is enlarged to fit the menu where the terminal allows it
                                  (classic Windows console, xterm, iTerm2, Terminal.app) and put back
-                                 at the end; --no-resize or VPNSPLIT_NO_RESIZE=1 leaves it alone
+                                 at the end; --no-resize or VPNSPLIT_NO_RESIZE=1 leaves it alone.
+                                 Windows: an icon in the notification area (switch, show window, exit),
+                                 key m hides a classic console window into it; --no-tray or VPNSPLIT_NO_TRAY=1 switches it off
   vpnsplit list                  show network adapters and the VPN clients behind them
   vpnsplit init                  choose corp / home VPN (default: detect automatically)
   vpnsplit add <cidr|ip|domain|AS>...        send these to the corp VPN
@@ -79,7 +81,7 @@ func run(args []string, version string) error {
 	if len(args) > 0 {
 		cmd, rest = args[0], args[1:]
 	}
-	if len(args) > 0 && args[0] == "--no-resize" { // the menu is the default command
+	if len(args) > 0 && (args[0] == "--no-resize" || args[0] == "--no-tray") { // the menu is the default command
 		cmd, rest = "menu", args
 	}
 	switch cmd {

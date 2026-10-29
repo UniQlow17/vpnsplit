@@ -114,10 +114,12 @@ func parseMenu(args []string) (tui.Options, error) {
 	var o tui.Options
 	for _, a := range args {
 		switch a {
+		case "--no-tray":
+			o.NoTray = true
 		case "--no-resize":
 			o.NoResize = true
 		default:
-			return o, fmt.Errorf("usage: vpnsplit [menu] [--no-resize] (unknown argument %q)", a)
+			return o, fmt.Errorf("usage: vpnsplit [menu] [--no-resize] [--no-tray] (unknown argument %q)", a)
 		}
 	}
 	return o, nil
