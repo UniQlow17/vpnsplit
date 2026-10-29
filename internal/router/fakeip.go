@@ -63,7 +63,7 @@ var clientProviders = map[string][]string{
 var clientNameHints = map[string][]string{
 	"sing-box": {"sing-box", "singbox"},
 	"Hiddify":  {"hiddify"},
-	"Mihomo":   {"mihomo", "clash", "meta"},
+	"Mihomo":   {"mihomo", "clash", "clash-meta", "meta-"},
 }
 
 // clientRunning reports whether an adapter of the client is up.
@@ -110,6 +110,15 @@ func fakeRangeOf(a netip.Addr) string {
 	if fakeIPNet.Contains(a) {
 		return fakeIPNet.String()
 	}
+	return extraRangeOf(a)
+}
+
+// extraRangeOf names the range of a client config that holds a ("" if none
+// does). Unlike 198.18.0.0/15 such a range is only a guess about what the DNS
+// of a client answers, so it is applied to the answers of the system resolver
+// only (see resolveDomains).
+func extraRangeOf(a netip.Addr) string {
+	a = a.Unmap()
 	if l := extraFake.Load(); l != nil {
 		for _, r := range *l {
 			if r.p.Contains(a) {

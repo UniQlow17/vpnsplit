@@ -188,26 +188,77 @@ func listEntries(d *os.File, limit int) ([]UserEntry, error) {
 // directory owned by root (SYSTEM, Administrators, TrustedInstaller) and, on
 // Unix, not writable by group or others. What lies in a directory a user made
 // is not a setting of the machine.
+//
+// On Windows the access list of the directory is checked as well: nobody but
+// SYSTEM, Administrators and TrustedInstaller may write to it or change it.
 func machineDirOK(dir string) bool {
 	fi, err := os.Lstat(dir)
-	return err == nil && fi.IsDir() && fi.Mode()&os.ModeSymlink == 0 && trustedOwner(fi, dir)
+	return err == nil && fi.IsDir() && fi.Mode()&os.ModeSymlink == 0 && trustedOwner(fi, dir) && strictDir(dir)
 }
 
-// ReadMachineFile is ReadRegularMax for the files of the machine-wide places:
-// the file and its directory must belong to the system (see machineDirOK), else
-// the file is refused as if it were not there.
-func ReadMachineFile(path string, max int64) ([]byte, error) {
-	if !machineDirOK(filepath.Dir(path)) {
-		return nil, fmt.Errorf("%s: the directory is not the system's", path)
+// machineChainOK says whether every directory from dir up to the root belongs
+// to the system (owner, and on Unix no write for group or others): a directory
+// on the way that a user owns would let the user swap the one below it. dir has
+// no symbolic links in it (see ReadMachineFile).
+func machineChainOK(dir string) bool {
+	for d := dir; ; {
+		fi, err := os.Lstat(d)
+		if err != nil || !fi.IsDir() || fi.Mode()&os.ModeSymlink != 0 || !trustedOwner(fi, d) {
+			return false
+		}
+		parent := filepath.Dir(d)
+		if parent == d {
+			return true
+		}
+		d = parent
 	}
-	fi, err := os.Lstat(path)
+}
+
+// ReadMachineFile is ReadRegularMax for the files of the machine-wide places.
+// The file is opened first (a link is not followed) and its owner and rights are
+// judged on the open descriptor, so it cannot be swapped afterwards; its
+// directory must belong to the system (see machineDirOK) and so must every
+// directory above it, else the file is refused as if it were not there.
+func ReadMachineFile(path string, max int64) ([]byte, error) {
+	if max <= 0 || max > maxFileSize {
+		return nil, fmt.Errorf("bad size limit %d", max)
+	}
+	if !filepath.IsAbs(path) {
+		return nil, fmt.Errorf("%s: not an absolute path", path)
+	}
+	// links in the directories above (macOS: /etc -> private/etc) are resolved
+	// once; the checks below then walk a path without links
+	dir, err := filepath.EvalSymlinks(filepath.Dir(path))
 	if err != nil {
 		return nil, err
 	}
-	if !trustedOwner(fi, path) {
+	full := filepath.Join(dir, filepath.Base(path))
+	fi, err := os.Lstat(full)
+	if err != nil {
+		return nil, err
+	}
+	if !fi.Mode().IsRegular() || fi.Size() > max {
+		return nil, fmt.Errorf("%s: not a regular file, or too large", path)
+	}
+	f, err := os.OpenFile(full, os.O_RDONLY|openReadFlags, 0)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	fi2, err := f.Stat()
+	if err != nil {
+		return nil, err
+	}
+	if !fi2.Mode().IsRegular() || !os.SameFile(fi, fi2) {
+		return nil, fmt.Errorf("%s changed while it was opened", path)
+	}
+	if !machineFileOK(f, fi2) {
 		return nil, fmt.Errorf("%s: the file is not the system's", path)
 	}
-	return ReadRegularMax(path, max)
+	if !machineDirOK(dir) || !machineChainOK(dir) {
+		return nil, fmt.Errorf("%s: the directory is not the system's", path)
+	}
+	return readLimited(f, max, path)
 }
 
 // ListMachineDir lists at most limit entries of a directory that only the

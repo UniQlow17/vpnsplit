@@ -110,9 +110,15 @@ func TestFlightCacheReuses(t *testing.T) {
 func TestFlightCachePanicIsContained(t *testing.T) {
 	c := &flightCache{fn: func() Result { panic("boom") }}
 	_ = c.get(time.Hour, time.Second)
+	// the empty result counts: a reader does not start the broken run again
 	c.fn = func() Result { return Result{GPONRPT: 3} }
-	if r := c.get(time.Hour, time.Second); r.GPONRPT != 3 {
+	start := time.Now()
+	if r := c.get(time.Hour, time.Second); r.GPONRPT != 0 || r.Stale || time.Since(start) > 500*time.Millisecond {
 		t.Errorf("after a panic: %+v", r)
+	}
+	// once it is old, the run is made again
+	if r := c.get(0, time.Second); r.GPONRPT != 3 {
+		t.Errorf("not renewed after a panic: %+v", r)
 	}
 }
 

@@ -13,6 +13,13 @@ func trustedOwner(fi os.FileInfo, _ string) bool {
 	return ok && st.Uid == 0 && fi.Mode().Perm()&0o022 == 0
 }
 
+// machineFileOK judges the open file by its descriptor: root's, and not
+// writable by group or others.
+func machineFileOK(_ *os.File, fi os.FileInfo) bool { return trustedOwner(fi, "") }
+
+// strictDir: on Unix trustedOwner already looks at the rights of the directory.
+func strictDir(string) bool { return true }
+
 // userOwned: the file belongs to the real user (the one behind sudo or
 // pkexec, or the user of the process) or to root.
 func userOwned(fi os.FileInfo) bool {

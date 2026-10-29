@@ -474,10 +474,14 @@ func (v *avoid) addNets(why string, list ...netip.Prefix) {
 	}
 }
 
-// why says why a has to be left alone ("" if it does not).
-func (v *avoid) why(a netip.Addr) string {
+// whyServer says why the address a has to be left alone ("" if it does not):
+// not a host address (badServer), or taken by what was added. A fake-ip range is
+// not judged here: it describes DNS answers, and a real DNS server of the
+// provider may well lie in a range that a client config names (8.0.0.0/8).
+// The answers are judged by resolveDomains.
+func (v *avoid) whyServer(a netip.Addr) string {
 	a = a.Unmap()
-	if w := badAddr(a); w != "" {
+	if w := badServer(a); w != "" {
 		return w
 	}
 	if w, ok := v.addrs[a]; ok {
@@ -499,7 +503,7 @@ func (v *avoid) filterServers(servers []string) (kept, notes []string) {
 		if err != nil {
 			continue
 		}
-		if w := v.why(a); w != "" {
+		if w := v.whyServer(a); w != "" {
 			notes = append(notes, fmt.Sprintf("the DNS server %s of the provider is %s: no direct route to it, it is not asked about the names that go direct", s, w))
 			continue
 		}
@@ -580,7 +584,7 @@ func (m *Manager) buildPlan(cfg *config.Config, e Env, st *config.State, tbl *ta
 		}
 		if len(cfg.Domains) > 0 {
 			fmt.Fprintln(w, "resolving corp domains...")
-			ips, dropped := m.resolveDomains(cfg.Domains, servers, nil, w)
+			ips, dropped := m.resolveDomains(cfg.Domains, servers, nil, true, w)
 			p.warns = append(p.warns, dropped...)
 			for _, ip := range ips {
 				corp(ip)
@@ -609,7 +613,7 @@ func (m *Manager) buildPlan(cfg *config.Config, e Env, st *config.State, tbl *ta
 		}
 		if len(cfg.HomeDomains) > 0 {
 			fmt.Fprintln(w, "resolving home domains...")
-			ips, dropped := m.resolveDomains(cfg.HomeDomains, nil, nil, w)
+			ips, dropped := m.resolveDomains(cfg.HomeDomains, nil, nil, true, w)
 			p.warns = append(p.warns, dropped...)
 			for _, ip := range ips {
 				home(ip)
@@ -650,7 +654,7 @@ func (m *Manager) buildPlan(cfg *config.Config, e Env, st *config.State, tbl *ta
 				p.warns = append(p.warns, "no DNS server of the provider is usable: the domains that go direct are resolved by the system resolver")
 			}
 			fmt.Fprintln(w, "resolving direct domains...")
-			ips, dropped := m.resolveDomains(cfg.DirectDomains, servers, av.why, w)
+			ips, dropped := m.resolveDomains(cfg.DirectDomains, servers, av.whyServer, false, w)
 			p.warns = append(p.warns, dropped...)
 			for _, ip := range ips {
 				direct(ip)

@@ -81,6 +81,22 @@ func TestDiagnoseCallsScanOncePerFreshness(t *testing.T) {
 	}
 }
 
+// Findings made without a finished scan are not kept.
+func TestDiagnoseDoesNotKeepStaleScan(t *testing.T) {
+	scans := 0
+	d := &diagnoser{
+		routesFn: func() ([]OSRoute, error) { return nil, nil },
+		rulesFn:  func() ([]OSRule, error) { return nil, nil },
+		scanFn:   func() clientcfg.Result { scans++; return clientcfg.Result{Stale: true} },
+	}
+	cfg, e := config.New(), diagEnv()
+	d.run(cfg, e, nil)
+	d.run(cfg, e, nil)
+	if scans != 2 {
+		t.Errorf("%d scans, want 2", scans)
+	}
+}
+
 // The adapter metric of Windows counts in the comparison of default routes.
 func TestDiagWindowsIfMetric(t *testing.T) {
 	in := baseIn()
@@ -158,7 +174,7 @@ func TestFakeRangesOnlyOfRunningClients(t *testing.T) {
 	if got := fakeRangesFor(res, []netif.Info{eth, down}); len(got) != 0 {
 		t.Errorf("a down adapter counts: %v", got)
 	}
-	if got := fakeRangesFor(res, []netif.Info{eth, up("Meta", "")}); len(got) != 1 {
+	if got := fakeRangesFor(res, []netif.Info{eth, up("Clash Meta", "")}); len(got) != 1 {
 		t.Errorf("the name of the adapter is not used: %v", got)
 	}
 	setFakeRanges(fakeRangesFor(res, []netif.Info{eth, up("sb", "sing-box")}))

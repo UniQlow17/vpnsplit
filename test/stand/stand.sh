@@ -1428,8 +1428,14 @@ s_diag_fakeip() {
   mihomo_up
   start_run s33b run
   check "routes applied" wait_for 20 applied
-  check "the answer 28.5.5.5 got no route" bash -c "! ip -n client -4 route show table all | grep -q -E '^28\.5\.5\.5'"
-  grep -q "fake28.example=28.5.5.5" "$RLOG" && ok "the report names the dropped answer" || bad "the dropped answer is not in the output"
+  if grep -q "direct DNS (provider)" "$RLOG"; then
+    # the provider's DNS is asked explicitly: a range of a config is only a guess about the DNS of the
+    # client and does not apply to what another server answers
+    check "provider DNS asked explicitly: the answer 28.5.5.5 keeps its route" bash -c "ip -n client -4 route show table all | grep -q -E '^28\.5\.5\.5 '"
+  else
+    check "the answer 28.5.5.5 got no route" bash -c "! ip -n client -4 route show table all | grep -q -E '^28\.5\.5\.5'"
+    grep -q "fake28.example=28.5.5.5" "$RLOG" && ok "the report names the dropped answer" || bad "the dropped answer is not in the output"
+  fi
   routes_ok
   DIAG=$(diag_out)
   show_diag

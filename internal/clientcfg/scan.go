@@ -22,6 +22,10 @@ type Result struct {
 
 	CiscoFailClosed bool // a profile of Cisco AnyConnect / Secure Client fails closed
 	CiscoAlwaysOn   bool
+
+	// Stale is set by Cached and Files when the result is not a fresh read: the
+	// run was not over in time (the previous result, or an empty one, is given).
+	Stale bool
 }
 
 // scanFn is Scan; a variable so that the tests can replace the slow part.
@@ -94,7 +98,9 @@ func (c *flightCache) get(maxAge, wait time.Duration) Result {
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return c.res
+	r := c.res
+	r.Stale = !c.have || time.Since(c.at) >= maxAge
+	return r
 }
 
 func (c *flightCache) run(fl chan struct{}) {
@@ -103,9 +109,12 @@ func (c *flightCache) run(fl chan struct{}) {
 	defer func() {
 		_ = recover() // the settings are an extra: a broken reader must not stop the program
 		c.mu.Lock()
-		if ok {
-			c.res, c.at, c.have = r, time.Now(), true
+		if !ok {
+			// a panic: an empty result counts as a result, or every reader would
+			// start the broken run again and wait for it
+			r = Result{}
 		}
+		c.res, c.at, c.have = r, time.Now(), true
 		c.flight = nil
 		c.mu.Unlock()
 		close(fl)

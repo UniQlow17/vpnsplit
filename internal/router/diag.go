@@ -126,7 +126,11 @@ var defaultDiagnoser = &diagnoser{
 	scanFn: func() clientcfg.Result { return clientcfg.Cached(clientScanAge) },
 }
 
-// diagFreshness is how long findings are reused for the same adapters and rules.
+// diagFreshness is how long findings are reused while the key stays the same:
+// the adapters and config (Sig), the default routes read each time, and the
+// number of routes and rules in the journal. The rules and the other routes of
+// the OS are not part of the key: a change in them is seen at the latest after
+// this time.
 const diagFreshness = 20 * time.Second
 
 // clientScanAge is how old the read of the files and the registry may be.
@@ -135,8 +139,8 @@ const clientScanAge = 30 * time.Second
 // Diagnose looks around and returns the findings, the most serious first. It
 // only reads: the routing table and the rules of the OS, the settings of the
 // clients (clientcfg), what Detect found. A part that cannot be read is
-// skipped. The result is reused for diagFreshness while the adapters, the
-// rules, the journal and the default routes stay the same.
+// skipped. The result is reused for diagFreshness (see there for the key); it
+// is not kept when the scan of the clients did not finish.
 func Diagnose(cfg *config.Config, e Env, st *config.State) []Diag {
 	return defaultDiagnoser.run(cfg, e, st)
 }
@@ -172,6 +176,12 @@ func (d *diagnoser) run(cfg *config.Config, e Env, st *config.State) (list []Dia
 	}
 	in.cl = d.scanFn()
 	list = diagnose(in)
+	if in.cl.Stale {
+		// the scan did not finish in time: these findings lack its part, so they are
+		// not kept for diagFreshness, the next call asks again
+		d.key = ""
+		return list
+	}
 	d.key, d.at, d.list = key, time.Now(), list
 	return list
 }

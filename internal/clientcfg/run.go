@@ -51,7 +51,9 @@ func runLimited(cmd *exec.Cmd) (string, error) {
 	defer t.Stop()
 	select {
 	case err := <-done:
-		if err != nil {
+		// ErrWaitDelay: the tool ended well, a child it left kept the pipe
+		// open; what was written until then is the answer
+		if err != nil && !errors.Is(err, exec.ErrWaitDelay) {
 			return "", err
 		}
 	case <-t.C:

@@ -361,7 +361,14 @@ func lookupIPv4(ctx context.Context, dns, domain string) ([]netip.Addr, error) {
 // it is not where the name lives. So is an address that is not one of a host
 // (loopback, link-local, multicast...) and one that skip refuses (nil: none
 // is); the reasons come back as dropped, to be shown as warnings.
-func (m *Manager) resolveDomains(domains, servers []string, skip func(netip.Addr) string, w io.Writer) (cidrs, dropped []string) {
+//
+// 198.18.0.0/15 is dropped from every answer. A range that a client config names
+// is a guess about what the DNS of that client answers, so it applies only to
+// what the system resolver answered, never to a server asked explicitly (the
+// provider, the corp DNS through its /32). With warnOnly (the rules for corp and
+// through the home VPN, where a missing route is a leak or a lost resource) the
+// route is made anyway and a warning is added to dropped.
+func (m *Manager) resolveDomains(domains, servers []string, skip func(netip.Addr) string, warnOnly bool, w io.Writer) (cidrs, dropped []string) {
 	lookup := m.lookup
 	if lookup == nil {
 		lookup = lookupIPv4
@@ -373,7 +380,9 @@ func (m *Manager) resolveDomains(domains, servers []string, skip func(netip.Addr
 	for _, d := range domains {
 		var ips []netip.Addr
 		var err error
+		system := false
 		for _, s := range servers {
+			system = s == ""
 			if ips, err = lookup(m.ctx, s, d); err == nil {
 				break
 			}
@@ -383,11 +392,18 @@ func (m *Manager) resolveDomains(domains, servers []string, skip func(netip.Addr
 			continue
 		}
 		for _, ip := range ips {
-			if isFakeIP(ip) {
-				fake = append(fake, d+"="+ip.String()+" ["+fakeRangeOf(ip)+"]")
+			if fakeIPNet.Contains(ip.Unmap()) {
+				fake = append(fake, d+"="+ip.String()+" ["+fakeIPNet.String()+"]")
 				continue
 			}
-			if why := badAddr(ip); why != "" {
+			if x := extraRangeOf(ip); x != "" && system {
+				if !warnOnly {
+					fake = append(fake, d+"="+ip.String()+" ["+x+"]")
+					continue
+				}
+				dropped = append(dropped, fmt.Sprintf("%s resolves to %s, in the fake-ip range %s: the route is made anyway, check that it is the real address", d, ip, x))
+			}
+			if why := badServer(ip); why != "" {
 				dropped = append(dropped, fmt.Sprintf("%s resolves to %s (%s): no route for it", d, ip, why))
 				continue
 			}
