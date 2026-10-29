@@ -285,8 +285,14 @@ func (s *Session) Settle(deadline time.Time) *Baseline {
 		return nil
 	}
 	defer s.m.unlockSem()
-	if st, _, status := s.m.store.Load(); statusErr(status) != nil || !st.Empty() {
+	st, _, status := s.m.store.Load()
+	if statusErr(status) != nil || !st.Empty() {
 		return nil
+	}
+	if st.Owner != nil { // only the header of a run that has nothing applied: nobody owns anything
+		if err := s.m.saveBare(&config.State{}); err != nil {
+			return nil
+		}
 	}
 	return s.m.settle(ctx, false)
 }

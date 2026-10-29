@@ -18,7 +18,10 @@ import (
 
 const usage = `vpnsplit - corp traffic through the corp VPN, chosen sites past every VPN, the rest through the home VPN
 
-  vpnsplit [menu]                interactive menu (default)
+  vpnsplit [menu] [--no-resize]  interactive menu (default); keys: digit = run the item, ? help, q quit.
+                                 The window is enlarged to fit the menu where the terminal allows it
+                                 (classic Windows console, xterm, iTerm2, Terminal.app) and put back
+                                 at the end; --no-resize or VPNSPLIT_NO_RESIZE=1 leaves it alone
   vpnsplit list                  show network adapters and the VPN clients behind them
   vpnsplit init                  choose corp / home VPN (default: detect automatically)
   vpnsplit add <cidr|ip|domain|AS>...        send these to the corp VPN
@@ -40,6 +43,15 @@ const usage = `vpnsplit - corp traffic through the corp VPN, chosen sites past e
   vpnsplit run                   like watch, but a session: everything is removed when it ends
                                  (SIGINT/SIGTERM/SIGHUP, console closed), or by the next start
                                  if it was killed; for scripts and services
+  vpnsplit recover               finish what a run that was killed left: remove its routes, rules and DNS
+                                 entries from the journal and compare with the state before that run;
+                                 applies nothing, leaves apply/watch routes alone (needs admin/root)
+  vpnsplit install-recover [--remove]
+                                 install (or remove) the job that runs "vpnsplit recover" at every start
+                                 of the computer: a Task Scheduler task (SYSTEM), a systemd unit, a
+                                 LaunchDaemon. Done only by this command, never on its own. The program
+                                 and all of its directories must be closed to ordinary users (Program
+                                 Files, /usr/local/bin owned by root), else nothing is installed
   vpnsplit status                show what is connected and what vpnsplit added
   vpnsplit diff                  show how routes, rules and DNS entries differ from the state
                                  before vpnsplit started, and whose each difference is
@@ -67,9 +79,16 @@ func run(args []string, version string) error {
 	if len(args) > 0 {
 		cmd, rest = args[0], args[1:]
 	}
+	if len(args) > 0 && args[0] == "--no-resize" { // the menu is the default command
+		cmd, rest = "menu", args
+	}
 	switch cmd {
 	case "menu":
-		return tui.Run()
+		opts, err := parseMenu(rest)
+		if err != nil {
+			return err
+		}
+		return tui.Run(opts)
 	case "list":
 		return cmdList(os.Stdout)
 	case "init":
@@ -90,6 +109,10 @@ func run(args []string, version string) error {
 		return needAdmin(func() error { return cmdSync(config.ModePersistent) })
 	case "run":
 		return needAdmin(func() error { return cmdSync(config.ModeSession) })
+	case "recover":
+		return needAdmin(func() error { return cmdRecover(os.Stdout) })
+	case "install-recover":
+		return needAdmin(func() error { return cmdInstallRecover(rest, os.Stdout) })
 	case "status":
 		return cmdStatus()
 	case "diff":

@@ -234,7 +234,7 @@ func TestUndoNoStepWithoutChange(t *testing.T) {
 
 // Ctrl+z / ctrl+y outside an input do nothing, and the input is not entered.
 func TestCtrlZOutsideInputIsHarmless(t *testing.T) {
-	for _, sc := range []screen{scMenu, scRules, scPick, scSettings, scStatus, scBusy} {
+	for _, sc := range []screen{scMenu, scRules, scPick, scAdvanced, scDiag, scBusy} {
 		m := testModel()
 		m.sc, m.cursor = sc, 1
 		got, cmd := m.Update(ctrlZ)
@@ -247,7 +247,7 @@ func TestCtrlZOutsideInputIsHarmless(t *testing.T) {
 		}
 	}
 	// any key leaves these screens, ctrl+z included, and starts nothing
-	for _, sc := range []screen{scHelp, scResult, scConfirm} {
+	for _, sc := range []screen{scHelp, scResult} {
 		m := testModel()
 		m.sc = sc
 		got, cmd := m.Update(ctrlZ)

@@ -141,6 +141,9 @@ func (m *Manager) lockSem(ctx context.Context) error {
 
 func (m *Manager) unlockSem() { <-m.sem }
 
+// journalWait is how long Session.Journal waits for a running operation.
+const journalWait = 5 * time.Second
+
 // begin takes the right to run one operation; it fails once the session is
 // being ended, even if the semaphore happens to be free.
 func (m *Manager) begin() error {
@@ -803,6 +806,26 @@ func (m *Manager) ResetReport() (Report, []error) {
 	return m.resetLocked(m.ctx)
 }
 
+// Disable removes what this session applied (DNS entries, then rules, then
+// routes, and the settings of the automatic IPv6 tunnels), the way Cleanup does,
+// but the session goes on: the lock, the snapshot of the state before the start
+// and the right to apply again stay. The end of the session compares with the
+// snapshot as usual. Entries of apply/watch that wait for TakeOver are not the
+// session's and are left alone (nothing is removed, no error).
+func (m *Manager) Disable() (Report, []error) {
+	if err := m.requireOwner(); err != nil {
+		return Report{}, []error{err}
+	}
+	if err := m.begin(); err != nil {
+		return Report{}, []error{err}
+	}
+	defer m.unlockSem()
+	if m.Foreign() {
+		return Report{}, nil
+	}
+	return m.resetLocked(m.ctx)
+}
+
 func (m *Manager) resetLocked(ctx context.Context) (Report, []error) {
 	st, _, status := m.loadLocked()
 	if err := statusErr(status); err != nil {
@@ -860,6 +883,9 @@ func (s *Session) Foreign() bool { return s.m.Foreign() }
 
 // TakeOver makes them the session's: removed when it ends.
 func (s *Session) TakeOver() error { return s.m.TakeOver() }
+
+// Disable is Manager.Disable for the session.
+func (s *Session) Disable() (Report, []error) { return s.m.Disable() }
 
 // Cleanup is CleanupUntil with a time limit counted from now.
 func (s *Session) Cleanup(budget time.Duration) (Report, error) {
@@ -942,4 +968,19 @@ func (m *Manager) cleanupLocked(ctx context.Context, progress func(done, total i
 		return rep, fmt.Errorf("%d entries were not removed, the journal keeps them for the next start: %w", len(errs), errors.Join(errs...))
 	}
 	return rep, nil
+}
+
+// Journal is the journal as it is now (what is still applied).
+//
+// It is read under the semaphore of the operations, so it never shows the
+// middle of an Apply. If an operation does not end within a few seconds (or
+// the cleanup gave up and keeps the semaphore) it is read without, as before.
+func (s *Session) Journal() (*config.State, config.JournalStatus) {
+	ctx, cancel := context.WithTimeout(context.Background(), journalWait)
+	defer cancel()
+	if err := s.m.lockSem(ctx); err == nil {
+		defer s.m.unlockSem()
+	}
+	st, _, status := s.m.store.Load()
+	return st, status
 }

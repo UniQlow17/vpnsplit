@@ -22,7 +22,7 @@ func testModel() model {
 
 // Every screen must render, and the menu must show the hint of the selected item.
 func TestViewAllScreens(t *testing.T) {
-	for _, sc := range []screen{scMenu, scBusy, scResult, scConfirm, scPick, scRules, scSettings, scHelp, scStatus} {
+	for _, sc := range []screen{scMenu, scBusy, scResult, scConfirm, scPick, scRules, scAdvanced, scHelp, scDiag} {
 		m := testModel()
 		m.sc = sc
 		if v := m.View(); v == "" {
@@ -40,12 +40,34 @@ func TestViewAllScreens(t *testing.T) {
 	}
 }
 
-func TestDigitsMoveCursorOnly(t *testing.T) {
+// A digit starts the item with that number at once; the keys ? and q are help and exit.
+func TestDigitsStartItems(t *testing.T) {
 	m := testModel()
-	for k, want := range map[string]int{"1": itemApply, "5": itemStatus, "7": itemAuto, "8": itemHelp, "0": itemExit} {
-		got, cmd := m.updateKeys(keyMsg(k))
-		if cmd != nil || got.(model).cursor != want || got.(model).sc != scMenu {
-			t.Errorf("key %s: cursor=%d sc=%d cmd=%v, want cursor %d on the menu", k, got.(model).cursor, got.(model).sc, cmd, want)
+	for k, want := range map[string]screen{"2": scRules, "3": scDiag, "4": scAdvanced} {
+		got, _ := m.updateKeys(keyMsg(k))
+		if gm := got.(model); gm.sc != want {
+			t.Errorf("key %s: screen %d, want screen %d", k, gm.sc, want)
+		}
+	}
+	// 1 is the switch: without rights it explains and does nothing
+	got, cmd := m.updateKeys(keyMsg("1"))
+	if gm := got.(model); cmd != nil || gm.on || gm.sc != scMenu || gm.flash == "" {
+		t.Errorf("key 1 without rights: on=%v sc=%d cmd=%v flash=%q", gm.on, gm.sc, cmd, gm.flash)
+	}
+	// a digit beyond the items does nothing
+	if got, cmd := m.updateKeys(keyMsg("9")); cmd != nil || got.(model).sc != scMenu {
+		t.Error("digit 9 must do nothing")
+	}
+	got, _ = m.updateKeys(keyMsg("?"))
+	if got.(model).sc != scHelp {
+		t.Error("? must open the help")
+	}
+	if _, cmd := m.updateKeys(keyMsg("q")); cmd == nil {
+		t.Error("q must quit")
+	}
+	for _, k := range []string{"0", "8"} {
+		if got, cmd := m.updateKeys(keyMsg(k)); cmd != nil || got.(model).sc != scMenu {
+			t.Errorf("key %s must do nothing", k)
 		}
 	}
 }
@@ -66,11 +88,6 @@ func TestRulesAddAndDelete(t *testing.T) {
 	got, _ = m.updateKeys(keyMsg("enter"))
 	if mm := got.(model); mm.purpose != "direct" {
 		t.Fatalf("enter on row 1 must ask for a direct rule, got %q", mm.purpose)
-	}
-	m.cursor = 2
-	got, _ = m.updateKeys(keyMsg("enter"))
-	if mm := got.(model); mm.purpose != "import" {
-		t.Fatalf("enter on row 2 must ask for a file to import, got %q", mm.purpose)
 	}
 	m.cursor = m.ruleRows()
 	got, _ = m.updateKeys(keyMsg("enter"))
@@ -124,8 +141,8 @@ func TestStatusListsEnvironmentFindings(t *testing.T) {
 	if m.diagIndicator() != "" {
 		t.Error("an indicator without findings")
 	}
-	if strings.Contains(plain(m.statusLines()), "Окружение") {
-		t.Error("a section without findings")
+	if got := plain(m.statusLines()); !strings.Contains(got, "замечаний нет") {
+		t.Error("a section without findings must say there are none")
 	}
 	m.diags = []router.Diag{
 		{Code: "GPO_NRPT", Level: router.DiagDanger, TextRU: "политика задаёт NRPT", TextEN: "x", AdviceRU: "используйте IP"},

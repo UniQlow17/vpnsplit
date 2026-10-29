@@ -57,7 +57,7 @@ func assertFits(t *testing.T, name, view string, w int) {
 }
 
 var screenNames = map[screen]string{scMenu: "menu", scBusy: "busy", scResult: "result", scConfirm: "confirm",
-	scPick: "pick", scRules: "rules", scSettings: "settings", scHelp: "help", scStatus: "status"}
+	scPick: "pick", scRules: "rules", scAdvanced: "settings", scHelp: "help", scDiag: "status"}
 
 // No line of any screen may be wider than the terminal, which is what makes
 // lines wrap and break the frame.
@@ -69,7 +69,7 @@ func TestViewFitsTerminalWidth(t *testing.T) {
 				m.sc, m.cursor = sc, cur
 				assertFits(t, name, m.View(), w)
 				m.cfg = nil
-				if sc != scSettings { // settings are only reachable with a config
+				if sc != scAdvanced { // settings are only reachable with a config
 					assertFits(t, name+"/nocfg", m.View(), w)
 				}
 			}
@@ -87,7 +87,7 @@ func TestViewFitsTerminalWidth(t *testing.T) {
 		m.sc, m.delAsk, m.cursor = scRules, true, m.ruleRows()
 		assertFits(t, "rules/delete", m.View(), w)
 		m = richModel(w)
-		m.sc, m.scroll = scStatus, 3
+		m.sc, m.scroll = scDiag, 3
 		assertFits(t, "status/scroll", m.View(), w)
 	}
 }

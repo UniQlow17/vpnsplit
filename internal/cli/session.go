@@ -18,6 +18,12 @@ import (
 // leftovers are dealt with first (ctx ends that early). The Session must be
 // ended with end.
 func acquire(ctx context.Context, mgr *router.Manager, mode string, out io.Writer) (*router.Session, error) {
+	sess, _, err := acquireInfo(ctx, mgr, mode, out)
+	return sess, err
+}
+
+// acquireInfo is acquire that also says what happened to the leftovers of an earlier run.
+func acquireInfo(ctx context.Context, mgr *router.Manager, mode string, out io.Writer) (*router.Session, router.AcquireInfo, error) {
 	sess, info, err := mgr.Acquire(ctx, mode, out)
 	printWarningsTo(out, info.Warns)
 	// an old-format journal that is still where it was: say that and why
@@ -25,7 +31,7 @@ func acquire(ctx context.Context, mgr *router.Manager, mode string, out io.Write
 		printWarningsTo(out, []string{n})
 	}
 	if err != nil {
-		return nil, err
+		return nil, info, err
 	}
 	if info.Recovered.Total()+info.Recovered.Forgotten > 0 {
 		fmt.Fprintln(out, "recovered after an earlier run:", info.Recovered.Describe(false))
@@ -44,7 +50,7 @@ func acquire(ctx context.Context, mgr *router.Manager, mode string, out io.Write
 	if info.TookOver {
 		fmt.Fprintln(out, "took over the routes of the journal that had no owner (apply/watch or an older version): they are removed when this run ends")
 	}
-	return sess, nil
+	return sess, info, nil
 }
 
 func printWarningsTo(w io.Writer, warns []string) {

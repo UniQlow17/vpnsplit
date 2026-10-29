@@ -34,8 +34,8 @@ func TestViewFitsTerminalHeight(t *testing.T) {
 				m := manyRules(richModel(size.w))
 				m.height = size.h
 				m.sc, m.cursor = sc, cur
-				if sc == scSettings {
-					m.cursor = cur % 4
+				if sc == scAdvanced {
+					m.cursor = cur % advCount
 				}
 				v := m.View()
 				lines := frameLines(v)
@@ -109,7 +109,7 @@ func TestFrameNeverWiderThanWindow(t *testing.T) {
 // Scrolling reaches the end of a long status screen and stays inside it.
 func TestStatusScrollsWithinWindow(t *testing.T) {
 	m := manyRules(richModel(80))
-	m.height, m.sc = 24, scStatus
+	m.height, m.sc = 24, scDiag
 	if m.scrollMax() == 0 {
 		t.Fatal("the status screen must not fit 24 lines in this test")
 	}
@@ -143,7 +143,7 @@ func TestStatusScrollsWithinWindow(t *testing.T) {
 }
 
 func TestTipLinesFitWidth(t *testing.T) {
-	tips := append(append(menuTips(), settingsTips...), pickTips[:]...)
+	tips := append(append(menuTips(), advancedTips[:]...), pickTips[:]...)
 	tips = append(tips, rulesTip)
 	for _, w := range []int{10, 20, 40, tipWidth} {
 		for _, tp := range tips {
@@ -173,7 +173,7 @@ func TestWrapLinesAndIndent(t *testing.T) {
 	}
 }
 
-// menuNames are the titles of the nine main menu items as they appear in the frame.
+// menuNames are the titles of the main menu items as they appear in the frame.
 func menuNames() []string {
 	var out []string
 	for _, it := range menuItems {
@@ -209,7 +209,7 @@ func menuRows(v string) []menuRow {
 	return out
 }
 
-// wantAllItems checks that all nine items are shown, in order.
+// wantAllItems checks that all items are shown, in order.
 func wantAllItems(t *testing.T, ctx, v string) {
 	t.Helper()
 	rows := menuRows(v)
@@ -224,13 +224,13 @@ func wantAllItems(t *testing.T, ctx, v string) {
 	}
 }
 
-// The main menu shows all nine items without any scroll marks at any height
+// The main menu shows all items without any scroll marks at any height
 // that can hold them, and the frame fits the window.
 func TestMenuShowsAllItems(t *testing.T) {
 	for _, h := range []int{16, 24, 30, 40} {
 		for _, w := range []int{40, 60, 80, 120} {
 			for _, flash := range []bool{false, true} {
-				for _, cur := range []int{0, 4, itemExit} {
+				for _, cur := range []int{0, 2, len(menuItems) - 1} {
 					m := richModel(w)
 					m.height, m.sc, m.cursor = h, scMenu, cur
 					if flash {
@@ -276,23 +276,23 @@ func TestMenuItemNamesWhole(t *testing.T) {
 // A tall window gets the full scheme and the description; a low one loses them.
 func TestMenuDegradesInOrder(t *testing.T) {
 	m := richModel(100)
-	m.sc, m.cursor = scMenu, itemApply
-	tip := "Корпоративные правила уходят"
+	m.sc, m.cursor = scMenu, itemSplit
+	tip := "Включает и выключает"
 	m.height = 50
 	v := m.View()
-	if !strings.Contains(v, "интранет") || !strings.Contains(v, "DIRECT") || !strings.Contains(v, tip) || !strings.Contains(v, "vpnsplit apply") {
+	if !strings.Contains(v, "интранет") || !strings.Contains(v, "DIRECT") || !strings.Contains(v, tip) || !strings.Contains(v, "vpnsplit run") {
 		t.Errorf("tall window must show the full scheme and description:\n%s", v)
 	}
 	if !strings.Contains(v, "требует прав администратора") {
 		t.Error("tall window must show the hints")
 	}
-	m.height = 16
+	m.height = 10
 	v = m.View()
-	if strings.Contains(v, "vpnsplit apply") || strings.Contains(v, "интранет") {
-		t.Errorf("height 16 must lose the description and the full scheme:\n%s", v)
+	if strings.Contains(v, "vpnsplit run") || strings.Contains(v, "интранет") {
+		t.Errorf("height 10 must lose the description and the full scheme:\n%s", v)
 	}
-	if n := len(frameLines(v)); n > 16 {
-		t.Errorf("height 16: %d lines", n)
+	if n := len(frameLines(v)); n > 10 {
+		t.Errorf("height 10: %d lines", n)
 	}
 }
 
@@ -318,7 +318,7 @@ func menuWidths() []int {
 }
 
 // Along the ladder the menu only gets shorter (frame included; equal layouts
-// are fine), a layout is found for every height, and from 9 lines up all nine
+// are fine), a layout is found for every height, and from as many lines as there are items, all
 // items are visible.
 func TestMenuLadder(t *testing.T) {
 	for name, variant := range menuVariants {
@@ -358,20 +358,13 @@ func TestMenuLadder(t *testing.T) {
 					wantAllItems(t, ctx, v)
 				}
 			}
-			if name == "plain" {
-				// title + nine items + frame is 12 lines
-				m.height = 12
-				if _, lines, ok := m.menuPlan(); !ok || len(lines) != 10 {
-					t.Errorf("width %d height 12: ok=%v lines=%d, want the layout of 10 lines", w, ok, len(lines))
-				}
-			}
 		}
 	}
 }
 
-// The last step has no frame: nine items on a window of 9 and 10 lines.
+// The last step has no frame: the items on a window of 4 and 5 lines.
 func TestMenuWithoutFrame(t *testing.T) {
-	for _, h := range []int{9, 10} {
+	for _, h := range []int{4, 5} {
 		m := richModel(80)
 		m.height, m.sc = h, scMenu
 		idx, _, ok := m.menuPlan()
@@ -385,13 +378,13 @@ func TestMenuWithoutFrame(t *testing.T) {
 		wantAllItems(t, fmt.Sprintf("height %d", h), v)
 	}
 	m := richModel(80)
-	m.height, m.sc = 11, scMenu
+	m.height, m.sc = 6, scMenu
 	if idx, _, ok := m.menuPlan(); !ok || !menuLadder[idx].box {
-		t.Errorf("height 11 must still have a frame")
+		t.Errorf("height 6 must still have a frame")
 	}
 }
 
-// Below 9 lines not even the items fit: a window of them around the selected
+// Below as many lines as there are items not even the items fit: a window of them around the selected
 // one is shown, continuous, with the selected item inside and no scroll marks.
 func TestMenuExtremeHeight(t *testing.T) {
 	for _, w := range []int{20, 80} {

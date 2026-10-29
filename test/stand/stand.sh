@@ -1513,6 +1513,219 @@ s_dns_keep() {
   show_log
 }
 
+
+# S36-S39: stage 5 (menu switch, recover, install-recover, window size)
+s_tui_switch() {
+  CUR=S36
+  say "S36: the switch 'Разделение' in the menu: OFF removes at once (session, lock, snapshot stay), ON applies again, q ends clean"
+  fresh
+  snap > "$WORK/base.snap"
+  local offchk='{ ip -n client -4 route show table all | grep -v -E "^(local|broadcast|multicast)"; ip -n client -4 rule show; } | sort | cmp -s - /tmp/stand/base.snap'
+  local lockchk='ip netns exec client env HOME=/root /usr/local/bin/vpnsplit reset >/dev/null 2>&1; [ $? -ne 0 ]'
+  out=$(TUI_CHECK_OFF="$offchk" TUI_CHECK_OFF2="$lockchk" TUI_CHECK_ON="$READY" python3 $STAND/tuirun.py offon "$READY" "$BIN" 2>&1)
+  echo "$out" | grep -E '^(OFF|ON|EXIT)' | sed 's/^/        | /'
+  echo "$out" | grep -q 'OFF_CHECK=0' && ok "OFF: the table equals the snapshot while the menu is still open" || bad "OFF: the table differs from the snapshot"
+  echo "$out" | grep -q 'OFF_CHECK2=0' && ok "OFF: the lock is still held (a second copy is refused)" || bad "OFF: a second copy was not refused"
+  echo "$out" | grep -q 'OFF_STATUS=1' && ok "OFF: the status line says so" || bad "OFF: no OFF in the status line"
+  echo "$out" | grep -q 'ON_CHECK=0' && ok "ON: the rules are applied again" || bad "ON: routes were not applied again"
+  echo "$out" | grep -q 'EXIT=0' && ok "q after ON ends with exit code 0" || bad "exit: $(echo "$out" | grep EXIT)"
+  check "the routing table equals the snapshot" base_state
+  check "the snapshot file is gone with the session" test ! -e /var/lib/vpnsplit/snapshot.json
+
+  CUR=S36b
+  say "S36b: the exit after the switch was turned on again: the table equals the snapshot (second round)"
+  fresh
+  snap > "$WORK/base.snap"
+  out=$(TUI_CHECK_OFF="$offchk" TUI_CHECK_OFF2="$lockchk" TUI_CHECK_ON="$READY" python3 $STAND/tuirun.py offon "$READY" "$BIN" 2>&1)
+  echo "$out" | grep -q 'EXIT=0' && ok "exit code 0" || bad "exit: $(echo "$out" | grep EXIT)"
+  check "the routing table equals the snapshot" base_state
+
+  CUR=S36c
+  say "S36c: over the routes of apply the switch refuses (nothing is taken without t)"
+  fresh
+  check "apply succeeds" vs apply >"$WORK/s36c.apply.log" 2>&1
+  local before
+  before=$(snap)
+  out=$(python3 $STAND/tuirun.py key1q 'screen:Забрать' "$BIN" 2>&1)
+  echo "$out" | grep -E '^(REFUSED|EXIT)' | sed 's/^/        | /'
+  echo "$out" | grep -q 'REFUSED=1' && ok "the menu says to press [t] first" || bad "no refusal on the screen"
+  echo "$out" | grep -q 'EXIT=0' && ok "exit code 0" || bad "exit: $(echo "$out" | grep EXIT)"
+  check "the table did not change" test "$(snap)" = "$before"
+  check "routes still work" applied
+  check "the journal is still persistent" grep -q '"persistent"' /var/lib/vpnsplit/state.json
+  vs reset >/dev/null 2>&1
+  check "reset cleans up" base_state
+}
+
+s_recover() {
+  CUR=S37
+  say "S37: 'vpnsplit recover' after kill -9 removes what the dead session left, applies nothing"
+  fresh
+  start_run s37a run
+  check "routes applied" wait_for 20 applied
+  kill -9 "$RPID"
+  reap
+  check "the table differs after kill -9" test "$(snap)" != "$BASE"
+  out=$(vs recover 2>&1)
+  rc=$?
+  echo "$out" | sed 's/^/        | /'
+  check "recover exits 0 (got $rc)" test "$rc" = 0
+  check "the routing table equals the snapshot" base_state
+  echo "$out" | grep -q "recovered after an earlier run" && ok "the report names what was removed" || bad "no report"
+  echo "$out" | grep -q "Restored to the state before the start" && ok "the report compares with the state before the dead run" || bad "no verdict about the state before the dead run"
+  check "the snapshot file is gone" test ! -e /var/lib/vpnsplit/snapshot.json
+  check "the journal holds no routes" bash -c '! grep -q "\"dest\"" /var/lib/vpnsplit/state.json'
+
+  say "S37b: recover with nothing to do, and next to a running copy"
+  out=$(vs recover 2>&1)
+  rc=$?
+  check "nothing to recover: exit 0 (got $rc)" test "$rc" = 0
+  echo "$out" | grep -q "nothing to recover" && ok "says so" || bad "no 'nothing to recover'"
+  start_run s37b run
+  check "routes applied" wait_for 20 applied
+  out=$(vs recover 2>&1)
+  rc=$?
+  check "recover refuses while a session runs (exit $rc)" test "$rc" != 0
+  check "routes still work" applied
+  kill -TERM "$RPID"
+  reap
+  check "the first copy ends cleanly (exit $RCODE)" test "$RCODE" = 0
+  check "the routing table equals the snapshot" base_state
+
+  CUR=S37c
+  say "S37c: recover leaves the routes of apply (persistent) alone"
+  fresh
+  check "apply succeeds" vs apply >"$WORK/s37c.apply.log" 2>&1
+  out=$(vs recover 2>&1)
+  rc=$?
+  echo "$out" | sed 's/^/        | /'
+  check "recover exits 0 (got $rc)" test "$rc" = 0
+  check "routes of apply stay" applied
+  echo "$out" | grep -q "left in place" && ok "says that they stay" || bad "no 'left in place'"
+  vs reset >/dev/null 2>&1
+  check "reset cleans up" base_state
+}
+
+# systemctl is not in the container: a stub that logs its calls stands for it
+fake_systemd_on() {
+  mkdir -p /etc/systemd/system
+  chmod 755 /etc /etc/systemd /etc/systemd/system
+  printf '#!/bin/sh\necho "$@" >> /tmp/stand/systemctl.calls\nexit 0\n' > /usr/sbin/systemctl
+  chmod 755 /usr/sbin/systemctl
+  rm -f /tmp/stand/systemctl.calls
+}
+fake_systemd_off() {
+  rm -f /usr/sbin/systemctl /etc/systemd/system/vpnsplit-recover.service
+  rmdir /etc/systemd/system /etc/systemd 2>/dev/null
+}
+
+s_install_recover() {
+  CUR=S38
+  say "S38: install-recover copies the program into /usr/local/libexec/vpnsplit and the unit starts the copy; --remove deletes only its own"
+  fake_systemd_on
+  local unit=/etc/systemd/system/vpnsplit-recover.service
+  local cdir=/usr/local/libexec/vpnsplit
+  local copy=$cdir/vpnsplit
+  rm -rf "$cdir"
+  out=$(vs install-recover 2>&1)
+  rc=$?
+  echo "$out" | sed 's/^/        | /'
+  check "the install succeeds (exit $rc)" test "$rc" = 0
+  check "the copy is there, identical to the program, root 755" bash -c "cmp -s $BIN $copy && [ \"\$(stat -c '%a %U' $copy)\" = '755 root' ]"
+  check "the directory is root's and 755, with the marker" bash -c "[ \"\$(stat -c '%a %U' $cdir)\" = '755 root' ] && grep -q vpnsplit-managed $cdir/vpnsplit.managed"
+  check "the unit is written" test -f "$unit"
+  check "the unit starts the copy at boot, once" bash -c "grep -q 'ExecStart=\"$copy\" recover' $unit && grep -q 'Type=oneshot' $unit && grep -q 'WantedBy=multi-user.target' $unit"
+  check "the unit carries the mark" bash -c "head -1 $unit | grep -q 'vpnsplit-managed'"
+  check "the unit is not writable by others" bash -c "[ \"\$(stat -c %a $unit)\" = 644 ]"
+  check "systemctl enable was called, nothing was started" bash -c "grep -q 'enable vpnsplit-recover.service' /tmp/stand/systemctl.calls && ! grep -q 'start' /tmp/stand/systemctl.calls"
+  vs install-recover >/dev/null 2>&1
+  check "installing again replaces the copy and the unit" bash -c "test -f $unit && cmp -s $BIN $copy && test ! -e $copy.tmp"
+
+  say "S38b: a program anywhere is copied (the copy is what runs); the places of the copy must be root's"
+  mkdir -p /tmp/untrusted && cp "$BIN" /tmp/untrusted/vpnsplit && chmod 755 /tmp/untrusted/vpnsplit
+  rm -f "$unit"; rm -rf "$cdir"
+  out=$(ip netns exec client env HOME=/root /tmp/untrusted/vpnsplit install-recover 2>&1)
+  rc=$?
+  echo "$out" | head -3 | sed 's/^/        | /'
+  check "a program in a user-writable directory is fine now, the copy is used (exit $rc)" test "$rc" = 0
+  check "the unit points at the copy, not at /tmp" bash -c "grep -q 'ExecStart=\"$copy\" recover' $unit && ! grep -q /tmp/untrusted $unit"
+  rm -rf /tmp/untrusted
+  rm -f "$unit"
+  chmod 777 /usr/local/libexec
+  out=$(vs install-recover 2>&1)
+  rc=$?
+  chmod 755 /usr/local/libexec
+  check "a world-writable /usr/local/libexec is refused (exit $rc)" test "$rc" != 0
+  check "the unit is not written" test ! -e "$unit"
+  rm -rf "$cdir"; mkdir -p /tmp/elsewhere
+  ln -s /tmp/elsewhere "$cdir"
+  out=$(vs install-recover 2>&1)
+  rc=$?
+  check "a link in place of the directory is refused (exit $rc)" test "$rc" != 0
+  check "nothing was written through it" bash -c "[ -z \"\$(ls -A /tmp/elsewhere)\" ] && [ ! -e $unit ]"
+  rm -f "$cdir"; rm -rf /tmp/elsewhere
+  mkdir -p "$cdir" && printf 'theirs' > "$copy" && chmod 755 "$copy"
+  out=$(vs install-recover 2>&1)
+  rc=$?
+  check "a file of that name without our marker is not replaced (exit $rc)" bash -c "[ $rc != 0 ] && [ \"\$(cat $copy)\" = theirs ] && [ ! -e $unit ]"
+  out=$(vs install-recover --remove 2>&1)
+  check "and --remove leaves it too" test "$(cat $copy)" = theirs
+  rm -rf "$cdir"
+
+  say "S38c: --remove deletes its own unit and copy and leaves a foreign unit"
+  check "install again" vs install-recover >/dev/null 2>&1
+  out=$(vs install-recover --remove 2>&1)
+  rc=$?
+  check "remove exits 0 (got $rc)" test "$rc" = 0
+  check "the unit is gone" test ! -e "$unit"
+  check "the copy, the marker and the directory are gone" test ! -e "$cdir"
+  printf '[Service]\nExecStart=/bin/true\n' > "$unit"
+  out=$(vs install-recover --remove 2>&1)
+  rc=$?
+  check "somebody else's unit is not removed (exit $rc)" test "$rc" != 0
+  check "it is still there, unchanged" grep -q 'ExecStart=/bin/true' "$unit"
+  out=$(vs install-recover 2>&1)
+  rc=$?
+  check "and not overwritten either (exit $rc)" test "$rc" != 0
+  check "still unchanged" grep -q 'ExecStart=/bin/true' "$unit"
+  rm -rf "$cdir"
+  fake_systemd_off
+  out=$(vs install-recover 2>&1)
+  rc=$?
+  check "without systemd nothing is written (exit $rc)" bash -c "[ $rc != 0 ] && [ ! -e $unit ] && [ ! -e $cdir ]"
+  echo "$out" | grep -q "systemd" && ok "the message names systemd" || bad "no mention of systemd"
+}
+
+s_resize() {
+  CUR=S39
+  say "S39: the window is enlarged for the menu where the terminal allows it (xterm: CSI 8;rows;cols t) and put back"
+  fresh
+  out=$(TUI_ROWS=24 TUI_COLS=70 TUI_ENV='XTERM_VERSION=XTerm(380)' TUI_EMULATE_CSI=1 python3 $STAND/tuirun.py q "$READY" "$BIN" 2>&1)
+  echo "$out" | grep -E '^(RESIZE|EXIT)' | sed 's/^/        | /'
+  first=$(echo "$out" | grep '^RESIZE=' | head -1)
+  last=$(echo "$out" | grep '^RESIZE=' | tail -1)
+  case "$first" in RESIZE=2[5-9]x80 | RESIZE=[3-9][0-9]x80) ok "the window was asked to grow to 80 columns and more rows ($first)" ;; *) bad "no growth request: '$first'" ;; esac
+  [ "$last" = "RESIZE=24x70" ] && ok "the original size 24x70 was put back at the end" || bad "last request: '$last'"
+  echo "$out" | grep -q 'EXIT=0' && ok "exit code 0" || bad "exit: $(echo "$out" | grep EXIT)"
+  check "the routing table equals the snapshot" base_state
+
+  say "S39b: tmux and an unknown terminal are not resized, the user is asked; --no-resize and VPNSPLIT_NO_RESIZE leave the window alone"
+  for e in 'TMUX=/tmp/tmux-0/default,1,0 XTERM_VERSION=XTerm(380)' 'TERM_PROGRAM=somethingelse'; do
+    out=$(TUI_ROWS=24 TUI_COLS=70 TUI_ENV="$e" TUI_EMULATE_CSI=1 python3 $STAND/tuirun.py q "$READY" "$BIN" 2>&1)
+    echo "$out" | grep -q '^RESIZE=' && bad "[$e] a resize request was sent" || ok "[$e] no resize request"
+    echo "$out" | grep -q 'HINT=1' && ok "[$e] the user is asked to enlarge the window" || bad "[$e] no request on the screen"
+  done
+  out=$(TUI_ROWS=24 TUI_COLS=70 TUI_ENV='XTERM_VERSION=XTerm(380)' TUI_ARGS=--no-resize TUI_EMULATE_CSI=1 python3 $STAND/tuirun.py q "$READY" "$BIN" 2>&1)
+  echo "$out" | grep -q '^RESIZE=' && bad "--no-resize: a request was sent" || ok "--no-resize: the window is left alone"
+  echo "$out" | grep -q 'HINT=1' && bad "--no-resize: the user was still asked" || ok "--no-resize: no request either"
+  out=$(TUI_ROWS=24 TUI_COLS=70 TUI_ENV='XTERM_VERSION=XTerm(380) VPNSPLIT_NO_RESIZE=1' TUI_EMULATE_CSI=1 python3 $STAND/tuirun.py q "$READY" "$BIN" 2>&1)
+  echo "$out" | grep -q '^RESIZE=' && bad "VPNSPLIT_NO_RESIZE=1: a request was sent" || ok "VPNSPLIT_NO_RESIZE=1: the window is left alone"
+  check "the routing table equals the snapshot" base_state
+
+  say "S39c: a window that is big enough is not touched"
+  out=$(TUI_ROWS=50 TUI_COLS=130 TUI_ENV='XTERM_VERSION=XTerm(380)' TUI_EMULATE_CSI=1 python3 $STAND/tuirun.py q "$READY" "$BIN" 2>&1)
+  echo "$out" | grep -q '^RESIZE=' && bad "a request was sent for a big window" || ok "no request for a big window"
+}
 # --------------------------------------------------------------------- main
 say "setting up the network (home VPN variant: $VARIANT)"
 setup
@@ -1555,6 +1768,10 @@ want S32 && s_diag_endpoint
 want S33 && s_diag_fakeip
 want S34 && s_diag_onlink
 want S35 && s_dns_keep
+want S36 && s_tui_switch
+want S37 && s_recover
+want S38 && s_install_recover
+want S39 && s_resize
 
 say "result: $PASS ok, $FAIL failed"
 for f in "${FAILED[@]+"${FAILED[@]}"}"; do echo "  FAIL $f"; done

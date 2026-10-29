@@ -44,6 +44,18 @@ func noAdminNote() string {
 	return "Нет прав администратора: меню только показывает состояние, маршруты менять нельзя. Чтобы применять и сбрасывать, " + how
 }
 
+// Options are the settings of the menu that come from the command line.
+type Options struct {
+	// NoResize leaves the size of the window alone: it is neither enlarged to fit
+	// the menu nor is the user asked to enlarge it (also VPNSPLIT_NO_RESIZE=1).
+	NoResize bool
+}
+
+// resizeOff reports whether the window must be left alone.
+func (o Options) resizeOff() bool {
+	return o.NoResize || os.Getenv("VPNSPLIT_NO_RESIZE") != ""
+}
+
 // Run starts the interactive menu as a session: with administrator rights it
 // first deals with what an earlier run left behind (router.Manager.Acquire),
 // and whenever the menu ends, however (quit, Ctrl+C, closed window, signal,
@@ -51,11 +63,23 @@ func noAdminNote() string {
 // reported loudly and makes the exit code non-zero; the next start finishes.
 // Routes left by apply/watch are not removed without the user's say (the [t]
 // key of the menu).
-func Run() (err error) {
+func Run(opts Options) (err error) {
 	sp := spinner.New(spinner.WithSpinner(spinner.Dot))
 	sp.Style = lipgloss.NewStyle().Foreground(cCyan)
 	admin := router.IsPrivileged()
 	m := model{admin: admin, input: newInput(), spin: sp, streamPaste: streamPasteDefault, now: time.Now}
+
+	// The window is enlarged to fit the menu and put back as it was when
+	// everything else is done: the defer is registered first, so it runs after
+	// the cleanup below, which has its own time budget and comes first.
+	win := &windowRestore{}
+	restore := win.do
+	if !opts.resizeOff() {
+		m.resize = true
+		m.refit = win.fit // once more when the first status makes the menu longer
+		win.fit(m.wantSize())
+	}
+	defer restore()
 
 	// signals are listened for before anything slow starts: one that arrives
 	// while the previous run is being cleaned up ends the start, cleanly
@@ -77,7 +101,7 @@ func Run() (err error) {
 		m.flashAt = 100
 		// with rights, keep routes in sync from the start: nothing to think
 		// about, unless there are routes of apply/watch to decide about
-		m.auto = aerr == nil && !info.Foreign
+		m.on = aerr == nil && !info.Foreign
 		m.lastSession = config.ReadLastSession()
 		if m.lastSession != "" && aerr == nil {
 			m.flash = joinNotes(m.flash, "Последний сеанс: "+m.lastSession)
@@ -95,6 +119,7 @@ func Run() (err error) {
 			}
 			// a second signal while the cleanup runs: the user insists
 			n.OnRepeat(func(os.Signal) {
+				restore() // before the exit: nothing runs after os.Exit
 				lifecycle.ForceExit("\nvpnsplit: повторный сигнал, выход без ожидания. Журнал сохранён: следующий запуск vpnsplit с правами администратора доделает (или `vpnsplit reset`).")
 			})
 			err = finish(sess, exitInfo(n.Signal()), err, os.Stdout, os.Stderr)

@@ -14,6 +14,8 @@ func userHome(t *testing.T) {
 	t.Setenv("HOME", h)
 	t.Setenv("XDG_CONFIG_HOME", filepath.Join(h, ".config"))
 	t.Setenv("APPDATA", filepath.Join(h, "AppData"))
+	t.Setenv("LOCALAPPDATA", filepath.Join(h, "LocalAppData"))
+	t.Setenv("USERPROFILE", h)
 	t.Setenv("SUDO_USER", "")
 	t.Setenv("PKEXEC_UID", "")
 }

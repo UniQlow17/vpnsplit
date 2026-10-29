@@ -3,6 +3,8 @@ package tui
 import (
 	"fmt"
 	"strings"
+
+	"github.com/UniQlow17/vpnsplit/internal/termsize"
 )
 
 // The main menu never scrolls: all its items are always visible. When the
@@ -51,11 +53,11 @@ type menuLayout struct {
 // in this order: the description and the hints (shortened, then removed), the
 // scheme (compact, then removed), the status line, blank separators and the
 // vertical padding of the frame. The next two steps are the extreme measure
-// for windows lower than the frame, title and nine items (13 lines): first the
+// for windows lower than the frame, title and the items: first the
 // title, then the flash message go. The step after them drops the frame itself
-// (border and padding), so the nine items fit a window of 9 lines. The nine
+// (border and padding), so the items fit a window of as many lines as there are items. The
 // items are never given up in these steps. Only when even they do not fit
-// (a window of less than 9 lines) a window of the items around the selected one
+// (a window lower than the list) a window of the items around the selected one
 // is shown; in this extreme case the hidden items are not marked in any way.
 //
 // The last field, box, says whether the frame is drawn at all.
@@ -74,25 +76,45 @@ var menuLadder = []menuLayout{
 	{diagNone, false, tipNone, hintNone, false, false, false, false, false},
 }
 
-// menuItemLines are the nine items of the menu.
+// menuItemLines are the items of the menu.
 func (m model) menuItemLines() []string {
 	var out []string
 	for i, it := range menuItems {
 		label := it.Label
-		if i == itemAuto {
-			label += ": " + map[bool]string{true: "вкл", false: "выкл"}[m.auto]
-		}
-		num := i + 1
-		if i == itemExit {
-			num = 0
+		if i == itemSplit {
+			label += ": " + splitWord(m.on)
 		}
 		extra := ""
 		if it.Admin {
 			extra = sYel.Render("●")
 		}
-		out = append(out, m.row(i, fmt.Sprintf("%d) %s", num, label), extra))
+		out = append(out, m.row(i, fmt.Sprintf("%d) %s", i+1, label), extra))
 	}
 	return out
+}
+
+// splitWord is the state of the split switch as the menu shows it.
+func splitWord(on bool) string {
+	if on {
+		return "ВКЛ"
+	}
+	return "ВЫКЛ"
+}
+
+// menuHint is the keys line under the menu.
+const menuHint = "↑↓ выбор · enter / цифра — запуск · ? — справка · q — выход"
+
+// wantCols is the width of the window the full menu is laid out for.
+const wantCols = 80
+
+// wantSize is the window the full layout of the menu needs: it is what the
+// window is enlarged to, and what the user is asked for when it cannot be.
+func (m model) wantSize() termsize.Size {
+	c := m
+	c.width, c.height = wantCols, 0
+	c.flash, c.busy, c.small = "", "", false
+	pv, _ := c.boxPadding()
+	return termsize.Size{Cols: wantCols, Rows: len(c.menuLines(menuLadder[0])) + 2 + 2*pv}
 }
 
 // shortTip is the first sentence of the description of the selected item, in
@@ -148,11 +170,11 @@ func (m model) menuLines(l menuLayout) []string {
 	switch l.hint {
 	case hintFull:
 		out = append(out, "")
-		out = append(out, m.blockLines(sDim, "↑↓ выбор · enter запуск · цифры — номер · q — выход")...)
+		out = append(out, m.blockLines(sDim, menuHint)...)
 		out = append(out, m.blockLines(sDim, "● — пункт требует прав администратора")...)
 	case hintShort:
 		out = append(out, "")
-		out = append(out, m.blockLines(sDim, "↑↓ · enter · цифры · q")...)
+		out = append(out, m.blockLines(sDim, "↑↓ · enter · цифры · ? · q")...)
 	}
 	return out
 }
@@ -194,7 +216,7 @@ func (m model) menuPlan() (idx int, lines []string, ok bool) {
 }
 
 // menuWindow is the window of the items around the selected one, for a window
-// lower than the nine items.
+// lower than the list of items.
 func (m model) menuWindow() []string {
 	items := m.menuItemLines()
 	h := clamp(m.height, 1, len(items))

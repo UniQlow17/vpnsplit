@@ -76,12 +76,16 @@ func (m model) statusRows() []string {
 	aw := m.contentW() - textIndent
 	status := sGray.Render("маршрутов: ") + fmt.Sprint(m.routes)
 	switch {
-	case m.needApply && m.routes > 0:
-		status = sYel.Render("VPN или правила изменились, нужно применить ") + status
+	case m.on && m.needApply && m.routes > 0:
+		status = sGreen.Render("Разделение ВКЛ") + sGray.Render(" · ") + sYel.Render("VPN или правила изменились, применяется заново · ") + status
+	case m.on && m.routes > 0:
+		status = sGreen.Render("Разделение ВКЛ") + sGray.Render(" · ") + sGreen.Render("активно · ") + status
+	case m.on:
+		status = sGreen.Render("Разделение ВКЛ") + sGray.Render(" · ") + sYel.Render("ждёт VPN · ") + status
 	case m.routes > 0:
-		status = sGreen.Render("активно ") + status
+		status = sYel.Render("Разделение ВЫКЛ") + sGray.Render(" · ") + sYel.Render("в журнале маршрутов: ") + fmt.Sprint(m.routes)
 	default:
-		status = sYel.Render("не применено ") + status
+		status = sGray.Render("Разделение ВЫКЛ") + sGray.Render(" · ") + status
 	}
 	parts := []string{status}
 	if !m.admin {
@@ -139,6 +143,10 @@ func (m model) busyFlashLines() []string {
 	var out []string
 	if m.busy != "" && m.quiet {
 		out = append(out, "", strings.Repeat(" ", textIndent)+m.spin.View()+" "+m.busy)
+	}
+	if m.small {
+		out = append(out, "")
+		out = append(out, m.blockLines(sYel, resizeAsk(m.wantSize()))...)
 	}
 	if m.flash != "" && m.frame < m.flashAt {
 		out = append(out, "")
@@ -288,7 +296,7 @@ func (m model) screenParts() screenParts {
 		}
 		p.hint, p.gap = "любая клавиша — назад", true
 	case scConfirm:
-		add(m.blockLines(sYel, "Удалить все маршруты vpnsplit и вернуть исходную маршрутизацию?")...)
+		add(m.blockLines(sYel, "Удалить ВСЕ маршруты и DNS-записи vpnsplit из журнала и вернуть исходную маршрутизацию?")...)
 		add("")
 		add(m.blockLines(sGray, confirmText)...)
 		p.hint, p.gap = "y — да, любая другая клавиша — отмена", true
@@ -330,8 +338,6 @@ func (m model) screenParts() screenParts {
 			add(m.row(n, sGreen.Render("+")+" Добавить через домашний VPN…"))
 			n++
 		}
-		add(m.row(n, sCyan.Render("↓")+" Импорт из файла…"))
-		add(m.row(n+1, sCyan.Render("↑")+" Экспорт в файл…"))
 		add("")
 		if h := m.hiddenRules(); h > 0 {
 			add(strings.Repeat(" ", rowIndent) + sGray.Render(fmt.Sprintf("скрыто правил: %d (не действуют при этом режиме остального трафика)", h)))
@@ -367,26 +373,39 @@ func (m model) screenParts() screenParts {
 		}
 		p.tail = append([]string{""}, splitLines(panel([]tip{rulesTip}, 0, tw))...)
 		p.hint, p.hintSt = "enter — выбрать · d — удалить · esc — назад", sDim
-	case scStatus:
+	case scDiag:
 		p.scroll = true
 		for _, l := range m.statusLines() {
 			add(ind + l)
 		}
-		p.hint, p.hintSt, p.gap = "esc — назад", sDim, true
-	case scSettings:
+		p.hint, p.hintSt, p.gap = "esc — назад · r — перечитать отличия от снимка", sDim, true
+	case scAdvanced:
 		c := m.cfg
+		if c == nil {
+			c = &config.Config{}
+		}
 		yesNo := map[bool]string{true: sGreen.Render("да"), false: sRed.Render("нет")}
 		dns := c.CorpDNS
 		if dns == "" {
 			dns = "авто"
 		}
-		add(m.row(0, "Корп. DNS", sGray.Render(dns)))
-		add(m.row(1, "Корп. шлюз", sGray.Render(orDash(c.CorpGateway))))
-		add(m.row(2, "Остальной трафик", sCyan.Render(config.RestLabel(c.Rest, true))))
-		add(m.row(3, "Корп. домены через корп. DNS", yesNo[c.SplitDNS]))
+		adapters := fmt.Sprintf("%s / %s", orDash(c.Corp), orDash(c.Home))
+		rows := [advCount][2]string{
+			advAdapters: {"VPN-адаптеры", sGray.Render("корп. / дом.: " + adapters)},
+			advDNS:      {"Корп. DNS", sGray.Render(dns)},
+			advGateway:  {"Корп. шлюз", sGray.Render(orDash(c.CorpGateway))},
+			advRest:     {"Остальной трафик", sCyan.Render(config.RestLabel(c.Rest, true))},
+			advSplitDNS: {"Корп. домены через корп. DNS", yesNo[c.SplitDNS]},
+			advImport:   {"Импорт правил из файла…", sCyan.Render("↓")},
+			advExport:   {"Экспорт правил в файл…", sCyan.Render("↑")},
+			advReset:    {"Сбросить всё, что записано в журнал…", sYel.Render("●")},
+		}
+		for i, r := range rows {
+			add(m.row(i, fmt.Sprintf("%d) %s", i+1, r[0]), r[1]))
+		}
 		p.focus = m.cursor
-		p.tail = append([]string{""}, splitLines(panel(settingsTips, m.cursor, tw))...)
-		p.hint, p.hintSt = "enter — изменить · esc — назад", sDim
+		p.tail = append([]string{""}, splitLines(panel(advancedTips[:], m.cursor, tw))...)
+		p.hint, p.hintSt = "enter / цифра — выбрать · esc — назад", sDim
 	}
 	return p
 }

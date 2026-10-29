@@ -19,6 +19,7 @@ import (
 	"github.com/UniQlow17/vpnsplit/internal/config"
 	"github.com/UniQlow17/vpnsplit/internal/netif"
 	"github.com/UniQlow17/vpnsplit/internal/router"
+	"github.com/UniQlow17/vpnsplit/internal/termsize"
 )
 
 type screen int
@@ -30,9 +31,9 @@ const (
 	scConfirm
 	scPick
 	scRules
-	scSettings
+	scAdvanced
 	scHelp
-	scStatus
+	scDiag
 )
 
 type (
@@ -56,6 +57,13 @@ type (
 	}
 	// tookOver is the answer of the [t] key: the routes of apply/watch are the session's now.
 	tookOver struct{ err error }
+	// diffMsg is the full comparison with the state before the start (DNS entries
+	// included), made when the diagnostics screen is opened.
+	diffMsg struct {
+		b    router.Baseline
+		seq  int  // the request it answers; an answer to an older one is dropped
+		busy bool // an apply or reset was running when the reading began
+	}
 )
 
 type model struct {
@@ -74,13 +82,21 @@ type model struct {
 	delAsk      bool // rules: waiting for "delete this rule?" answer
 	scroll      int  // status screen
 	admin       bool
-	mgr         *router.Manager  // owns the journal; nil without administrator rights and in tests
-	readOnly    string           // why this copy may not change the network (no rights, or another copy owns it); "" if it may
-	lastSession string           // how the previous session ended (from a file), shown on the status screen
-	diff        *router.Baseline // live difference from the state before the start (status screen)
-	diags       []router.Diag    // findings about the environment, from the last refresh
-	auto        bool
-	autoWait    int
+	mgr         *router.Manager     // owns the journal; nil without administrator rights and in tests
+	readOnly    string              // why this copy may not change the network (no rights, or another copy owns it); "" if it may
+	lastSession string              // how the previous session ended (from a file), shown on the status screen
+	diff        *router.Baseline    // live difference from the state before the start (routes and rules only)
+	diffSeq     int                 // number of the last request for the full comparison
+	diffReading bool                // the request with number diffSeq is not answered yet
+	diffPartial bool                // the comparison was read while routes were being changed: it may be incomplete
+	fullDiff    *router.Baseline    // the same with the DNS entries, taken when the diagnostics screen is opened
+	diags       []router.Diag       // findings about the environment, from the last refresh
+	resize      bool                // tell the user to enlarge a window that is too small
+	refit       func(termsize.Size) // enlarges the window once more after the first status (nil: not at all)
+	refitted    bool                // the window was fitted for the filled-in menu already
+	small       bool                // resize is on and the window is smaller than the full menu needs: the footer asks to enlarge it
+	on          bool                // the split switch: ON applies and keeps the routes in sync (every 2 s), OFF removes them
+	autoWait    int                 // frame before which the sync does not try again
 	busy        string
 	quiet       bool
 	resTitle    string
@@ -263,6 +279,68 @@ func (m *model) startReset(quiet bool) tea.Cmd {
 	})
 }
 
+// startDisable removes what this session applied (the switch goes OFF): the same
+// removal as at the exit, DNS first, but the session, its lock and the snapshot
+// of the state before the start stay. Entries of apply/watch are not touched.
+func (m *model) startDisable(quiet bool) tea.Cmd {
+	if m.readOnly != "" || m.mgr == nil {
+		m.setFlash(m.notOwner())
+		return nil
+	}
+	m.busy, m.quiet = "Снимаю маршруты", quiet
+	if !quiet {
+		m.sc = scBusy
+	}
+	mgr := m.mgr
+	return opCmd("Разделение выключено", quiet, func(w io.Writer) error { return disableRun(mgr, w) })
+}
+
+// disableRun removes what the session applied and reports it to w.
+func disableRun(mgr *router.Manager, w io.Writer) error {
+	rep, errs := mgr.Disable()
+	fmt.Fprintf(w, "Снято записей: %d\n", rep.Total())
+	if n := rep.Notice(true); n != "" {
+		fmt.Fprintln(w, n)
+	}
+	for _, e := range errs {
+		fmt.Fprintln(w, "  !", e)
+	}
+	if len(errs) > 0 {
+		return fmt.Errorf("часть записей не снята: они остались в журнале, выход или повторное выключение доделает")
+	}
+	fmt.Fprintln(w, "Маршрутизация вернулась к исходной. Меню остаётся открытым: «Разделение: ВКЛ» применит правила снова.")
+	return nil
+}
+
+// toggleSplit is the switch "Разделение": ON applies and keeps in sync, OFF removes.
+func (m *model) toggleSplit() tea.Cmd {
+	switch {
+	case !m.admin:
+		m.setFlash("Разделение требует прав администратора: " + router.PrivHint)
+		return nil
+	case m.readOnly != "" || m.mgr == nil:
+		m.setFlash(m.notOwner())
+		return nil
+	case m.foreign():
+		m.setFlash("Есть маршруты от apply/watch: нажмите [t], чтобы забрать их в сессию, затем включайте и выключайте разделение")
+		return nil
+	case m.busy != "":
+		// a quiet automatic apply is running: a second operation would race it
+		// for the journal, and the switch would not know which one it flips
+		m.setFlash("Подождите, идёт синхронизация")
+		return nil
+	case m.cfg == nil:
+		m.setFlash("Конфиг повреждён: исправьте или удалите его (vpnsplit reset --purge)")
+		return nil
+	}
+	if m.on {
+		m.on = false
+		return m.startDisable(false)
+	}
+	m.on, m.autoWait = true, 0
+	return m.startApply(false)
+}
+
 // foreign reports whether the routes of apply/watch wait for the user to take them (the [t] key).
 func (m model) foreign() bool { return m.mgr != nil && m.mgr.Foreign() }
 
@@ -291,7 +369,7 @@ func (m *model) flashWarnings() {
 	}
 	text := "Внимание: " + m.warns[0]
 	if n := len(m.warns) - 1; n > 0 {
-		text += fmt.Sprintf(" (и ещё %d, см. «Статус»)", n)
+		text += fmt.Sprintf(" (и ещё %d, см. «Диагностику»)", n)
 	}
 	m.setFlash(text)
 }
@@ -321,24 +399,31 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.diff = msg.diff
 		m.diags = msg.diags
 		m.flashWarnings()
-		if m.auto && m.busy == "" && m.cfg != nil && m.admin && !m.foreign() && m.frame >= m.autoWait {
+		var fit tea.Cmd
+		if m.resize && !m.refitted && m.refit != nil {
+			// the first status adds lines (warnings, findings) the empty menu did not have
+			m.refitted = true
+			refit, want := m.refit, m.wantSize()
+			fit = func() tea.Msg { refit(want); return nil }
+		}
+		if m.on && m.busy == "" && m.cfg != nil && m.admin && !m.foreign() && m.frame >= m.autoWait {
 			if m.needApply {
 				m.autoWait = m.frame + 100
-				return m, m.startApply(true)
+				return m, tea.Batch(fit, m.startApply(true))
 			}
 			if m.needReset {
 				m.autoWait = m.frame + 100
-				return m, m.startReset(true)
+				return m, tea.Batch(fit, m.startReset(true))
 			}
 		}
-		return m, nil
+		return m, fit
 
 	case tookOver:
 		if msg.err != nil {
 			m.setFlash("Не удалось забрать маршруты: " + msg.err.Error())
 			return m, nil
 		}
-		m.auto, m.autoWait = true, 0
+		m.on, m.autoWait = true, 0
 		m.setFlash("Маршруты забраны в сессию: при выходе будут сняты")
 		m.refreshing = true
 		return m, refreshCmd()
@@ -347,9 +432,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.busy = ""
 		if msg.quiet {
 			if msg.err != nil {
-				m.setFlash("Авто-режим: " + msg.err.Error())
+				m.setFlash("Разделение: " + msg.err.Error())
 			} else {
-				m.setFlash("Авто-режим: маршруты синхронизированы")
+				m.setFlash("Разделение: маршруты синхронизированы")
 			}
 		} else {
 			m.sc, m.resTitle, m.resText, m.resErr, m.scroll = scResult, msg.title, msg.text, msg.err != nil, 0
@@ -364,6 +449,21 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.width, m.height = msg.Width, msg.Height
 		m.fitInput()
 		m.scroll = min(m.scroll, m.scrollMax())
+		if m.resize {
+			// the request stays in the footer for as long as the window is too small
+			m.small = !(termsize.Size{Cols: m.width, Rows: m.height}).Fits(m.wantSize())
+		}
+		return m, nil
+
+	case diffMsg:
+		if msg.seq != m.diffSeq {
+			return m, nil // an answer to a request [r] has replaced
+		}
+		b := msg.b
+		m.fullDiff, m.diffReading = &b, false
+		// Diff reads the system without the lock of the manager, so a change in
+		// progress (now or at the start of the reading) can show up as a difference
+		m.diffPartial = msg.busy || m.busy != ""
 		return m, nil
 
 	case clipMsg:
@@ -392,24 +492,24 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 func (m model) updateKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	k := msg.String()
 	n := m.listLen()
-	if m.sc == scMenu && len(k) == 1 && k[0] >= '0' && k[0] <= '9' {
-		// digits only move the cursor: 1..8 are items, 0 is exit
-		i := int(k[0]-'0') - 1
-		if k == "0" {
-			i = itemExit
-		}
-		if i >= 0 && i < len(menuItems) {
+	if (m.sc == scMenu || m.sc == scAdvanced) && len(k) == 1 && k[0] >= '1' && k[0] <= '9' {
+		// a digit starts the item with that number at once, without enter
+		if i := int(k[0]-'0') - 1; i < n {
 			m.cursor = i
+			return m.activate()
 		}
 		return m, nil
 	}
-	if m.sc == scStatus || m.sc == scHelp || m.sc == scResult {
+	if m.sc == scDiag || m.sc == scHelp || m.sc == scResult {
 		if m.scrollKey(k) {
 			return m, nil
 		}
-		if m.sc == scStatus {
-			if k == "esc" || k == "q" || k == "enter" {
-				m.sc, m.cursor = scMenu, itemStatus
+		if m.sc == scDiag {
+			switch k {
+			case "esc", "q", "enter":
+				m.sc, m.cursor = scMenu, itemDiag
+			case "r":
+				return m, m.diffCmd()
 			}
 			return m, nil
 		}
@@ -439,6 +539,8 @@ func (m model) updateKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		switch k {
 		case "q":
 			return m, tea.Quit
+		case "?":
+			m.sc, m.scroll = scHelp, 0
 		case "t":
 			if !m.foreign() {
 				return m, nil
@@ -446,64 +548,26 @@ func (m model) updateKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			mgr := m.mgr
 			return m, func() tea.Msg { return tookOver{err: mgr.TakeOver()} }
 		case "enter", " ":
-			switch m.cursor {
-			case itemApply:
-				return m, m.startApply(false)
-			case itemReset:
-				m.sc = scConfirm
-			case itemAdapters:
-				if m.cfg == nil {
-					m.setFlash("Конфиг повреждён: исправьте или удалите его (vpnsplit reset --purge)")
-					return m, nil
-				}
-				m.ifs, m.pickStep, m.cursor, m.sc = vpnAdapters(), 0, 0, scPick
-			case itemRules, itemSettings:
-				if m.cfg == nil {
-					m.setFlash("Конфиг повреждён: исправьте или удалите его (vpnsplit reset --purge)")
-					return m, nil
-				}
-				m.sc = scRules
-				if m.cursor == itemSettings {
-					m.sc = scSettings
-				}
-				m.cursor = 0
-			case itemAuto:
-				if !m.admin {
-					m.setFlash("Авто-режим требует прав администратора: " + router.PrivHint)
-					return m, nil
-				}
-				if m.readOnly != "" {
-					m.setFlash(m.readOnly)
-					return m, nil
-				}
-				m.auto = !m.auto
-				m.autoWait = 0
-			case itemStatus:
-				m.sc, m.scroll = scStatus, 0
-			case itemHelp:
-				m.sc, m.scroll = scHelp, 0
-			case itemExit:
-				return m, tea.Quit
-			}
+			return m.activate()
 		}
 	case scHelp:
-		m.sc, m.cursor = scMenu, itemHelp
+		m.sc, m.cursor = scMenu, itemSplit
 	case scResult:
 		m.sc, m.cursor = scMenu, 0
 	case scBusy:
 	case scConfirm:
 		switch k {
 		case "y", "Y", "enter":
-			m.auto = false
-			m.setFlash("Авто-режим выключен, чтобы не вернуть маршруты")
+			m.on = false
+			m.setFlash("Разделение выключено, чтобы оно не вернуло маршруты")
 			return m, m.startReset(false)
 		default:
-			m.sc = scMenu
+			m.sc, m.cursor = scAdvanced, advReset
 		}
 	case scPick:
 		switch k {
 		case "esc":
-			m.sc, m.cursor = scMenu, itemAdapters
+			m.sc, m.cursor = scAdvanced, advAdapters
 		case "enter":
 			switch {
 			case m.cursor == 0:
@@ -516,7 +580,7 @@ func (m model) updateKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			}
 		}
 	case scRules:
-		// rows: the actions (add corp, add direct and add home where they matter, import, export), then the rules
+		// rows: the actions (add corp, and add direct and add home where they matter), then the rules
 		acts := m.ruleActions()
 		on := func() string {
 			if (k == "enter" || k == " ") && m.cursor < len(acts) {
@@ -536,39 +600,102 @@ func (m model) updateKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		case (k == "h" || on == "home") && m.hasKind(config.DestHome):
 			m.beginInput("home", "", "Через домашний VPN — сеть / IP / домен / AS: ")
 			return m, textinput.Blink
-		case on == "import":
-			m.beginInput("import", "~/Downloads/", "Файл со списком правил: ")
-			return m, textinput.Blink
-		case on == "export":
-			m.beginInput("export", "~/Desktop/vpnsplit-rules.txt", "Сохранить правила в файл: ")
-			return m, textinput.Blink
 		case k == "enter" || k == " " || k == "d" || k == "delete" || k == "backspace":
 			if m.cursor >= len(acts) {
 				m.delAsk = true
 			}
 		}
-	case scSettings:
+	case scAdvanced:
 		switch k {
 		case "esc":
-			m.sc, m.cursor = scMenu, itemSettings
+			m.sc, m.cursor = scMenu, itemAdvanced
 		case "enter", " ":
-			switch m.cursor {
-			case 0:
-				m.beginInput("dns", m.cfg.CorpDNS, "Корп. DNS (пусто = автоматически): ")
-				return m, textinput.Blink
-			case 1:
-				m.beginInput("gw", m.cfg.CorpGateway, "Корп. шлюз (пусто = on-link): ")
-				return m, textinput.Blink
-			case 2:
-				m.cfg.Rest = nextRest(m.cfg.Rest)
-				m.save()
-			case 3:
-				m.cfg.SplitDNS = !m.cfg.SplitDNS
-				m.save()
-			}
+			return m.activate()
 		}
 	}
 	return m, nil
+}
+
+// activate starts the item under the cursor: of the main menu, or a row of the
+// screen "Дополнительно".
+func (m model) activate() (tea.Model, tea.Cmd) {
+	if m.sc == scAdvanced {
+		return m.activateAdvanced()
+	}
+	switch m.cursor {
+	case itemSplit:
+		cmd := m.toggleSplit()
+		return m, cmd
+	case itemRules:
+		if m.cfg == nil {
+			m.setFlash(brokenConfig)
+			return m, nil
+		}
+		m.sc, m.cursor = scRules, 0
+	case itemDiag:
+		m.sc, m.scroll = scDiag, 0
+		return m, m.diffCmd()
+	case itemAdvanced:
+		m.sc, m.cursor = scAdvanced, 0
+	}
+	return m, nil
+}
+
+const brokenConfig = "Конфиг повреждён: исправьте или удалите его (vpnsplit reset --purge)"
+
+// activateAdvanced starts the row under the cursor on the screen "Дополнительно".
+func (m model) activateAdvanced() (tea.Model, tea.Cmd) {
+	if m.cursor != advReset && m.cfg == nil {
+		m.setFlash(brokenConfig)
+		return m, nil
+	}
+	switch m.cursor {
+	case advAdapters:
+		m.ifs, m.pickStep, m.cursor, m.sc = vpnAdapters(), 0, 0, scPick
+	case advDNS:
+		m.beginInput("dns", m.cfg.CorpDNS, "Корп. DNS (пусто = автоматически): ")
+		return m, textinput.Blink
+	case advGateway:
+		m.beginInput("gw", m.cfg.CorpGateway, "Корп. шлюз (пусто = on-link): ")
+		return m, textinput.Blink
+	case advRest:
+		m.cfg.Rest = nextRest(m.cfg.Rest)
+		m.save()
+	case advSplitDNS:
+		m.cfg.SplitDNS = !m.cfg.SplitDNS
+		m.save()
+	case advImport:
+		m.beginInput("import", "~/Downloads/", "Файл со списком правил: ")
+		return m, textinput.Blink
+	case advExport:
+		m.beginInput("export", "~/Desktop/vpnsplit-rules.txt", "Сохранить правила в файл: ")
+		return m, textinput.Blink
+	case advReset:
+		if m.readOnly != "" || m.mgr == nil {
+			m.setFlash(m.notOwner())
+			return m, nil
+		}
+		m.sc = scConfirm
+	}
+	return m, nil
+}
+
+// diffCmd compares the system with the state before the start, DNS entries
+// included (that can take a while, so it runs when the diagnostics are opened or
+// refreshed with [r], not on every refresh). Without rights there is nothing to read.
+func (m *model) diffCmd() tea.Cmd {
+	if !m.admin {
+		return nil
+	}
+	m.diffSeq++
+	m.fullDiff, m.diffReading, m.diffPartial = nil, true, false
+	seq, busy := m.diffSeq, m.busy != ""
+	return func() tea.Msg { return diffMsg{b: router.Diff(context.Background(), true), seq: seq, busy: busy} }
+}
+
+// resizeAsk is the request to enlarge a window that is too small.
+func resizeAsk(want termsize.Size) string {
+	return "Окно меньше нужного: увеличьте его до " + want.String() + " (столбцов × строк), чтобы видеть всё меню"
 }
 
 // ruleAction is a row of actions on the rules screen.
@@ -580,7 +707,7 @@ func (m model) hasKind(kind string) bool {
 }
 
 // ruleActions are the action rows before the rules: add for each kind that
-// matters with the setting "rest of the traffic", then import and export.
+// matters with the setting "rest of the traffic".
 func (m model) ruleActions() []ruleAction {
 	acts := []ruleAction{{"rule"}}
 	if m.hasKind(config.DestDirect) {
@@ -589,7 +716,7 @@ func (m model) ruleActions() []ruleAction {
 	if m.hasKind(config.DestHome) {
 		acts = append(acts, ruleAction{"home"})
 	}
-	return append(acts, ruleAction{"import"}, ruleAction{"export"})
+	return acts
 }
 
 // ruleRows is how many action rows come before the rules on the rules screen.
@@ -630,7 +757,7 @@ func (m *model) scrollKey(k string) bool {
 	case "pgdown":
 		m.scroll += page
 	case " ":
-		if m.sc != scStatus {
+		if m.sc != scDiag {
 			return false
 		}
 		m.scroll += page
@@ -694,13 +821,19 @@ func (m model) statusLines() []string {
 		line("  %s", sGray.Render(fmt.Sprintf("Ещё %d правил не действуют при этом режиме «Остального трафика» и скрыты", n)))
 	}
 	line("  Остальной трафик: %s", config.RestLabel(c.Rest, true))
-	if lvl, _ := router.V6Status(c, m.env); lvl == router.V6Leaks {
-		line("  %s", sRed.Render(v6LeakText(m.env)))
-	} else if lvl == router.V6Info {
-		line("  %s", v6InfoText(m.env))
-	}
 	line("  Корп. домены через корп. DNS: %s", map[bool]string{true: "да", false: "нет"}[c.SplitDNS])
 	m.diagLines(&out, h)
+
+	out = append(out, "")
+	h("IPv6")
+	switch lvl, _ := router.V6Status(c, m.env); lvl {
+	case router.V6Leaks:
+		line("  %s", sRed.Render(v6LeakText(m.env)))
+	case router.V6Info:
+		line("  %s", v6InfoText(m.env))
+	default:
+		line("  %s", sGray.Render("внимания не требует"))
+	}
 
 	out = append(out, "")
 	st := m.st
@@ -717,7 +850,7 @@ func (m model) statusLines() []string {
 	default:
 		h(fmt.Sprintf("Применено сейчас: %d маршрутов, %d DNS-записей", len(st.Routes), len(st.Resolvers)))
 		if st.Empty() {
-			line("  %s", sYel.Render("ничего — нажмите «Применить маршруты» или включите авто-режим"))
+			line("  %s", sYel.Render("ничего — включите «Разделение»"))
 		}
 	}
 	for _, g := range []struct{ via, title string }{
@@ -750,18 +883,24 @@ func (m model) statusLines() []string {
 	if m.needApply && !st.Empty() {
 		out = append(out, "", sYel.Render("VPN или правила изменились после применения — нужно применить заново"))
 	}
-	if m.diff != nil {
+	if d := m.shownDiff(); d != nil {
 		out = append(out, "")
-		h("Отличия от состояния до запуска")
-		if m.diff.Checked {
-			line("  %s", m.diff.Describe(true))
-			if !m.diff.Restored() {
-				for _, l := range m.diff.Lines(true) {
+		h("Отличия от состояния до запуска (как `vpnsplit diff`)")
+		if m.diffReading {
+			line("  %s", sGray.Render("читаю…"))
+		}
+		if m.diffPartial {
+			line("  %s", sYel.Render("Список может быть неполным: во время чтения шло применение"))
+		}
+		if d.Checked {
+			line("  %s", d.Describe(true))
+			if !d.Restored() {
+				for _, l := range d.Lines(true) {
 					line("    %s", sGray.Render(l))
 				}
 			}
 		} else {
-			line("  %s", sGray.Render(m.diff.Lines(true)[0]))
+			line("  %s", sGray.Render(d.Lines(true)[0]))
 		}
 	}
 	if m.lastSession != "" {
@@ -825,10 +964,10 @@ func selector(i netif.Info) string {
 
 // applyHint tells where a rule change takes effect.
 func (m model) applyHint() string {
-	if m.auto {
-		return " (авто-режим применит сам)"
+	if m.on {
+		return " (разделение включено, применится само)"
 	}
-	return " (нажмите «Применить»)"
+	return " (вступит в силу после «Разделение: ВКЛ»)"
 }
 
 func (m *model) choose(name string) {
@@ -846,7 +985,7 @@ func (m *model) choose(name string) {
 	}
 	m.cfg.Home = name
 	m.save()
-	m.sc, m.cursor = scMenu, 0
+	m.sc, m.cursor = scAdvanced, advAdapters
 	m.setFlash("VPN сохранены")
 }
 
@@ -1027,8 +1166,8 @@ func (m model) listLen() int {
 		return len(m.ifs) + 2 // auto + adapters + manual
 	case scRules:
 		return len(m.ruleItems()) + m.ruleRows()
-	case scSettings:
-		return 4
+	case scAdvanced:
+		return advCount
 	}
 	return 0
 }
@@ -1106,12 +1245,14 @@ func v6InfoText(e router.Env) string {
 }
 
 // diagLines adds the section of the findings about the environment to the
-// status screen: the level and code of each, what it is, and what to do.
+// diagnostics screen: the level and code of each, what it is, and what to do.
 func (m model) diagLines(out *[]string, h func(string)) {
+	*out = append(*out, "")
 	if len(m.diags) == 0 {
+		h("Окружение")
+		*out = append(*out, "  "+sGray.Render("замечаний нет"))
 		return
 	}
-	*out = append(*out, "")
 	h("Окружение: " + router.DiagSummary(m.diags, true))
 	for _, d := range m.diags {
 		tag := map[router.DiagLevel]lipgloss.Style{router.DiagDanger: sRed, router.DiagWarn: sYel, router.DiagInfo: sGray}[d.Level]
@@ -1146,5 +1287,15 @@ func (m model) diagIndicator() string {
 	case router.DiagWarn:
 		st = sYel
 	}
-	return st.Render("окружение: " + router.DiagSummary(m.diags, true) + " (см. Статус)")
+	return st.Render("окружение: " + router.DiagSummary(m.diags, true) + " (см. Диагностику)")
+}
+
+// shownDiff is the comparison with the state before the start that the
+// diagnostics show: the full one (DNS entries included) once it was read, the
+// live one (routes and rules) before that.
+func (m model) shownDiff() *router.Baseline {
+	if m.fullDiff != nil {
+		return m.fullDiff
+	}
+	return m.diff
 }

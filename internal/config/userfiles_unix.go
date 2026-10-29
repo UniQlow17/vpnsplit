@@ -7,15 +7,16 @@ import (
 	"syscall"
 )
 
-// trustedOwner: the object belongs to root and nobody but the owner can write it.
-func trustedOwner(fi os.FileInfo, _ string) bool {
+// trustedOwner: the object belongs to root, nobody but the owner can write it
+// and (macOS) no extended access list gives anybody else a right to it.
+func trustedOwner(fi os.FileInfo, path string) bool {
 	st, ok := fi.Sys().(*syscall.Stat_t)
-	return ok && st.Uid == 0 && fi.Mode().Perm()&0o022 == 0
+	return ok && st.Uid == 0 && fi.Mode().Perm()&0o022 == 0 && noExtendedACL(path)
 }
 
 // machineFileOK judges the open file by its descriptor: root's, and not
 // writable by group or others.
-func machineFileOK(_ *os.File, fi os.FileInfo) bool { return trustedOwner(fi, "") }
+func machineFileOK(f *os.File, fi os.FileInfo) bool { return trustedOwner(fi, f.Name()) }
 
 // strictDir: on Unix trustedOwner already looks at the rights of the directory.
 func strictDir(string) bool { return true }

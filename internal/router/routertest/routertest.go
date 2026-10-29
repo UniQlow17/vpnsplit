@@ -176,3 +176,9 @@ func Count(log []string, prefix string) int {
 	}
 	return n
 }
+
+// Second is another Manager on the same fake system and the same lock: another
+// copy of the program.
+func (r *Rig) Second() *router.Manager {
+	return router.NewManagerFor(backend{r}, store{r}, procs{r}, r.lock)
+}

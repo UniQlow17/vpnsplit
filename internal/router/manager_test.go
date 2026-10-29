@@ -377,3 +377,95 @@ func TestResetEmptyJournalDropsHeaderOnly(t *testing.T) {
 		t.Errorf("the header of nothing must go: %+v", st)
 	}
 }
+
+// Disable removes what the session applied (DNS first) and the session goes on:
+// the lock stays, and it can apply again and be ended by Cleanup as usual.
+func TestDisableRemovesSessionEntriesAndKeepsTheSession(t *testing.T) {
+	r := newRig(nil)
+	s, _ := acquire(t, r, config.ModeSession)
+	if err := r.m.save(&config.State{Routes: homeRoutes(), Resolvers: []string{testResolver("corp.example")}, Sig: "x"}); err != nil {
+		t.Fatal(err)
+	}
+	rep, errs := s.Disable()
+	if len(errs) != 0 || rep.Routes != 2 || rep.Resolvers != 1 {
+		t.Fatalf("%+v %v", rep, errs)
+	}
+	if !before(r.b.calls(), "dns ", "route ") {
+		t.Errorf("order %v", r.b.calls())
+	}
+	if st := r.store.state(); !st.Empty() {
+		t.Errorf("%+v", st)
+	}
+	if !r.lock.held {
+		t.Error("the lock must stay")
+	}
+	// ON again: the session writes the journal with its own header
+	if err := r.m.save(&config.State{Routes: homeRoutes()[:1], Sig: "y"}); err != nil {
+		t.Fatalf("a session that was switched off must be able to apply again: %v", err)
+	}
+	if st := r.store.state(); st.Owner == nil || st.Mode != config.ModeSession || len(st.Routes) != 1 {
+		t.Errorf("%+v", st)
+	}
+	rep, err := s.Cleanup(time.Second)
+	if err != nil || rep.Routes != 1 {
+		t.Errorf("%+v %v", rep, err)
+	}
+	if r.lock.held {
+		t.Error("lock not released")
+	}
+}
+
+// Switched off, the end of the session has nothing left to remove.
+func TestDisableThenCleanupHasNothingToRemove(t *testing.T) {
+	r := newRig(nil)
+	s, _ := acquire(t, r, config.ModeSession)
+	if err := r.m.save(&config.State{Routes: homeRoutes(), Sig: "x"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, errs := s.Disable(); len(errs) != 0 {
+		t.Fatal(errs)
+	}
+	before := len(r.b.calls())
+	rep, err := s.Cleanup(time.Second)
+	if err != nil || rep.Total() != 0 || len(r.b.calls()) != before {
+		t.Errorf("%+v %v %v", rep, err, r.b.calls())
+	}
+}
+
+// Entries of apply/watch that wait for TakeOver are not the session's: Disable leaves them.
+func TestDisableLeavesPersistentEntriesAlone(t *testing.T) {
+	r := newRig(sessionJournal(4242, config.ModePersistent))
+	s, info := acquire(t, r, ModeSessionAsk)
+	if !info.Foreign {
+		t.Fatalf("%+v", info)
+	}
+	rep, errs := s.Disable()
+	if len(errs) != 0 || rep.Total() != 0 || len(r.b.calls()) != 0 {
+		t.Errorf("%+v %v %v", rep, errs, r.b.calls())
+	}
+	if st := r.store.state(); len(st.Routes) != 3 {
+		t.Errorf("%+v", st)
+	}
+}
+
+// A session that has not been started cannot disable anything.
+func TestDisableWithoutOwnership(t *testing.T) {
+	r := newRig(nil)
+	if _, errs := r.m.Disable(); len(errs) == 0 {
+		t.Error("Disable without Acquire must fail")
+	}
+}
+
+// Settle also drops the header of a run that has nothing applied.
+func TestSettleDropsEmptyHeader(t *testing.T) {
+	r := newRig(nil)
+	r.m.NoSnapshot()
+	s, _ := acquire(t, r, config.ModePersistent)
+	if st := r.store.state(); st.Owner == nil {
+		t.Fatalf("setup: %+v", st)
+	}
+	s.Settle(time.Now().Add(time.Second))
+	if st := r.store.state(); st.Owner != nil || !st.Empty() {
+		t.Errorf("%+v", st)
+	}
+}

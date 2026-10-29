@@ -12,6 +12,7 @@ import (
 
 	"github.com/charmbracelet/bubbles/spinner"
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/x/ansi"
 
 	"github.com/UniQlow17/vpnsplit/internal/config"
 	"github.com/UniQlow17/vpnsplit/internal/lifecycle"
@@ -323,7 +324,7 @@ func TestForeignRoutesNoticeAndQuitLeavesThem(t *testing.T) {
 
 func TestForeignAutoModeWaits(t *testing.T) {
 	m, r, _ := foreignModel(t)
-	m.auto = true
+	m.on = true
 	next, cmd := m.Update(statusMsg{cfg: config.New(), st: &config.State{}, apply: true})
 	if cmd != nil || len(r.Calls()) != 0 || next.(model).busy != "" {
 		t.Errorf("auto mode must not touch the routes of apply/watch before the confirmation: cmd %v", cmd)
@@ -343,8 +344,8 @@ func TestForeignTakeOverThenQuitRemoves(t *testing.T) {
 	}
 	next, _ = next.(model).Update(msg)
 	m = next.(model)
-	if m.foreign() || !m.auto {
-		t.Errorf("foreign %v auto %v", m.foreign(), m.auto)
+	if m.foreign() || !m.on {
+		t.Errorf("foreign %v auto %v", m.foreign(), m.on)
 	}
 	if v := m.View(); strings.Contains(v, "Забрать в сессию") {
 		t.Errorf("the notice must go:\n%s", v)
@@ -436,5 +437,134 @@ func TestStatusScreenShowsDifferencesFromTheStateBeforeTheStart(t *testing.T) {
 	m.diff = nil // no rights: the block is not shown at all
 	if v := strings.Join(m.statusLines(), "\n"); strings.Contains(v, "Отличия от состояния до запуска") {
 		t.Errorf("%s", v)
+	}
+}
+
+// Switching the split off removes what the session applied, DNS first, and the
+// session goes on; quitting afterwards has nothing left to remove and ends it.
+func TestSplitOffRemovesEntriesAndKeepsSession(t *testing.T) {
+	r := routertest.New(routertest.Journal(config.ModePersistent))
+	sess, info, err := r.M.Acquire(t.Context(), config.ModeSession, &bytes.Buffer{})
+	if err != nil || !info.TookOver {
+		t.Fatalf("%+v %v", info, err)
+	}
+	var out bytes.Buffer
+	if err := disableRun(r.M, &out); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.String(), "Снято записей: 4") {
+		t.Errorf("%s", out.String())
+	}
+	if st := r.State(); !st.Empty() {
+		t.Errorf("%+v", st)
+	}
+	if !r.Held() {
+		t.Error("the lock must stay while the menu is open")
+	}
+	n := len(r.Calls())
+	if err := finish(sess, finishInfo{deadline: time.Now().Add(time.Second)}, nil, &bytes.Buffer{}, &bytes.Buffer{}); err != nil {
+		t.Fatal(err)
+	}
+	if len(r.Calls()) != n || r.Held() {
+		t.Errorf("the exit after OFF must remove nothing more and release the lock: %v", r.Calls()[n:])
+	}
+}
+
+// The switch is for the owner of the journal only, and never touches the routes
+// of apply/watch before [t].
+func TestSplitSwitchRefusals(t *testing.T) {
+	m := testModel()
+	if cmd := m.toggleSplit(); cmd != nil || m.on || m.flash == "" {
+		t.Errorf("without rights: on=%v flash=%q", m.on, m.flash)
+	}
+	m = testModel()
+	m.admin, m.readOnly = true, "Другая копия vpnsplit уже управляет маршрутами"
+	if cmd := m.toggleSplit(); cmd != nil || m.on || m.flash != m.readOnly {
+		t.Errorf("second copy: on=%v flash=%q", m.on, m.flash)
+	}
+	f, _, _ := foreignModel(t)
+	f.cfg = config.New()
+	if cmd := f.toggleSplit(); cmd != nil || f.on || !strings.Contains(f.flash, "[t]") {
+		t.Errorf("apply/watch routes: on=%v flash=%q", f.on, f.flash)
+	}
+	if rows := plain(f.statusRows()); !strings.Contains(rows, "Разделение ВЫКЛ") {
+		t.Errorf("%q", rows)
+	}
+}
+
+// The state of the switch is in the status line and in the menu.
+func TestSplitStateIsVisible(t *testing.T) {
+	m := testModel()
+	if r := plain(m.statusRows()); !strings.Contains(r, "Разделение ВЫКЛ") {
+		t.Errorf("%q", r)
+	}
+	if v := ansi.Strip(m.View()); !strings.Contains(v, "Разделение: ВЫКЛ") {
+		t.Errorf("%s", v)
+	}
+	m.on, m.routes = true, 3
+	if r := plain(m.statusRows()); !strings.Contains(r, "Разделение ВКЛ") || !strings.Contains(r, "активно") {
+		t.Errorf("%q", r)
+	}
+	if v := ansi.Strip(m.View()); !strings.Contains(v, "Разделение: ВКЛ") {
+		t.Errorf("%s", v)
+	}
+}
+
+// A window smaller than the full menu gets the request in the footer for as
+// long as it is small; a big one, or resize switched off, gets none.
+func TestSmallWindowIsAskedToGrow(t *testing.T) {
+	m := testModel()
+	m.resize = true
+	next, _ := m.Update(tea.WindowSizeMsg{Width: 60, Height: 14})
+	m = next.(model)
+	if !m.small {
+		t.Fatal("a 60x14 window is smaller than the menu")
+	}
+	want := m.wantSize()
+	if v := ansi.Strip(m.View()); !strings.Contains(v, "увеличьте") || !strings.Contains(v, want.String()) {
+		t.Errorf("no request for %s:\n%s", want, v)
+	}
+	next, _ = m.Update(tea.WindowSizeMsg{Width: 61, Height: 14})
+	if !next.(model).small {
+		t.Error("the request goes away while the window is still small")
+	}
+	next, _ = next.(model).Update(tea.WindowSizeMsg{Width: want.Cols, Height: want.Rows})
+	big := next.(model)
+	if big.small || strings.Contains(ansi.Strip(big.View()), "увеличьте") {
+		t.Error("a big enough window must not be asked")
+	}
+	off := testModel()
+	next, _ = off.Update(tea.WindowSizeMsg{Width: 40, Height: 10})
+	if next.(model).small || strings.Contains(ansi.Strip(next.(model).View()), "увеличьте") {
+		t.Error("no request with resize off")
+	}
+}
+
+// The screen "Дополнительно" holds the rare settings and the full reset; digits start rows.
+func TestAdvancedScreenRows(t *testing.T) {
+	m := testModel()
+	m.sc = scAdvanced
+	v := ansi.Strip(m.View())
+	for _, w := range []string{"VPN-адаптеры", "Корп. DNS", "Корп. шлюз", "Остальной трафик", "Корп. домены через корп. DNS", "Импорт правил", "Экспорт правил", "Сбросить всё"} {
+		if !strings.Contains(v, w) {
+			t.Errorf("no %q:\n%s", w, v)
+		}
+	}
+	got, _ := m.updateKeys(keyMsg("2"))
+	if mm := got.(model); !mm.inputting || mm.purpose != "dns" {
+		t.Errorf("digit 2: %+v", mm.purpose)
+	}
+	got, _ = m.updateKeys(keyMsg("6"))
+	if mm := got.(model); !mm.inputting || mm.purpose != "import" {
+		t.Errorf("digit 6: %+v", mm.purpose)
+	}
+	before := m.cfg.SplitDNS
+	got, _ = m.updateKeys(keyMsg("5"))
+	if mm := got.(model); mm.cfg.SplitDNS == before {
+		t.Error("digit 5 must toggle split-dns")
+	}
+	got, _ = m.updateKeys(keyMsg("esc"))
+	if mm := got.(model); mm.sc != scMenu || mm.cursor != itemAdvanced {
+		t.Errorf("esc: sc %d cursor %d", mm.sc, mm.cursor)
 	}
 }
