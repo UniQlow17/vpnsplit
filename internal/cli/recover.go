@@ -56,7 +56,14 @@ func recoverWith(ctx context.Context, mgr *router.Manager, out io.Writer) (err e
 			fmt.Fprintln(out, s)
 		}
 	}
-	st, status := sess.Journal()
+	st, status, jerr := sess.Journal()
+	if jerr != nil {
+		fmt.Fprintln(out, "the journal is busy, its state is not shown; run `vpnsplit recover` again to check")
+		if failed > 0 {
+			return fmt.Errorf("%d entries of the earlier run could not be removed", failed)
+		}
+		return jerr
+	}
 	if r := info.Recovered; r.Total()+r.Forgotten == 0 && failed == 0 && status == config.JournalOK && st.Empty() {
 		fmt.Fprintln(out, "nothing to recover: no earlier run left routes or DNS entries")
 	}

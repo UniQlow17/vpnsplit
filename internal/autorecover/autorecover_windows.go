@@ -43,6 +43,16 @@ Register-ScheduledTask -TaskPath '\' -TaskName $env:VS_TASK -Action $action -Tri
 'installed'
 `
 
+// checkScript changes nothing: it says whether the name is free ("free"), taken
+// by a task of ours ("ours") or by something else ("foreign"). Install asks it
+// before a copy of the program is made.
+const checkScript = `$ErrorActionPreference = 'Stop'
+` + ourTask + `$t = @(Get-ScheduledTask -TaskPath '\' -TaskName $env:VS_TASK -ErrorAction SilentlyContinue)
+if ($t.Count -eq 0) { 'free'; exit 0 }
+if ($t.Count -gt 1 -or -not (Test-Ours $t[0])) { 'foreign'; exit 0 }
+'ours'
+`
+
 // removeScript deletes the task if it is ours.
 const removeScript = `$ErrorActionPreference = 'Stop'
 ` + ourTask + `$t = @(Get-ScheduledTask -TaskPath '\' -TaskName $env:VS_TASK -ErrorAction SilentlyContinue)
@@ -61,11 +71,19 @@ func taskEnv(exe string) map[string]string {
 // the start of the computer as SYSTEM. The task starts a copy of exe made in
 // %ProgramFiles%\vpnsplit (see program.go). The caller must be an administrator.
 func Install(exe string, out io.Writer) error {
+	// somebody else's task: refuse before a copy of the program is made
+	o, err := sysexec.PowerShell(checkScript, taskEnv(exe)).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("look for the task %s: %w: %s", TaskName, err, trim(o))
+	}
+	if strings.Contains(string(o), "foreign") {
+		return fmt.Errorf("the task %s: %w", TaskName, ErrNotOurs)
+	}
 	full, err := installProgram(exe, out)
 	if err != nil {
 		return err
 	}
-	o, err := sysexec.PowerShell(installScript, taskEnv(full)).CombinedOutput()
+	o, err = sysexec.PowerShell(installScript, taskEnv(full)).CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("register the task %s: %w: %s", TaskName, err, trim(o))
 	}

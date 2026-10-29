@@ -9,7 +9,7 @@ import (
 
 // The scripts are constants: the path never reaches their text, only the environment.
 func TestScriptsTakeDataFromTheEnvironment(t *testing.T) {
-	for name, s := range map[string]string{"install": installScript, "remove": removeScript} {
+	for name, s := range map[string]string{"install": installScript, "remove": removeScript, "check": checkScript} {
 		if !strings.Contains(s, "$env:VS_TASK") || !strings.Contains(s, "$env:VS_MARK") {
 			t.Errorf("%s: the name and the mark must come from the environment", name)
 		}
@@ -23,7 +23,7 @@ func TestScriptsTakeDataFromTheEnvironment(t *testing.T) {
 	if strings.Contains(installScript, `C:\`) {
 		t.Error("a path in the script")
 	}
-	for name, s := range map[string]string{"install": installScript, "remove": removeScript} {
+	for name, s := range map[string]string{"install": installScript, "remove": removeScript, "check": checkScript} {
 		if !strings.Contains(s, `-TaskPath '\'`) || !strings.Contains(s, "Count") || !strings.Contains(s, "S-1-5-18") || !strings.Contains(s, "Test-Ours") {
 			t.Errorf("%s: the task must be looked up in the root folder, once, as SYSTEM, with the mark", name)
 		}

@@ -107,10 +107,18 @@ func consoleFit(want Size, out *os.File) (func(), bool) {
 		windows.CloseHandle(h)
 		return nil, false
 	}
+	// the handle is not kept: a restore that is dropped (the second fit of the
+	// window, see tui.windowRestore) would leak it; restore opens its own
+	windows.CloseHandle(h)
 	return func() {
+		h, err := windows.CreateFile(name, windows.GENERIC_READ|windows.GENERIC_WRITE,
+			windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE, nil, windows.OPEN_EXISTING, 0, 0)
+		if err != nil {
+			return
+		}
+		defer windows.CloseHandle(h)
 		// the other way round: the window first, then the buffer
 		_ = setWindow(h, savedWin)
 		_ = setBufferSize(h, savedBuf)
-		windows.CloseHandle(h)
 	}, true
 }

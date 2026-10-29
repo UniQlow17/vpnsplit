@@ -974,13 +974,18 @@ func (m *Manager) cleanupLocked(ctx context.Context, progress func(done, total i
 //
 // It is read under the semaphore of the operations, so it never shows the
 // middle of an Apply. If an operation does not end within a few seconds (or
-// the cleanup gave up and keeps the semaphore) it is read without, as before.
-func (s *Session) Journal() (*config.State, config.JournalStatus) {
+// the cleanup gave up and keeps the semaphore) it returns ErrJournalBusy and
+// reads nothing: a read without the semaphore could show half of an operation.
+func (s *Session) Journal() (*config.State, config.JournalStatus, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), journalWait)
 	defer cancel()
-	if err := s.m.lockSem(ctx); err == nil {
-		defer s.m.unlockSem()
+	if err := s.m.lockSem(ctx); err != nil {
+		return nil, config.JournalOK, fmt.Errorf("%w: %v", ErrJournalBusy, err)
 	}
+	defer s.m.unlockSem()
 	st, _, status := s.m.store.Load()
-	return st, status
+	return st, status, nil
 }
+
+// ErrJournalBusy: an operation holds the journal and did not end in time.
+var ErrJournalBusy = errors.New("the journal is busy: an operation is still running")

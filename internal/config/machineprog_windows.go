@@ -93,11 +93,28 @@ func verifyFinalPath(full string) error {
 	if err != nil || int(n) > len(buf) {
 		return fmt.Errorf("final path of %s: %v", full, err)
 	}
-	final := strings.TrimPrefix(windows.UTF16ToString(buf[:n]), `\?\`)
+	final, err := dosFinalPath(windows.UTF16ToString(buf[:n]))
+	if err != nil {
+		return fmt.Errorf("final path of %s: %w", full, err)
+	}
 	if !strings.EqualFold(final, full) {
 		return fmt.Errorf("%s leads to %s: refusing a path through a link", full, final)
 	}
 	return nil
+}
+
+// dosFinalPath turns what GetFinalPathNameByHandle returns (`\\?\C:\dir`) into
+// the plain path (`C:\dir`). A network share (`\\?\UNC\...`) is refused.
+func dosFinalPath(p string) (string, error) {
+	const prefix = `\\?\`
+	if !strings.HasPrefix(p, prefix) {
+		return p, nil
+	}
+	rest := p[len(prefix):]
+	if len(rest) >= 4 && strings.EqualFold(rest[:4], `UNC\`) {
+		return "", errors.New("the file is on a network share")
+	}
+	return rest, nil
 }
 
 // VOLUME_NAME_DOS of GetFinalPathNameByHandle.
