@@ -7,11 +7,15 @@ package router
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"hash/fnv"
 	"io"
 	"net"
+	"net/netip"
+	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/UniQlow17/vpnsplit/internal/config"
@@ -26,6 +30,46 @@ const (
 	ViaDirect = "direct"
 )
 
+// errExists is returned by addRoute when the route is already in the table
+// (a VPN client or the OS set it up). It is detected without reading
+// localized command output where the OS allows it.
+var errExists = errors.New("route already exists")
+
+// errNotOurs is returned by DelRoute for a route that is in the table but does
+// not look like the one the journal describes (somebody else's route to the
+// same place). It stays; the entry is dropped from the journal and the report
+// says so (Report.Left). Callers that only want the route gone ignore it.
+var errNotOurs = errors.New("not ours")
+
+// ignoreNotOurs: for callers that only want the route gone, a route that is not
+// ours is not theirs to remove, and that is all right.
+func ignoreNotOurs(err error) error {
+	if errors.Is(err, errNotOurs) {
+		return nil
+	}
+	return err
+}
+
+// errResolverExists is returned by addResolver when a DNS entry for the zone
+// is already there and is not ours: it stays as it is, which is no failure.
+var errResolverExists = errors.New("DNS entry already exists")
+
+// ifaceByName finds an adapter by its exact name in the list of the OS. found
+// is false only if the list was read and has no such adapter; an error means
+// the list could not be read, which says nothing about the adapter.
+func ifaceByName(name string) (index int, found bool, err error) {
+	ifs, err := net.Interfaces()
+	if err != nil {
+		return 0, false, fmt.Errorf("list of adapters: %w", err)
+	}
+	for _, i := range ifs {
+		if i.Name == name {
+			return i.Index, true, nil
+		}
+	}
+	return 0, false, nil
+}
+
 // Gateway is the physical uplink (Wi-Fi, Ethernet) used by direct routes.
 type Gateway struct{ Iface, Router string }
 
@@ -35,6 +79,10 @@ type Env struct {
 	CorpOK, HomeOK bool
 	GW             Gateway
 	GWOK           bool
+	GWv6           bool           // the physical adapter has a global IPv6 address
+	GWNets         []netip.Prefix // the IPv4 networks of the physical adapter: a host in one is reached on the link
+	V6Cap          V6Cap          // whether the home VPN client takes IPv4 and IPv6 by its own policy rules (see V6Status)
+	Ifs            []netif.Info   // all the adapters, as read by Detect (for the diagnostics)
 }
 
 // Any reports whether at least one VPN is connected.
@@ -43,9 +91,22 @@ func (e Env) Any() bool { return e.CorpOK || e.HomeOK }
 // Detect finds the configured VPN adapters and the physical gateway.
 func Detect(cfg *config.Config) Env {
 	var e Env
-	e.Corp, e.CorpOK = netif.Resolve(cfg.Corp, netif.KindCorp, "")
-	e.Home, e.HomeOK = netif.Resolve(cfg.Home, netif.KindVPN, e.Corp.Name)
+	ifs, err := netif.List() // read once: the adapters, the VPNs and the IPv6 of the gateway come from this list
+	e.Ifs = ifs
+	if err == nil {
+		e.Corp, e.CorpOK = netif.ResolveIn(ifs, cfg.Corp, netif.KindCorp, "")
+		e.Home, e.HomeOK = netif.ResolveIn(ifs, cfg.Home, netif.KindVPN, e.Corp.Name)
+	}
 	e.GW, e.GWOK = physicalGateway()
+	if e.GWOK {
+		if i, ok := netif.FindIn(ifs, e.GW.Iface); ok {
+			e.GWv6 = i.HasV6()
+			e.GWNets = i.Nets
+		}
+	}
+	if e.HomeOK && e.Home.HasV6() && cfg.Rest == config.RestHome {
+		e.V6Cap = v6CapOf(osBackend{}, e.Home.Name) // two reads of the tables, only when IPv6 is in play
+	}
 	return e
 }
 
@@ -56,14 +117,8 @@ func Sig(cfg *config.Config, e Env) string {
 	b, _ := json.Marshal(cfg)
 	h := fnv.New32a()
 	h.Write(b)
-	name := func(ok bool, i netif.Info) string {
-		if !ok {
-			return "-"
-		}
-		return i.Name
-	}
 	return fmt.Sprintf("corp=%s home=%s gw=%s/%s cfg=%x",
-		name(e.CorpOK, e.Corp), name(e.HomeOK, e.Home), e.GW.Iface, e.GW.Router, h.Sum32())
+		ident(e.CorpOK, e.Corp), ident(e.HomeOK, e.Home), e.GW.Iface, e.GW.Router, h.Sum32())
 }
 
 // Sync decides what keeps routes in line with what is connected: apply when
@@ -75,50 +130,29 @@ func Sync(cfg *config.Config, e Env, st *config.State) (apply, reset bool) {
 	return Sig(cfg, e) != st.Sig, false
 }
 
-// Reset removes every route and DNS file recorded in the journal. Entries
-// that could not be removed stay in the journal for the next try.
-// It needs no config, so it works even if config.json is broken or missing.
-func Reset() (removed int, errs []error) {
-	st := config.LoadState()
-	keep := &config.State{}
-	for _, r := range st.Routes {
-		if err := delRoute(r); err != nil {
-			errs = append(errs, err)
-			keep.Routes = append(keep.Routes, r)
-			continue
-		}
-		removed++
+// Apply brings the routing in line with cfg and what is connected: corp
+// rules go through the corp VPN, direct rules past every VPN and, if
+// configured, everything else through the home VPN. Whatever is not
+// connected is skipped. It does not start from scratch: what is in place
+// stays, what is missing is added and what is ours but not wanted any more
+// is removed (see reconcile). Progress goes to w. The Manager must own the
+// journal (see Acquire).
+func (m *Manager) Apply(cfg *config.Config, w io.Writer) error {
+	if err := m.requireOwner(); err != nil {
+		return err
 	}
-	for _, p := range st.Resolvers {
-		if err := delResolver(p); err != nil {
-			errs = append(errs, err)
-			keep.Resolvers = append(keep.Resolvers, p)
-			continue
-		}
-		removed++
+	if err := m.begin(); err != nil {
+		return err
 	}
-	if len(st.Resolvers) > 0 {
-		flushDNS()
-	}
-	if !st.Empty() {
-		_ = config.SaveState(keep)
-	}
-	return
-}
-
-// Apply sends corp rules through the corp VPN, direct rules past every VPN,
-// and, if configured, everything else through the home VPN. Whatever is not
-// connected is skipped. Progress goes to w.
-func Apply(cfg *config.Config, w io.Writer) error {
-	e := Detect(cfg)
+	defer m.unlockSem()
+	e := m.detect(cfg)
 	if !e.Any() {
 		return fmt.Errorf("no VPN is connected: connect the corporate and/or home VPN first")
 	}
-	if n, errs := Reset(); len(errs) > 0 {
-		return fmt.Errorf("could not clear previous routes: %v", errs[0])
-	} else if n > 0 {
-		fmt.Fprintf(w, "cleared %d previous entries\n", n)
-	}
+	return m.applyEnv(cfg, e, w)
+}
+
+func (m *Manager) applyEnv(cfg *config.Config, e Env, w io.Writer) error {
 	show := func(role, sel string, ok bool, i netif.Info) {
 		if ok {
 			fmt.Fprintf(w, "%s: %s\n", role, i.Label())
@@ -133,124 +167,94 @@ func Apply(cfg *config.Config, w io.Writer) error {
 	} else if len(cfg.DirectNetworks)+len(cfg.DirectDomains) > 0 {
 		fmt.Fprintln(w, "direct:   no Wi-Fi/Ethernet gateway found, direct rules are skipped")
 	}
-
-	// write-ahead journal: each entry is saved before it is created, and only
-	// what was really created stays, so reset never removes routes that the
-	// VPN clients set up themselves
-	st := &config.State{Sig: Sig(cfg, e)}
-	if err := config.SaveState(st); err != nil {
+	st, _, status := m.store.Load()
+	if err := statusErr(status); err != nil {
 		return err
 	}
-	added, kept, failed := 0, 0, 0
-	add := func(r config.Route) {
-		st.Routes = append(st.Routes, r)
-		if err := config.SaveState(st); err != nil {
-			fmt.Fprintf(w, "  ! journal: %v\n", err)
-			failed++
-			st.Routes = st.Routes[:len(st.Routes)-1]
-			return
-		}
-		err := addRoute(r)
-		if err == nil {
-			added++
-			fmt.Fprintf(w, "  + %-18s -> %-6s %s\n", r.Dest, r.Via, r.Iface)
-			return
-		}
-		st.Routes = st.Routes[:len(st.Routes)-1]
-		_ = config.SaveState(st)
-		if strings.Contains(strings.ToLower(err.Error()), "exists") {
-			kept++
-			fmt.Fprintf(w, "  = %-18s already routed by the system or a VPN client, left as is\n", r.Dest)
-			return
-		}
-		failed++
-		fmt.Fprintf(w, "  ! %s via %s: %v\n", r.Dest, r.Iface, err)
+	if m.clientScan != nil {
+		// the last read of the client files, no waiting for a new one; only the
+		// clients whose adapter is up count
+		setFakeRanges(fakeRangesFor(m.clientScan(), e.Ifs))
 	}
-
-	if e.CorpOK {
-		corp := func(dest string) {
-			add(config.Route{Dest: dest, Iface: e.Corp.Name, Gateway: cfg.CorpGateway, Via: ViaCorp})
+	m.memo = newDNSMemo()
+	defer probes.scope()()
+	defer func() { m.memo = nil }()
+	tbl, rs := m.readTables()
+	if bp := m.bootstrapPlan(cfg, e, st, tbl, rs); bp != nil {
+		m.notePlanned(bp.routes)
+		// the corp DNS must be reachable before the corp domains are resolved
+		if err := m.reconcile(st, bp, tbl, rs, pendingSig, true, io.Discard); err != nil {
+			return err
 		}
-		servers, zones := corpDNS(e.Corp.Name)
-		if cfg.CorpDNS != "" {
-			servers = []string{cfg.CorpDNS}
-			corp(cfg.CorpDNS + "/32") // the corp DNS itself must be reachable through corp
+		if st, _, status = m.store.Load(); statusErr(status) != nil {
+			return statusErr(status)
 		}
-		if len(servers) > 0 {
-			fmt.Fprintf(w, "corp DNS: %s\n", strings.Join(servers, ", "))
-		}
-		for _, n := range expandNets(cfg.Networks, w) {
-			corp(n)
-		}
-		if len(cfg.Domains) > 0 {
-			fmt.Fprintln(w, "resolving corp domains...")
-			for _, ip := range resolveDomains(cfg.Domains, first(servers), w) {
-				corp(ip)
-			}
-		}
-		if cfg.SplitDNS && len(servers) > 0 {
-			splitDNS(st, e.Corp.Name, servers, append(zones, cfg.Domains...), cfg.DirectDomains, w)
-		}
+		tbl, rs = m.readTables()
 	}
-	if e.GWOK {
-		direct := func(dest string) {
-			add(config.Route{Dest: dest, Iface: e.GW.Iface, Gateway: e.GW.Router, Via: ViaDirect})
-		}
-		for _, n := range expandNets(cfg.DirectNetworks, w) {
-			direct(n)
-		}
-		if len(cfg.DirectDomains) > 0 {
-			fmt.Fprintln(w, "resolving direct domains...")
-			for _, ip := range resolveDomains(cfg.DirectDomains, "", w) {
-				direct(ip)
-			}
-		}
+	p := m.buildPlan(cfg, e, st, tbl, rs, w)
+	m.notePlanned(p.routes)
+	for _, s := range p.warns {
+		fmt.Fprintf(w, "  ! %s\n", s)
 	}
-	if e.HomeOK && cfg.HomeDefault {
-		// two halves of the address space beat the default route without touching it
-		for _, d := range []string{"0.0.0.0/1", "128.0.0.0/1"} {
-			add(config.Route{Dest: d, Iface: e.Home.Name, Via: ViaHome})
-		}
-	}
-	fmt.Fprintf(w, "done: %d routes added, %d already in place, %d failed. Undo anytime with: vpnsplit reset\n", added, kept, failed)
-	return nil
+	return m.reconcile(st, p, tbl, rs, Sig(cfg, e), false, w)
 }
 
-// splitDNS makes the OS resolve corp zones through the corp DNS, so they keep
-// working when the home VPN replaces the system DNS (BlancVPN does). How is
-// up to the OS (dns_<os>.go): resolverPlan lists the entries to create, each
-// is journaled before it is created, like routes.
-func splitDNS(st *config.State, iface string, servers, zones, skip []string, w io.Writer) {
-	var clean []string
-	done := map[string]bool{}
-	for _, s := range skip {
-		done[s] = true
-	}
-	for _, z := range zones {
-		z = strings.TrimSuffix(strings.TrimPrefix(strings.ToLower(z), "~"), ".")
-		if z != "" && !done[z] {
-			done[z] = true
-			clean = append(clean, z)
+// applyCache remembers what a probe of the OS answered while one apply runs (is
+// systemd-resolved there: a tool run each time it is asked) and forgets it at
+// the end. Outside of an apply nothing is remembered.
+type applyCache struct {
+	mu sync.Mutex
+	on int
+	v  map[string]bool
+}
+
+var probes applyCache
+
+// scope starts remembering; the returned function ends it.
+func (c *applyCache) scope() func() {
+	c.mu.Lock()
+	c.on++
+	c.mu.Unlock()
+	return func() {
+		c.mu.Lock()
+		if c.on--; c.on == 0 {
+			c.v = nil
 		}
+		c.mu.Unlock()
 	}
-	plan := resolverPlan(iface, servers, clean)
-	for _, id := range plan {
-		st.Resolvers = append(st.Resolvers, id)
-		if err := config.SaveState(st); err != nil {
-			fmt.Fprintf(w, "  ! journal: %v\n", err)
-			return
+}
+
+// get returns the answer of probe, asked once per scope.
+func (c *applyCache) get(key string, probe func() bool) bool {
+	c.mu.Lock()
+	if v, ok := c.v[key]; ok && c.on > 0 {
+		c.mu.Unlock()
+		return v
+	}
+	c.mu.Unlock()
+	v := probe()
+	c.mu.Lock()
+	if c.on > 0 {
+		if c.v == nil {
+			c.v = map[string]bool{}
 		}
-		if err := addResolver(id, servers); err != nil {
-			st.Resolvers = st.Resolvers[:len(st.Resolvers)-1]
-			_ = config.SaveState(st)
-			fmt.Fprintf(w, "  = %s: %v\n", id, err)
-			continue
-		}
-		fmt.Fprintf(w, "  + %-18s -> corp DNS\n", id)
+		c.v[key] = v
 	}
-	if len(plan) > 0 {
-		flushDNS()
+	c.mu.Unlock()
+	return v
+}
+
+// readTables reads the routing table and the policy rules. What cannot be
+// read is marked unknown: the journal is then taken for the truth.
+func (m *Manager) readTables() (*table, *ruleSet) {
+	tbl, rs := &table{byKey: map[rkey]OSRoute{}}, &ruleSet{}
+	if routes, err := m.b.Routes(); err == nil {
+		tbl = newTable(routes)
 	}
+	if rules, err := m.b.Rules(); err == nil {
+		rs = newRuleSet(rules)
+	}
+	return tbl, rs
 }
 
 // expandNets replaces autonomous systems ("AS49675") with the networks they
@@ -273,6 +277,25 @@ func expandNets(rules []string, w io.Writer) []string {
 		}
 		fmt.Fprintf(w, "%s: %d networks from RIPE%s\n", r, len(nets), note)
 		out = append(out, nets...)
+	}
+	return out
+}
+
+// validServers keeps the IPv4 addresses (canonical form) of what the OS
+// reported as DNS servers: they end up in commands and files.
+func validServers(in []string) []string {
+	var out []string
+	for _, s := range in {
+		ip, err := config.ParseIPv4(strings.TrimSpace(s))
+		if err != nil {
+			continue
+		}
+		// loopback (the stub of a local resolver), link-local, multicast and the like
+		// are no server a route can be made to
+		if a, perr := netip.ParseAddr(ip); perr != nil || badServer(a) != "" {
+			continue
+		}
+		out = config.AddUnique(out, ip)
 	}
 	return out
 }
@@ -307,7 +330,9 @@ func parseDefaultGW(out string) (Gateway, bool) {
 	return Gateway{}, false
 }
 
-func resolveDomains(domains []string, dns string, w io.Writer) []string {
+// lookupIPv4 asks dns (one address, port 53; "" is the system resolver) for the
+// IPv4 addresses of a name.
+func lookupIPv4(ctx context.Context, dns, domain string) ([]netip.Addr, error) {
 	res := net.DefaultResolver
 	if dns != "" {
 		res = &net.Resolver{PreferGo: true, Dial: func(ctx context.Context, _, _ string) (net.Conn, error) {
@@ -315,20 +340,86 @@ func resolveDomains(domains []string, dns string, w io.Writer) []string {
 			return d.DialContext(ctx, "udp", net.JoinHostPort(dns, "53"))
 		}}
 	}
-	var cidrs []string
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	ips, err := res.LookupIP(ctx, "ip4", domain)
+	if err != nil {
+		return nil, err
+	}
+	var out []netip.Addr
+	for _, ip := range ips {
+		if a, ok := netip.AddrFromSlice(ip.To4()); ok {
+			out = append(out, a)
+		}
+	}
+	return out, nil
+}
+
+// resolveDomains turns names into /32 networks. Each name is asked of the
+// servers in turn until one answers (none given: the system resolver). An
+// answer in the range of fake-ip DNS (see fakeIPNet) is dropped and reported:
+// it is not where the name lives. So is an address that is not one of a host
+// (loopback, link-local, multicast...) and one that skip refuses (nil: none
+// is); the reasons come back as dropped, to be shown as warnings.
+//
+// 198.18.0.0/15 is dropped from every answer. A range that a client config names
+// is a guess about what the DNS of that client answers, so it applies only to
+// what the system resolver answered, never to a server asked explicitly (the
+// provider, the corp DNS through its /32). With warnOnly (the rules for corp and
+// through the home VPN, where a missing route is a leak or a lost resource) the
+// route is made anyway and a warning is added to dropped.
+func (m *Manager) resolveDomains(domains, servers []string, skip func(netip.Addr) string, warnOnly bool, w io.Writer) (cidrs, dropped []string) {
+	lookup := m.lookup
+	if lookup == nil {
+		lookup = lookupIPv4
+	}
+	if len(servers) == 0 {
+		servers = []string{""}
+	}
+	var fake []string
 	for _, d := range domains {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		ips, err := res.LookupIP(ctx, "ip4", d)
-		cancel()
+		var ips []netip.Addr
+		var err error
+		system := false
+		for _, s := range servers {
+			system = s == ""
+			if ips, err = lookup(m.ctx, s, d); err == nil {
+				break
+			}
+		}
 		if err != nil {
 			fmt.Fprintf(w, "  ! cannot resolve %s: %v\n", d, err)
 			continue
 		}
 		for _, ip := range ips {
+			if fakeIPNet.Contains(ip.Unmap()) {
+				fake = append(fake, d+"="+ip.String()+" ["+fakeIPNet.String()+"]")
+				continue
+			}
+			if x := extraRangeOf(ip); x != "" && system {
+				if !warnOnly {
+					fake = append(fake, d+"="+ip.String()+" ["+x+"]")
+					continue
+				}
+				dropped = append(dropped, fmt.Sprintf("%s resolves to %s, in the fake-ip range %s: the route is made anyway, check that it is the real address", d, ip, x))
+			}
+			if why := badServer(ip); why != "" {
+				dropped = append(dropped, fmt.Sprintf("%s resolves to %s (%s): no route for it", d, ip, why))
+				continue
+			}
+			if skip != nil {
+				if why := skip(ip); why != "" {
+					dropped = append(dropped, fmt.Sprintf("%s resolves to %s (%s): no /32 route for it, the rule that covers it decides", d, ip, why))
+					continue
+				}
+			}
 			cidrs = config.AddUnique(cidrs, ip.String()+"/32")
 		}
 	}
-	return cidrs
+	if len(fake) > 0 {
+		fmt.Fprintf(w, "  ! fake-ip answers (198.18.0.0/15 and the ranges of running clients) dropped, a name behind them cannot be routed by its address: %s\n", strings.Join(fake, ", "))
+	}
+	return cidrs, dropped
 }
 
 // parseSCArray returns the items of "key : <array> { 0 : a  1 : b }" in scutil output.
@@ -382,4 +473,56 @@ func parseResolvConf(s string) (servers, search []string) {
 		}
 	}
 	return servers, search
+}
+
+// ident is how an adapter takes part in Sig: its name, its index (a VPN that
+// reconnects under the same name usually gets a new one, and its routes went
+// with the old adapter) and a hash of its addresses (the journal keeps Sig as
+// one bounded string).
+func ident(ok bool, i netif.Info) string {
+	if !ok {
+		return "-"
+	}
+	addrs := append([]string(nil), i.Addrs...)
+	sort.Strings(addrs) // the OS may list the same addresses in another order
+	h := fnv.New32a()
+	h.Write([]byte(strings.Join(addrs, ",")))
+	v6 := "" // whether it has IPv6 changes the plan (::/1 routes); the addresses themselves do not (privacy addresses change daily)
+	if i.HasV6() {
+		v6 = "+6"
+	}
+	return fmt.Sprintf("%s#%d@%x%s", i.Name, i.Index, h.Sum32(), v6)
+}
+
+// parseScutilDNS reads the DNS servers that `scutil --dns` lists for the
+// adapter iface: the resolvers whose "if_index" names it ("if_index : 6 (en0)").
+func parseScutilDNS(out, iface string) []string {
+	var servers []string
+	var cur []string
+	match := false
+	flush := func() {
+		if match {
+			for _, s := range cur {
+				servers = config.AddUnique(servers, s)
+			}
+		}
+		cur, match = nil, false
+	}
+	for _, l := range strings.Split(out, "\n") {
+		t := strings.TrimSpace(l)
+		switch {
+		case strings.HasPrefix(t, "resolver #"):
+			flush()
+		case strings.HasPrefix(t, "nameserver["):
+			if _, v, ok := strings.Cut(t, " : "); ok {
+				cur = append(cur, strings.TrimSpace(v))
+			}
+		case strings.HasPrefix(t, "if_index"):
+			if _, v, ok := strings.Cut(t, "("); ok {
+				match = strings.TrimSuffix(strings.TrimSpace(v), ")") == iface
+			}
+		}
+	}
+	flush()
+	return servers
 }

@@ -6,9 +6,9 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/UniQlow17/vpnsplit/internal/config"
 	"github.com/UniQlow17/vpnsplit/internal/netif"
@@ -18,24 +18,50 @@ import (
 
 const usage = `vpnsplit - corp traffic through the corp VPN, chosen sites past every VPN, the rest through the home VPN
 
-  vpnsplit [menu]                interactive menu (default)
+  vpnsplit [menu] [--no-resize] [--no-tray]  interactive menu (default); keys: digit = run the item, ? help, q quit.
+                                 The window is enlarged to fit the menu where the terminal allows it
+                                 (classic Windows console, xterm, iTerm2, Terminal.app) and put back
+                                 at the end; --no-resize or VPNSPLIT_NO_RESIZE=1 leaves it alone.
+                                 Windows: an icon in the notification area (switch, show window, exit),
+                                 key m hides a classic console window into it; --no-tray or VPNSPLIT_NO_TRAY=1 switches it off
   vpnsplit list                  show network adapters and the VPN clients behind them
   vpnsplit init                  choose corp / home VPN (default: detect automatically)
   vpnsplit add <cidr|ip|domain|AS>...        send these to the corp VPN
                                  (AS49675 = every network the AS announces, from RIPE)
   vpnsplit add --direct <cidr|ip|domain>...  send these past every VPN (Wi-Fi/Ethernet)
-  vpnsplit remove [--direct] <cidr|ip|domain>...
+  vpnsplit add --home <cidr|ip|domain>...    send these into the home VPN (when the rest goes direct)
+  vpnsplit remove [--direct|--home] <cidr|ip|domain>...
   vpnsplit rules                 show current rules
   vpnsplit import <file>         add the rules of a rules file (from export or someone else)
   vpnsplit export [file]         write the rules as a rules file (stdout by default)
   vpnsplit set <key> <value>     corp | home (auto, client or adapter name),
                                  corp-dns | corp-gateway ("none" clears),
-                                 home-default | split-dns (true/false)
-  vpnsplit apply                 add routes (needs admin/root)
-  vpnsplit watch                 keep routes in sync when VPNs connect, switch or disconnect
+                                 rest (home = through the home VPN, direct = past every VPN,
+                                 keep = as the VPN client set it up), split-dns (yes/no, ...),
+                                 home-default (old name: yes = rest home, no = rest keep)
+  vpnsplit apply                 add routes and leave them in place (needs admin/root)
+  vpnsplit watch                 keep routes in sync when VPNs connect, switch or disconnect;
+                                 routes stay after Ctrl+C
+  vpnsplit run                   like watch, but a session: everything is removed when it ends
+                                 (SIGINT/SIGTERM/SIGHUP, console closed), or by the next start
+                                 if it was killed; for scripts and services
+  vpnsplit recover               finish what a run that was killed left: remove its routes, rules and DNS
+                                 entries from the journal and compare with the state before that run;
+                                 applies nothing, leaves apply/watch routes alone (needs admin/root)
+  vpnsplit install-recover [--remove]
+                                 install (or remove) the job that runs "vpnsplit recover" at every start
+                                 of the computer: a Task Scheduler task (SYSTEM), a systemd unit, a
+                                 LaunchDaemon. Done only by this command, never on its own. The program
+                                 and all of its directories must be closed to ordinary users (Program
+                                 Files, /usr/local/bin owned by root), else nothing is installed
   vpnsplit status                show what is connected and what vpnsplit added
-  vpnsplit reset [--purge]       remove ALL routes added by this tool and
-                                 restore original routing (--purge also deletes config)
+  vpnsplit diff                  show how routes, rules and DNS entries differ from the state
+                                 before vpnsplit started, and whose each difference is
+  vpnsplit reset [--purge] [--force]
+                                 remove ALL routes added by this tool and restore original
+                                 routing (--purge also deletes config.json; --force removes
+                                 the journal's routes even if it thinks the computer was
+                                 restarted since)
   vpnsplit version
 
 Only routes created by vpnsplit are ever touched; the system default route
@@ -55,9 +81,16 @@ func run(args []string, version string) error {
 	if len(args) > 0 {
 		cmd, rest = args[0], args[1:]
 	}
+	if len(args) > 0 && (args[0] == "--no-resize" || args[0] == "--no-tray") { // the menu is the default command
+		cmd, rest = "menu", args
+	}
 	switch cmd {
 	case "menu":
-		return tui.Run()
+		opts, err := parseMenu(rest)
+		if err != nil {
+			return err
+		}
+		return tui.Run(opts)
 	case "list":
 		return cmdList(os.Stdout)
 	case "init":
@@ -73,19 +106,25 @@ func run(args []string, version string) error {
 	case "set":
 		return cmdSet(rest)
 	case "apply":
-		return needAdmin(func() error {
-			cfg, err := config.Load()
-			if err != nil {
-				return err
-			}
-			return router.Apply(cfg, os.Stdout)
-		})
+		return needAdmin(cmdApply)
 	case "watch":
-		return needAdmin(cmdWatch)
+		return needAdmin(func() error { return cmdSync(config.ModePersistent) })
+	case "run":
+		return needAdmin(func() error { return cmdSync(config.ModeSession) })
+	case "recover":
+		return needAdmin(func() error { return cmdRecover(os.Stdout) })
+	case "install-recover":
+		return needAdmin(func() error { return cmdInstallRecover(rest, os.Stdout) })
 	case "status":
 		return cmdStatus()
+	case "diff":
+		return cmdDiff(os.Stdout)
 	case "reset":
-		return needAdmin(func() error { return cmdReset(len(rest) > 0 && rest[0] == "--purge") })
+		o, err := parseReset(rest)
+		if err != nil {
+			return err
+		}
+		return needAdmin(func() error { return cmdReset(router.NewManager(), o, os.Stdout) })
 	case "version", "--version", "-v":
 		fmt.Println("vpnsplit", version)
 		return nil
@@ -95,6 +134,19 @@ func run(args []string, version string) error {
 	default:
 		fmt.Println(usage)
 		return fmt.Errorf("unknown command %q", cmd)
+	}
+}
+
+// loadConfig loads the config and tells about every value dropped as invalid.
+func loadConfig() (*config.Config, error) {
+	cfg, warns, err := config.LoadChecked()
+	printWarnings(warns)
+	return cfg, err
+}
+
+func printWarnings(warns []string) {
+	for _, w := range warns {
+		fmt.Fprintln(os.Stderr, "warning:", w)
 	}
 }
 
@@ -166,7 +218,7 @@ func cmdInit(r io.Reader, w io.Writer) error {
 		}
 		return line, nil
 	}
-	cfg, err := config.Load()
+	cfg, err := loadConfig()
 	if err != nil {
 		cfg = config.New()
 	}
@@ -187,18 +239,23 @@ func cmdInit(r io.Reader, w io.Writer) error {
 }
 
 func cmdRules(op string, items []string) error {
-	cfg, err := config.Load()
+	cfg, err := loadConfig()
 	if err != nil {
 		return err
 	}
-	direct := len(items) > 0 && items[0] == "--direct"
-	if direct {
+	kind := config.DestCorp
+	for len(items) > 0 && (items[0] == "--direct" || items[0] == "--home") {
+		kind = strings.TrimPrefix(items[0], "--")
 		items = items[1:]
 	}
 	if len(items) == 0 {
-		return fmt.Errorf("usage: vpnsplit %s [--direct] <cidr|ip|domain>...", op)
+		return fmt.Errorf("usage: vpnsplit %s [--direct|--home] <cidr|ip|domain>...", op)
 	}
-	nets, domains := cfg.Lists(direct)
+	if op == "add" && !slices.Contains(cfg.Kinds(), kind) {
+		return fmt.Errorf("--%s rules have no meaning while the rest of the traffic is set to %q (%s); change it first: vpnsplit set rest <home|direct|keep>",
+			kind, cfg.Rest, restWhy(cfg.Rest, kind))
+	}
+	nets, domains := cfg.ListsOf(kind)
 	for _, it := range items {
 		isNet, v, err := config.NormalizeRule(it)
 		if err != nil {
@@ -224,15 +281,33 @@ func cmdRules(op string, items []string) error {
 	return nil
 }
 
+// restWhy says why a kind of rules does not matter with a setting of the rest.
+func restWhy(rest, kind string) string {
+	switch {
+	case rest == config.RestDirect && kind == config.DestDirect:
+		return "everything else goes direct anyway"
+	case rest == config.RestHome && kind == config.DestHome:
+		return "everything else goes into the home VPN anyway"
+	}
+	return "not applicable"
+}
+
 func cmdRulesShow() error {
-	cfg, err := config.Load()
+	cfg, err := loadConfig()
 	if err != nil {
 		return err
 	}
-	fmt.Println("corp networks:  ", strings.Join(cfg.Networks, ", "))
-	fmt.Println("corp domains:   ", strings.Join(cfg.Domains, ", "))
-	fmt.Println("direct networks:", strings.Join(cfg.DirectNetworks, ", "))
-	fmt.Println("direct domains: ", strings.Join(cfg.DirectDomains, ", "))
+	fmt.Printf("rest of the traffic: %s\n", config.RestLabel(cfg.Rest, false))
+	for _, k := range cfg.Kinds() {
+		nets, domains := cfg.ListsOf(k)
+		fmt.Printf("%-7s networks: %s\n", k, strings.Join(*nets, ", "))
+		fmt.Printf("%-7s domains:  %s\n", k, strings.Join(*domains, ", "))
+	}
+	for _, k := range []string{config.DestDirect, config.DestHome} {
+		if nets, domains := cfg.ListsOf(k); !slices.Contains(cfg.Kinds(), k) && len(*nets)+len(*domains) > 0 {
+			fmt.Printf("(%d %s rules are kept but not applied with this setting of the rest)\n", len(*nets)+len(*domains), k)
+		}
+	}
 	return nil
 }
 
@@ -240,7 +315,7 @@ func cmdImport(a []string) error {
 	if len(a) != 1 {
 		return fmt.Errorf("usage: vpnsplit import <file>")
 	}
-	cfg, err := config.Load()
+	cfg, err := loadConfig()
 	if err != nil {
 		return err
 	}
@@ -260,7 +335,7 @@ func cmdImport(a []string) error {
 }
 
 func cmdExport(a []string) error {
-	cfg, err := config.Load()
+	cfg, err := loadConfig()
 	if err != nil {
 		return err
 	}
@@ -273,9 +348,9 @@ func cmdExport(a []string) error {
 
 func cmdSet(a []string) error {
 	if len(a) != 2 {
-		return fmt.Errorf("usage: vpnsplit set <corp|home|corp-dns|corp-gateway|home-default|split-dns> <value>")
+		return fmt.Errorf("usage: vpnsplit set <corp|home|corp-dns|corp-gateway|rest|split-dns|home-default> <value>")
 	}
-	cfg, err := config.Load()
+	cfg, err := loadConfig()
 	if err != nil {
 		return err
 	}
@@ -284,26 +359,61 @@ func cmdSet(a []string) error {
 		val = ""
 	}
 	switch a[0] {
-	case "corp":
-		cfg.Corp = val
-	case "home":
-		cfg.Home = val
-	case "corp-dns":
-		cfg.CorpDNS = val
-	case "corp-gateway":
-		cfg.CorpGateway = val
-	case "home-default":
-		cfg.HomeDefault = val == "true"
-	case "split-dns":
-		cfg.SplitDNS = val == "true"
+	case "corp", "home":
+		if val != "" && !config.ValidIface(val) {
+			return fmt.Errorf("invalid %s value %q", a[0], val)
+		}
+		if a[0] == "corp" {
+			cfg.Corp = val
+		} else {
+			cfg.Home = val
+		}
+	case "corp-dns", "corp-gateway":
+		if val != "" {
+			ip, err := config.ParseIPv4(val)
+			if err != nil {
+				return fmt.Errorf("%s: %w", a[0], err)
+			}
+			val = ip
+		}
+		if a[0] == "corp-dns" {
+			cfg.CorpDNS = val
+		} else {
+			cfg.CorpGateway = val
+		}
+	case "rest":
+		r, err := config.ParseRest(a[1])
+		if err != nil {
+			return err
+		}
+		cfg.Rest = r
+	case "home-default", "split-dns":
+		b, err := config.ParseBool(a[1])
+		if err != nil {
+			return fmt.Errorf("%s: %w", a[0], err)
+		}
+		if a[0] == "home-default" {
+			cfg.Rest = config.RestKeep
+			if b {
+				cfg.Rest = config.RestHome
+			}
+		} else {
+			cfg.SplitDNS = b
+		}
 	default:
 		return fmt.Errorf("unknown key %q", a[0])
 	}
-	return config.Save(cfg)
+	if err := config.Save(cfg); err != nil {
+		return err
+	}
+	if a[0] == "rest" || a[0] == "home-default" {
+		fmt.Printf("rest of the traffic: %s. Rules that matter now: %s\n", config.RestLabel(cfg.Rest, false), strings.Join(cfg.Kinds(), ", "))
+	}
+	return nil
 }
 
 func cmdStatus() error {
-	cfg, err := config.Load()
+	cfg, err := loadConfig()
 	if err != nil {
 		return err
 	}
@@ -322,11 +432,34 @@ func cmdStatus() error {
 	} else {
 		fmt.Println("direct: no Wi-Fi/Ethernet gateway found")
 	}
-	fmt.Printf("corp-dns=%q corp-gateway=%q home-default=%v split-dns=%v\n", cfg.CorpDNS, cfg.CorpGateway, cfg.HomeDefault, cfg.SplitDNS)
-	st := config.LoadState()
+	fmt.Printf("corp-dns=%q corp-gateway=%q rest=%s split-dns=%v\n", cfg.CorpDNS, cfg.CorpGateway, cfg.Rest, cfg.SplitDNS)
+	if lvl, text := router.V6Status(cfg, e); lvl == router.V6Leaks {
+		fmt.Println("!!! " + text)
+	} else if lvl == router.V6Info {
+		fmt.Println(text)
+	}
+	st, warns, jstatus := config.LoadStateStatus()
+	printWarnings(warns)
+	if n := config.LegacyNote(false); n != "" {
+		printWarnings([]string{n})
+	}
+	printDiagnostics(os.Stdout, router.Diagnose(cfg, e, st))
+	switch jstatus {
+	case config.JournalDenied:
+		fmt.Printf("journal of applied routes: available only with administrator rights (%s); what is applied is unknown\n", router.PrivHint)
+		return nil
+	case config.JournalUnreadable:
+		fmt.Println("journal of applied routes: cannot be read (see the warnings above); what is applied is unknown")
+		return nil
+	}
+	printOwner(os.Stdout, st)
+	printLastSession(os.Stdout)
 	fmt.Printf("routes owned by vpnsplit: %d\n", len(st.Routes))
 	for _, r := range st.Routes {
 		fmt.Printf("  %-18s -> %-6s %s\n", r.Dest, r.Via, r.Iface)
+	}
+	for _, r := range st.Rules {
+		fmt.Printf("  rule: lookup %d pref %d\n", r.Table, r.Pref)
 	}
 	for _, p := range st.Resolvers {
 		fmt.Printf("  dns file %s\n", p)
@@ -337,42 +470,33 @@ func cmdStatus() error {
 	return nil
 }
 
-func cmdReset(purge bool) error {
-	n, errs := router.Reset()
-	fmt.Printf("removed %d routes and DNS entries\n", n)
-	for _, e := range errs {
-		fmt.Println("  !", e)
-	}
-	if purge {
-		if err := config.Remove(); err == nil {
-			fmt.Println("config deleted")
+// parseReset reads the flags of `reset`.
+func parseReset(args []string) (resetOpts, error) {
+	var o resetOpts
+	for _, a := range args {
+		switch a {
+		case "--purge":
+			o.purge = true
+		case "--force":
+			o.force = true
+		default:
+			return o, fmt.Errorf("usage: vpnsplit reset [--purge] [--force] (unknown argument %q)", a)
 		}
 	}
-	if len(errs) > 0 {
-		return fmt.Errorf("%d entries could not be removed; journal kept, run reset again", len(errs))
-	}
-	fmt.Println("routing is back to what your VPN clients and OS set up. Reconnect the VPNs if something still looks off.")
-	return nil
+	return o, nil
 }
 
-func cmdWatch() error {
-	fmt.Println("watching (Ctrl+C to stop; run `vpnsplit reset` to clean up)...")
-	for {
-		cfg, err := config.Load()
-		if err != nil {
-			return err
+// printDiagnostics lists what the diagnostics found around the setup: one line
+// per finding with its level and code, and what to do about it.
+func printDiagnostics(w io.Writer, list []router.Diag) {
+	if len(list) == 0 {
+		return
+	}
+	fmt.Fprintf(w, "diagnostics: %s\n", router.DiagSummary(list, false))
+	for _, d := range list {
+		fmt.Fprintf(w, "  [%s] %s: %s\n", d.Level, d.Code, d.Text(false))
+		if a := d.Advice(false); a != "" {
+			fmt.Fprintf(w, "      -> %s\n", a)
 		}
-		e := router.Detect(cfg)
-		switch apply, reset := router.Sync(cfg, e, config.LoadState()); {
-		case apply:
-			fmt.Println(time.Now().Format("15:04:05"), "VPNs or rules changed, applying")
-			if err := router.Apply(cfg, os.Stdout); err != nil {
-				fmt.Println("  !", err)
-			}
-		case reset:
-			fmt.Println(time.Now().Format("15:04:05"), "no VPN connected, removing routes")
-			router.Reset()
-		}
-		time.Sleep(5 * time.Second)
 	}
 }

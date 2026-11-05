@@ -3,8 +3,9 @@
 package netif
 
 import (
-	"os/exec"
 	"strings"
+
+	"github.com/UniQlow17/vpnsplit/internal/sysexec"
 )
 
 // owners names the app behind utun adapters it can be sure about:
@@ -18,7 +19,7 @@ import (
 func owners([]Info) (map[string]string, []string) {
 	res := map[string]string{}
 
-	if out, err := exec.Command("scutil", "--nc", "list").Output(); err == nil {
+	if out, err := sysexec.Command("scutil", "--nc", "list").Output(); err == nil {
 		for _, s := range parseNCList(string(out)) {
 			if !s.Connected {
 				continue
@@ -35,10 +36,10 @@ func owners([]Info) (map[string]string, []string) {
 	}
 
 	procs := map[int]string{}
-	if out, err := exec.Command("ps", "-axo", "pid=,comm=").Output(); err == nil {
+	if out, err := sysexec.Command("ps", "-axo", "pid=,comm=").Output(); err == nil {
 		procs = parsePS(string(out))
 	}
-	if out, err := exec.Command("lsof", "-nP", "-w", "-F", "pn").Output(); err == nil || len(out) > 0 {
+	if out, err := sysexec.Command("lsof", "-nP", "-w", "-F", "pn").Output(); err == nil || len(out) > 0 {
 		for iface, pid := range parseLsofUtun(string(out)) {
 			if _, done := res[iface]; !done {
 				claim(res, iface, procs[pid])
@@ -54,7 +55,7 @@ func owners([]Info) (map[string]string, []string) {
 }
 
 func scutilShow(key string) (string, error) {
-	cmd := exec.Command("scutil")
+	cmd := sysexec.Command("scutil")
 	cmd.Stdin = strings.NewReader("show " + key + "\n")
 	out, err := cmd.Output()
 	return string(out), err

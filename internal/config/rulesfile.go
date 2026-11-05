@@ -11,6 +11,7 @@ import (
 //	[direct]           rules below go past every VPN
 //	217.12.96.0/21
 //	[corp]             rules below go through the corp VPN
+//	[home]             rules below go through the home VPN
 //	intranet.example.com
 //
 // Rules before any section go to corp, like `vpnsplit add`.
@@ -19,7 +20,7 @@ import (
 // new. Lines that are not rules are returned as errors with their numbers and
 // do not stop the import.
 func (c *Config) ImportRules(text string) (added int, errs []error) {
-	direct := false
+	kind := DestCorp
 	for n, line := range strings.Split(text, "\n") {
 		line, _, _ = strings.Cut(line, "#")
 		line = strings.TrimSpace(line)
@@ -27,10 +28,13 @@ func (c *Config) ImportRules(text string) (added int, errs []error) {
 		case "":
 			continue
 		case "[direct]":
-			direct = true
+			kind = DestDirect
 			continue
 		case "[corp]":
-			direct = false
+			kind = DestCorp
+			continue
+		case "[home]":
+			kind = DestHome
 			continue
 		}
 		isNet, v, err := NormalizeRule(line)
@@ -38,7 +42,7 @@ func (c *Config) ImportRules(text string) (added int, errs []error) {
 			errs = append(errs, fmt.Errorf("line %d: %v", n+1, err))
 			continue
 		}
-		nets, domains := c.Lists(direct)
+		nets, domains := c.ListsOf(kind)
 		list := domains
 		if isNet {
 			list = nets
@@ -60,6 +64,7 @@ func (c *Config) ExportRules() string {
 		nets, domains []string
 	}{
 		{"[direct]", c.DirectNetworks, c.DirectDomains},
+		{"[home]", c.HomeNetworks, c.HomeDomains},
 		{"[corp]", c.Networks, c.Domains},
 	} {
 		if len(s.nets)+len(s.domains) == 0 {

@@ -13,3 +13,6 @@ coverage.*
 .vscode/
 .DS_Store
 Thumbs.db
+
+# Docker stand build output
+/test/stand/.build/

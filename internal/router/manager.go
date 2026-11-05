@@ -1,0 +1,991 @@
+package router
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"net/netip"
+	"runtime"
+	"runtime/debug"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/UniQlow17/vpnsplit/internal/clientcfg"
+	"github.com/UniQlow17/vpnsplit/internal/config"
+)
+
+// How long Recover may take, and how many OS calls run at once while entries
+// are removed (the system tools are slow to start, PowerShell especially).
+const (
+	recoverBudget = 60 * time.Second
+	removeWorkers = 4
+	// dnsShare is the part of the time left for a cleanup that the DNS entries
+	// may take at most, so that the routes (the last step) always get to start.
+	dnsShare = 0.4
+)
+
+// ModeSessionAsk is a mode for Acquire (never written to the journal) for the
+// interactive menu: a session, except that a persistent journal with entries
+// (applied by apply/watch) is not taken over silently. The session then starts
+// persistent for those entries (nothing is removed at exit) and Foreign says
+// so, until TakeOver is called or the entries are gone.
+const ModeSessionAsk = "session-ask"
+
+var errNotOwner = errors.New("this copy of vpnsplit does not own the routes (see Acquire)")
+
+var errClosed = errors.New("the session has ended: the journal is not written any more")
+
+// BusyError means another running vpnsplit owns the routes. This copy may
+// only look: it must neither apply nor remove anything.
+type BusyError struct {
+	Owner *config.Owner // from the journal, nil if unknown
+	Mode  string
+}
+
+func (e *BusyError) Error() string {
+	who := "another copy of vpnsplit"
+	if e.Owner != nil {
+		who = fmt.Sprintf("another copy of vpnsplit (PID %d)", e.Owner.PID)
+	}
+	return who + " is running and owns the routes: this copy can only view, close the other one first"
+}
+
+func (e *BusyError) Unwrap() error { return config.ErrLocked }
+
+// Manager applies and removes routes and DNS entries and keeps the journal.
+// Exactly one running process owns the journal (Acquire); the lock for it is
+// held by the OS for as long as the process lives.
+type Manager struct {
+	b     Backend
+	store Store
+	procs Procs
+	lock  LockFunc
+
+	sem    chan struct{} // one operation at a time; unlike a mutex, can be waited for with a deadline
+	ctx    context.Context
+	cancel context.CancelFunc
+	stamp  atomic.Pointer[config.State] // header written to every saved journal; nil until Acquire
+	closed atomic.Bool                  // the session ended: nothing writes the journal any more
+	force  bool                         // see SetForce
+
+	// the OS-dependent inputs of Apply; tests replace them
+	detect  func(*config.Config) Env
+	dnsOf   func(iface string) (servers, zones []string)
+	physDNS func(iface string) []string                                         // the DNS servers of the physical adapter
+	lookup  func(ctx context.Context, dns, domain string) ([]netip.Addr, error) // nil: lookupIPv4
+	memo    *dnsMemo                                                            // answers of dnsOf and physDNS during one apply
+
+	goos       string                   // the OS whose rules tell a route of ours from a client's (runtime.GOOS; tests set it)
+	providerOf func() map[string]string // adapter name -> VPN client behind it, for the report
+	snapOff    bool                     // see NoSnapshot
+	oneShot    bool                     // see SetOneShot
+	clientScan func() clientcfg.Result  // the client files (fake-ip ranges), last read, at the start of an apply; nil: none (tests)
+
+	mu        sync.Mutex
+	mode      string          // what Cleanup does: config.ModeSession or config.ModePersistent
+	foreign   bool            // persistent entries of apply/watch are waiting for TakeOver
+	planned   map[string]bool // routes of the plans of this run (kept in the notes next to the snapshot too)
+	kept      map[string]bool // routes found in place and left as somebody else's
+	planTaken string          // the snapshot the notes belong to
+	planDirty bool            // the notes grew since they were written
+	jhint     []config.Route  // routes the journal listed before they were removed in this run
+	jhintRes  []string        // the same for DNS entries
+}
+
+// NewManager returns the Manager that works on this OS.
+func NewManager() *Manager {
+	m := newManager(osBackend{}, fileStore{}, osProcs{}, osLock)
+	m.clientScan = clientcfg.Files
+	return m
+}
+
+// NewManagerFor returns a Manager on the given parts (for tests of the
+// callers; NewManager is the real one).
+func NewManagerFor(b Backend, s Store, p Procs, l LockFunc) *Manager {
+	return newManager(b, s, p, l)
+}
+
+func newManager(b Backend, s Store, p Procs, l LockFunc) *Manager {
+	ctx, cancel := context.WithCancel(context.Background())
+	return &Manager{b: b, store: s, procs: p, lock: l, sem: make(chan struct{}, 1), ctx: ctx, cancel: cancel,
+		detect: Detect, dnsOf: corpDNS, physDNS: physicalDNS, goos: runtime.GOOS, providerOf: providersByName, planned: map[string]bool{}, kept: map[string]bool{}}
+}
+
+// NoSnapshot makes Acquire leave the snapshot of the state before the start
+// alone (neither taken nor compared): for `reset`, which takes nothing new on.
+// Call it before Acquire.
+func (m *Manager) NoSnapshot() { m.snapOff = true }
+
+// SetForce makes the recovery in Acquire distrust the "computer was restarted"
+// verdict: routes of an earlier run are then removed instead of forgotten.
+// For `reset --force`, when the boot id lied (a clock jump) and routes that
+// should be gone are still in the table. Call it before Acquire.
+func (m *Manager) SetForce(on bool) { m.force = on }
+
+func (m *Manager) lockSem(ctx context.Context) error {
+	select {
+	case m.sem <- struct{}{}:
+		return nil
+	default:
+	}
+	select {
+	case m.sem <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (m *Manager) unlockSem() { <-m.sem }
+
+// journalWait is how long Session.Journal waits for a running operation.
+const journalWait = 5 * time.Second
+
+// begin takes the right to run one operation; it fails once the session is
+// being ended, even if the semaphore happens to be free.
+func (m *Manager) begin() error {
+	if err := m.lockSem(m.ctx); err != nil {
+		return fmt.Errorf("interrupted: %w", err)
+	}
+	if err := m.ctx.Err(); err != nil {
+		m.unlockSem()
+		return fmt.Errorf("interrupted: %w", err)
+	}
+	return nil
+}
+
+func (m *Manager) requireOwner() error {
+	if m.stamp.Load() == nil {
+		return errNotOwner
+	}
+	return nil
+}
+
+// save writes the journal with the owner's header.
+func (m *Manager) save(st *config.State) error {
+	if m.closed.Load() {
+		return errClosed
+	}
+	if h := m.stamp.Load(); h != nil {
+		o := *h.Owner
+		st.Version, st.Owner, st.Mode = h.Version, &o, h.Mode
+	}
+	return m.store.Save(st)
+}
+
+// saveBare writes the journal as it is (an empty one has no owner).
+func (m *Manager) saveBare(st *config.State) error {
+	if m.closed.Load() {
+		return errClosed
+	}
+	return m.store.Save(st)
+}
+
+// Report says what was removed.
+type Report struct {
+	Routes, Resolvers int
+	Rules             int
+	Tun6              bool      // the settings of the automatic IPv6 tunnels (Windows) were put back
+	Forgotten         int       // journal routes (and DNS entries of systemd-resolved) dropped without removal: gone with a reboot
+	Left              []string  // journal routes and DNS entries found in the table but not removed because they are not ours (or may not be); dropped from the journal
+	FullTunnel        bool      // 0.0.0.0/1 and 128.0.0.0/1 of the home VPN were removed
+	Base              *Baseline // the system compared with the state before the start; nil: not done
+}
+
+// Total is the number of entries removed.
+func (r Report) Total() int { return r.Routes + r.Resolvers + r.Rules }
+
+// Describe tells what was removed, in English or Russian.
+func (r Report) Describe(ru bool) string {
+	if r.Total() == 0 && !r.Tun6 && r.Forgotten == 0 && len(r.Left) == 0 {
+		if ru {
+			return "ничего снимать не пришлось"
+		}
+		return "nothing to remove"
+	}
+	var s string
+	if ru {
+		s = fmt.Sprintf("снято: маршрутов %d, DNS-записей %d", r.Routes, r.Resolvers)
+		if r.Rules > 0 {
+			s += fmt.Sprintf(", правил маршрутизации %d", r.Rules)
+		}
+		if r.Tun6 {
+			s += "; IPv6-туннели Windows (Teredo, 6to4, ISATAP) возвращены"
+		}
+		if r.FullTunnel {
+			s += "; полный туннель 0/1+128/1 снят"
+		}
+		if r.Forgotten > 0 {
+			s += fmt.Sprintf("; после перезагрузки забыто записей (маршруты, DNS): %d", r.Forgotten)
+		}
+		if len(r.Left) > 0 {
+			s += fmt.Sprintf("; оставлено (не похоже на наше): %d (%s)", len(r.Left), leftList(r.Left))
+		}
+		return s
+	}
+	s = fmt.Sprintf("removed: %d routes, %d DNS entries", r.Routes, r.Resolvers)
+	if r.Rules > 0 {
+		s += fmt.Sprintf(", %d policy rules", r.Rules)
+	}
+	if r.Tun6 {
+		s += "; Windows IPv6 tunnels (Teredo, 6to4, ISATAP) put back"
+	}
+	if r.FullTunnel {
+		s += "; full tunnel 0/1+128/1 removed"
+	}
+	if r.Forgotten > 0 {
+		s += fmt.Sprintf("; entries (routes, DNS) forgotten after a reboot: %d", r.Forgotten)
+	}
+	if len(r.Left) > 0 {
+		s += fmt.Sprintf("; left (do not look like ours): %d (%s)", len(r.Left), leftList(r.Left))
+	}
+	return s
+}
+
+// leftList names the first routes of Report.Left.
+func leftList(l []string) string {
+	const show = 5
+	if len(l) <= show {
+		return strings.Join(l, ", ")
+	}
+	return fmt.Sprintf("%s and %d more", strings.Join(l[:show], ", "), len(l)-show)
+}
+
+// Notice is what the user must know after the full tunnel of the home VPN was
+// removed, or "" when it was not.
+func (r Report) Notice(ru bool) string {
+	if !r.FullTunnel {
+		return ""
+	}
+	if ru {
+		return "Весь трафик теперь идёт напрямую через провайдера (мимо домашнего VPN), пока VPN-клиент сам не направит его в туннель."
+	}
+	return "All traffic now goes straight through your ISP (past the home VPN) until the VPN client routes it into the tunnel itself."
+}
+
+func (r *Report) add(o Report) {
+	r.Routes += o.Routes
+	r.Resolvers += o.Resolvers
+	r.Rules += o.Rules
+	r.Tun6 = r.Tun6 || o.Tun6
+	r.Forgotten += o.Forgotten
+	r.Left = append(r.Left, o.Left...)
+	r.FullTunnel = r.FullTunnel || o.FullTunnel
+}
+
+// AcquireInfo is what happened while the journal was taken over.
+type AcquireInfo struct {
+	Recovered Report
+	Errors    []error   // entries of a dead owner that could not be removed; they stay in the journal
+	Warns     []string  // problems found while reading the journal
+	TookOver  bool      // a persistent (apply/watch) journal with entries became a session's
+	Foreign   bool      // ModeSessionAsk: such a journal was found and left alone, see TakeOver
+	Baseline  *Baseline // an earlier run's snapshot was compared with the system (nil: there was none)
+}
+
+// Acquire makes this process the owner of the journal, or fails. It takes
+// the lock (a *BusyError if another copy runs), recovers what a dead owner
+// left (see recover) and writes the header of this process. mode is
+// config.ModeSession, config.ModePersistent or ModeSessionAsk.
+//
+// ctx ends the recovery early (a signal during the start): what was not
+// removed stays in the journal, the lock is released and the error wraps
+// ctx's. The recovery has a time limit of its own as well.
+func (m *Manager) Acquire(ctx context.Context, mode string, w io.Writer) (*Session, AcquireInfo, error) {
+	var info AcquireInfo
+	if err := ctx.Err(); err != nil {
+		return nil, info, fmt.Errorf("interrupted: %w", err)
+	}
+	release, err := m.lock()
+	if err != nil {
+		if errors.Is(err, config.ErrLocked) {
+			return nil, info, m.busy()
+		}
+		return nil, info, fmt.Errorf("lock the journal: %w", err)
+	}
+	fail := func(err error) (*Session, AcquireInfo, error) {
+		if rerr := release(); rerr != nil {
+			err = fmt.Errorf("%w (and the lock was not released: %v)", err, rerr)
+		}
+		return nil, info, err
+	}
+	st, warns, status := m.loadLocked()
+	info.Warns = warns
+	if err := statusErr(status); err != nil {
+		return fail(err)
+	}
+	rctx, cancel := context.WithTimeout(ctx, recoverBudget)
+	defer cancel()
+	self := m.procs.Self()
+	rep, errs := m.recover(rctx, st, self, w)
+	info.Recovered, info.Errors = rep, errs
+	if err := ctx.Err(); err != nil {
+		// recover has saved what it managed to do
+		return fail(fmt.Errorf("interrupted while finishing the previous run, the rest stays in the journal: %w", err))
+	}
+
+	// A journal with no owner is one of an older version (or one moved from the
+	// user's directory): what it lists is ours, and a session removes it at its end.
+	// What apply/watch left is not taken without the user's word in the menu.
+	legacy := !st.Empty() && st.Owner == nil
+	leftover := !st.Empty() && st.Mode == config.ModePersistent
+	eff := mode
+	switch mode {
+	case config.ModeSession:
+		info.TookOver = leftover || legacy
+	case ModeSessionAsk:
+		eff = config.ModeSession
+		switch {
+		case leftover:
+			eff, info.Foreign = config.ModePersistent, true
+		case legacy:
+			info.TookOver = true
+		}
+	}
+	// whatever a dead session could not remove stays a session's: the next
+	// start removes it, whatever this run is
+	hdrMode := eff
+	if !st.Empty() && st.Mode == config.ModeSession {
+		hdrMode = config.ModeSession
+	}
+	m.stamp.Store(&config.State{Version: config.JournalVersion, Owner: &self, Mode: hdrMode})
+	m.mu.Lock()
+	m.mode, m.foreign = eff, info.Foreign
+	m.mu.Unlock()
+	if err := m.save(st); err != nil {
+		m.stamp.Store(nil)
+		return fail(err)
+	}
+	if !m.snapOff {
+		info.Baseline = m.acquireSnapshot(rctx, st, self, w)
+	}
+	return &Session{m: m, release: release}, info, nil
+}
+
+// loadLocked reads the journal while the lock is held, which is the only time
+// an old journal of the user's directory may be taken over into it (everything
+// else only reads).
+func (m *Manager) loadLocked() (*config.State, []string, config.JournalStatus) {
+	if ms, ok := m.store.(interface {
+		LoadMigrate() (*config.State, []string, config.JournalStatus)
+	}); ok {
+		return ms.LoadMigrate()
+	}
+	return m.store.Load()
+}
+
+// busy builds the error for a lock held by somebody else.
+func (m *Manager) busy() error {
+	e := &BusyError{}
+	if st, _, status := m.store.Load(); status == config.JournalOK {
+		e.Owner, e.Mode = st.Owner, st.Mode
+	}
+	return e
+}
+
+func statusErr(s config.JournalStatus) error {
+	switch s {
+	case config.JournalDenied:
+		return fmt.Errorf("the journal of routes is available to administrators only: %s", PrivHint)
+	case config.JournalUnreadable:
+		return errors.New("the journal of routes cannot be read, nothing was changed (see the warnings of `vpnsplit status`)")
+	}
+	return nil
+}
+
+// SetOneShot says that nothing watches what is applied: `vpnsplit apply`, which
+// leaves the entries and exits. The DNS rule for everything else (NRPT "." or
+// "~.") is not made then: if the home VPN fell, every name would stop
+// resolving, and nobody would be there to take the rule away before `reset`.
+func (m *Manager) SetOneShot() {
+	m.mu.Lock()
+	m.oneShot = true
+	m.mu.Unlock()
+}
+
+// Mode is what Cleanup does with what was applied: config.ModeSession
+// removes it, config.ModePersistent leaves it.
+func (m *Manager) Mode() string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.mode
+}
+
+// Foreign reports whether persistent entries of apply/watch wait for TakeOver
+// (see ModeSessionAsk). Nothing of them is removed at exit until then.
+func (m *Manager) Foreign() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.foreign
+}
+
+// setMode changes what Cleanup does and the mode the next saved journal
+// carries. A dead session's leftovers (see Acquire) keep their session
+// header, so it is called only when the journal holds nothing of the kind.
+func (m *Manager) setMode(mode string, stamp bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.mode, m.foreign = mode, false
+	if h := m.stamp.Load(); h != nil && stamp {
+		c := *h
+		c.Mode = mode
+		m.stamp.Store(&c)
+	}
+}
+
+// journalCleared is called after the journal was emptied: whatever it said
+// before is gone, so the header follows the mode of this run. Entries of
+// apply/watch that waited for TakeOver are gone too, and what is applied from
+// now on is the session's.
+func (m *Manager) journalCleared() {
+	m.mu.Lock()
+	mode := m.mode
+	if m.foreign {
+		mode = config.ModeSession
+	}
+	m.mu.Unlock()
+	m.setMode(mode, true)
+}
+
+// TakeOver makes the persistent entries that were left alone the session's:
+// they are removed when the session ends. It does nothing if there are none.
+func (m *Manager) TakeOver() error {
+	if err := m.requireOwner(); err != nil {
+		return err
+	}
+	if err := m.begin(); err != nil {
+		return err
+	}
+	defer m.unlockSem()
+	if !m.Foreign() {
+		return nil
+	}
+	st, _, status := m.store.Load()
+	if err := statusErr(status); err != nil {
+		return err
+	}
+	prevStamp, prevMode := m.stamp.Load(), m.Mode()
+	m.setMode(config.ModeSession, true)
+	if err := m.save(st); err != nil {
+		m.stamp.Store(prevStamp)
+		m.mu.Lock()
+		m.mode, m.foreign = prevMode, true
+		m.mu.Unlock()
+		return fmt.Errorf("journal not updated: %w", err)
+	}
+	return nil
+}
+
+// recover deals with what an earlier owner left in the journal. It is called
+// with the lock held, and the OS drops the lock when its holder dies, so that
+// owner is dead whatever the process table says (a reused PID, a process we
+// cannot look into). st is updated in place and saved when it changes.
+//
+//   - computer restarted since (boot id differs): routes are gone with the
+//     reboot and are forgotten, never removed (the table may hold a route of a
+//     VPN client to the same place); DNS entries that survive a reboot (NRPT,
+//     /etc/resolver) are removed, the settings of systemd-resolved are
+//     forgotten like the routes. With SetForce everything is removed instead;
+//   - session journal: everything is removed, DNS first;
+//   - persistent journal (and one written by an older version): left alone.
+//
+// Entries that could not be removed stay in the journal with their owner's
+// header, which Acquire keeps for sessions.
+func (m *Manager) recover(ctx context.Context, st *config.State, self config.Owner, w io.Writer) (Report, []error) {
+	var rep Report
+	if st.Empty() {
+		return rep, nil
+	}
+	o := st.Owner
+	if o != nil && !(o.PID == self.PID && o.Start == self.Start) && m.procs.AliveExact(*o) {
+		fmt.Fprintf(w, "warning: a process with PID %d, the one named in the journal, is running, but the lock is free, so it does not own the routes (the PID was reused?): continuing\n", o.PID)
+	}
+	if o != nil && (o.Boot == "" || self.Boot == "") {
+		fmt.Fprintln(w, "warning: the boot id is unknown, so it cannot be told whether the computer was restarted since the routes were applied: assuming it was not")
+	}
+	rebooted := o != nil && !m.force && !m.procs.SameBoot(o.Boot, self.Boot)
+	switch {
+	case rebooted:
+		dns := &config.State{Resolvers: st.Resolvers, Tun6: st.Tun6} // survive a reboot, unless the OS keeps them in memory
+		if loses, ok := m.b.(interface{ resolversLostOnReboot() bool }); ok && loses.resolversLostOnReboot() {
+			// what is there under the same name now was set by somebody else
+			dns.Resolvers = nil
+			rep.Forgotten += len(st.Resolvers)
+			fmt.Fprintln(w, "the computer was restarted since the routes were applied: forgetting routes and DNS entries (the DNS settings of the links do not survive a restart)")
+		} else {
+			fmt.Fprintln(w, "the computer was restarted since the routes were applied: removing DNS entries, forgetting routes")
+		}
+		r, keep, errs := m.removeEntries(ctx, dns, nil)
+		rep.add(r)
+		rep.Forgotten += len(st.Routes) + len(st.Rules)
+		st.Resolvers, st.Routes, st.Rules, st.Sig, st.DNSSig, st.Tun6 = keep.Resolvers, nil, nil, "", "", keep.Tun6
+		if err := m.saveBare(st); err != nil {
+			errs = append(errs, fmt.Errorf("journal not updated: %w", err))
+		}
+		return rep, errs
+	case st.Mode == config.ModeSession:
+		fmt.Fprintln(w, "the previous vpnsplit session did not clean up after itself, removing its routes and DNS entries")
+		r, keep, errs := m.removeEntries(ctx, st, nil)
+		rep.add(r)
+		keep.Version, keep.Owner, keep.Mode = st.Version, st.Owner, st.Mode
+		*st = *keep
+		if len(errs) == 0 {
+			*st = config.State{}
+		}
+		if err := m.saveBare(st); err != nil {
+			errs = append(errs, fmt.Errorf("journal not updated: %w", err))
+		}
+		return rep, errs
+	}
+	return rep, nil
+}
+
+// removeEntries removes the DNS entries of st, then its policy rules and routes, up to four
+// calls at a time, and returns what stays in the journal: the entries that
+// could not be removed or were not reached before ctx ended. Nothing is
+// written. progress, if set, is told after every entry how many are done.
+func (m *Manager) removeEntries(ctx context.Context, st *config.State, progress func(done, total int)) (Report, *config.State, []error) {
+	m.mu.Lock()
+	m.jhint = append(m.jhint, st.Routes...)
+	m.jhintRes = append(m.jhintRes, st.Resolvers...)
+	m.mu.Unlock()
+	var (
+		rep   Report
+		errs  []error
+		keep  = &config.State{}
+		pmu   sync.Mutex
+		done  int
+		total = len(st.Resolvers) + len(st.Rules) + len(st.Routes)
+	)
+	step := func() {
+		if progress == nil {
+			return
+		}
+		pmu.Lock()
+		defer pmu.Unlock()
+		done++
+		progress(done, total)
+	}
+	dctx, dcancel := dnsContext(ctx)
+	defer dcancel()
+	// the automatic IPv6 tunnels (Windows) are put back alongside the DNS entries,
+	// under the same share of the time
+	tunDone := make(chan error, 1)
+	tunWanted := !st.Tun6.Empty()
+	if tunWanted {
+		total++
+		go func() { tunDone <- m.restoreTun6(dctx, *st.Tun6) }()
+	}
+	var dnsErrs []error
+	if bulk, ok := m.b.(resolverBulkDeleter); ok && len(st.Resolvers) > 0 {
+		// one call for all of them, see DelResolvers
+		err := runAll(dctx, []struct{}{{}}, 1, func(struct{}) error { return bulk.DelResolvers(st.Resolvers) })[0]
+		dnsErrs = make([]error, len(st.Resolvers))
+		for i, id := range st.Resolvers {
+			if !config.ValidResolverEntry(id) {
+				dnsErrs[i] = fmt.Errorf("invalid DNS entry %q", id)
+			} else {
+				dnsErrs[i] = err
+			}
+			step()
+		}
+	} else {
+		dnsErrs = runAll(dctx, st.Resolvers, removeWorkers, func(id string) error {
+			defer step()
+			if !config.ValidResolverEntry(id) {
+				return fmt.Errorf("invalid DNS entry %q", id)
+			}
+			return m.b.DelResolver(id)
+		})
+	}
+	for i, id := range st.Resolvers {
+		if err := dnsErrs[i]; errors.Is(err, errNotOurs) {
+			// not ours (the link was made again, somebody changed the servers): it stays as it
+			// is and leaves the journal
+			rep.Left = append(rep.Left, fmt.Sprintf("DNS %s: %v", id, err))
+			continue
+		} else if err != nil {
+			errs = append(errs, entryErr("DNS "+id, err))
+			keep.Resolvers = append(keep.Resolvers, id)
+			continue
+		}
+		rep.Resolvers++
+	}
+	if tunWanted {
+		err := <-tunDone
+		step()
+		if err != nil {
+			errs = append(errs, entryErr("IPv6 tunnels (Teredo, 6to4, ISATAP)", err))
+			if !errors.Is(err, errTun6) { // a value that is not valid is never handed on: it is dropped
+				c := *st.Tun6
+				keep.Tun6 = &c
+			}
+		} else {
+			rep.Tun6 = true
+		}
+	}
+	ruleErrs := runAll(ctx, st.Rules, removeWorkers, func(r config.Rule) error {
+		defer step()
+		if err := config.ValidateRule(r); err != nil {
+			return err
+		}
+		return m.b.DelRule(r)
+	})
+	for i, r := range st.Rules {
+		if err := ruleErrs[i]; err != nil {
+			errs = append(errs, entryErr(fmt.Sprintf("rule lookup %d pref %d", r.Table, r.Pref), err))
+			keep.Rules = append(keep.Rules, r)
+			continue
+		}
+		rep.Rules++
+	}
+	skip := m.legacySkips(ctx, st.Routes)
+	routeErrs := runAll(ctx, st.Routes, removeWorkers, func(r config.Route) error {
+		defer step()
+		if err := config.ValidateRoute(r); err != nil {
+			return err
+		}
+		if why, ok := skip[r]; ok {
+			return fmt.Errorf("%w: %s", errNotOurs, why)
+		}
+		return m.b.DelRoute(r)
+	})
+	gone := map[string]bool{}
+	for i, r := range st.Routes {
+		if err := routeErrs[i]; errors.Is(err, errNotOurs) {
+			// Not removed, and not counted as removed. The entry leaves the journal:
+			// it would be found "not ours" again at every start.
+			rep.Left = append(rep.Left, fmt.Sprintf("%s on %s: %v", r.Dest, r.Iface, err))
+			continue
+		} else if err != nil {
+			errs = append(errs, entryErr("route "+r.Dest, err))
+			keep.Routes = append(keep.Routes, r)
+			continue
+		}
+		rep.Routes++
+		if r.Via == ViaHome {
+			gone[r.Dest] = true
+		}
+	}
+	rep.FullTunnel = gone["0.0.0.0/1"] && gone["128.0.0.0/1"]
+	if len(st.Resolvers) > 0 && dctx.Err() == nil && ctx.Err() == nil {
+		runAll(dctx, []struct{}{{}}, 1, func(struct{}) error { m.b.FlushDNS(); return nil })
+	}
+	return rep, keep, errs
+}
+
+// dnsContext limits the removal of DNS entries to a share of the time left
+// (the routes come after them and must get to start); without a deadline there
+// is no limit.
+func dnsContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	dl, ok := ctx.Deadline()
+	if !ok {
+		return context.WithCancel(ctx)
+	}
+	return context.WithDeadline(ctx, time.Now().Add(time.Duration(float64(time.Until(dl))*dnsShare)))
+}
+
+// legacySkips lists the routes of the journal that came from an old journal in
+// the user's directory (an untrusted file) and must stay in the table: the
+// same exceptions as for a route that is not in the journal at all (see
+// addExtraRoute) - the adapter belongs to a recognized VPN client, or the
+// prefix is /1 or shorter (the halves of a full tunnel). The value says why.
+func (m *Manager) legacySkips(ctx context.Context, routes []config.Route) map[config.Route]string {
+	var skip map[config.Route]string
+	var prov map[string]string
+	provRead := false
+	for _, r := range routes {
+		if !r.FromLegacy {
+			continue
+		}
+		if skip == nil {
+			skip = map[config.Route]string{}
+		}
+		p, err := netip.ParsePrefix(r.Dest)
+		if err != nil || p.Bits() <= 1 {
+			skip[r] = "from an old journal and as wide as the halves of a full tunnel: not removed"
+			continue
+		}
+		if !provRead && m.providerOf != nil {
+			prov, _ = within(ctx, func() (map[string]string, error) { return m.providerOf(), nil })
+			provRead = true
+		}
+		if name := prov[r.Iface]; name != "" {
+			skip[r] = "from an old journal and the adapter belongs to the VPN client " + name + ": not removed"
+		}
+	}
+	return skip
+}
+
+// entryErr names the entry when the error says only that time ran out.
+func entryErr(what string, err error) error {
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+		return fmt.Errorf("%s: not removed in time: %w", what, err)
+	}
+	return err
+}
+
+// runAll calls fn for every item, up to workers at a time, and returns the
+// error of each. When ctx ends, calls still running are abandoned (they may
+// finish later; their result is dropped) and items not started get ctx's
+// error: the caller then treats them as not removed. A call that has finished
+// by then counts as done. A panic in fn is an error.
+func runAll[T any](ctx context.Context, items []T, workers int, fn func(T) error) []error {
+	errs := make([]error, len(items))
+	if len(items) == 0 {
+		return errs
+	}
+	started := make([]bool, len(items))
+	jobs := make(chan int)
+	var wg sync.WaitGroup
+	for range min(workers, len(items)) {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := range jobs {
+				started[i] = true
+				done := make(chan error, 1)
+				go func() {
+					defer func() {
+						if r := recover(); r != nil {
+							done <- fmt.Errorf("internal error: %v", r)
+						}
+					}()
+					done <- fn(items[i])
+				}()
+				select {
+				case errs[i] = <-done:
+				case <-ctx.Done():
+					select { // both may be ready: a finished call is not "not removed"
+					case errs[i] = <-done:
+					default:
+						errs[i] = ctx.Err()
+					}
+				}
+			}
+		}()
+	}
+feed:
+	for i := range items {
+		select {
+		case jobs <- i:
+		case <-ctx.Done():
+			break feed
+		}
+	}
+	close(jobs)
+	wg.Wait()
+	for i := range items {
+		if !started[i] && errs[i] == nil {
+			errs[i] = ctx.Err()
+		}
+	}
+	return errs
+}
+
+// Reset removes every route and DNS entry recorded in the journal. Entries
+// that could not be removed stay in the journal for the next try. It needs no
+// config, so it works even if config.json is broken or missing.
+func (m *Manager) Reset() (removed int, errs []error) {
+	rep, errs := m.ResetReport()
+	return rep.Total(), errs
+}
+
+// ResetReport is Reset that says what was removed.
+func (m *Manager) ResetReport() (Report, []error) {
+	if err := m.requireOwner(); err != nil {
+		return Report{}, []error{err}
+	}
+	if err := m.begin(); err != nil {
+		return Report{}, []error{err}
+	}
+	defer m.unlockSem()
+	return m.resetLocked(m.ctx)
+}
+
+// Disable removes what this session applied (DNS entries, then rules, then
+// routes, and the settings of the automatic IPv6 tunnels), the way Cleanup does,
+// but the session goes on: the lock, the snapshot of the state before the start
+// and the right to apply again stay. The end of the session compares with the
+// snapshot as usual. Entries of apply/watch that wait for TakeOver are not the
+// session's and are left alone (nothing is removed, no error).
+func (m *Manager) Disable() (Report, []error) {
+	if err := m.requireOwner(); err != nil {
+		return Report{}, []error{err}
+	}
+	if err := m.begin(); err != nil {
+		return Report{}, []error{err}
+	}
+	defer m.unlockSem()
+	if m.Foreign() {
+		return Report{}, nil
+	}
+	return m.resetLocked(m.ctx)
+}
+
+func (m *Manager) resetLocked(ctx context.Context) (Report, []error) {
+	st, _, status := m.loadLocked()
+	if err := statusErr(status); err != nil {
+		return Report{}, []error{err}
+	}
+	if st.Empty() {
+		if st.Owner != nil { // only the header of a finished run: nobody owns anything now
+			if err := m.saveBare(&config.State{}); err != nil {
+				return Report{}, []error{fmt.Errorf("journal not updated: %w", err)}
+			}
+		}
+		m.journalCleared()
+		return Report{}, nil
+	}
+	rep, keep, errs := m.removeEntries(ctx, st, nil)
+	var err error
+	if len(errs) == 0 {
+		err = m.saveBare(&config.State{}) // nothing is applied: no owner to record
+		if err == nil {
+			m.journalCleared()
+		}
+	} else {
+		err = m.save(keep)
+	}
+	if err != nil {
+		errs = append(errs, fmt.Errorf("journal not updated, entries removed above may be listed again: %w", err))
+	}
+	return rep, errs
+}
+
+// Session is the ownership of the journal by this process.
+type Session struct {
+	m       *Manager
+	release func() error
+
+	once sync.Once
+	rep  Report
+	err  error
+}
+
+// Abort stops an Apply in flight (it returns an "interrupted" error) and
+// makes later ones fail; used when the program is told to exit.
+func (s *Session) Abort() { s.m.cancel() }
+
+// OwnerRunning reports whether the process that wrote the journal header is
+// still running (for display; the lock is what decides).
+func OwnerRunning(o config.Owner) bool { return osProcs{}.Alive(o) }
+
+// Mode is config.ModeSession or config.ModePersistent: what Cleanup does.
+func (s *Session) Mode() string { return s.m.Mode() }
+
+// Foreign reports whether persistent entries of apply/watch are waiting for
+// TakeOver (see ModeSessionAsk).
+func (s *Session) Foreign() bool { return s.m.Foreign() }
+
+// TakeOver makes them the session's: removed when it ends.
+func (s *Session) TakeOver() error { return s.m.TakeOver() }
+
+// Disable is Manager.Disable for the session.
+func (s *Session) Disable() (Report, []error) { return s.m.Disable() }
+
+// Cleanup is CleanupUntil with a time limit counted from now.
+func (s *Session) Cleanup(budget time.Duration) (Report, error) {
+	return s.CleanupUntil(time.Now().Add(budget), nil)
+}
+
+// CleanupUntil ends the session, once, however often and from wherever it is
+// called (later calls return the first result). For a session journal it
+// removes everything applied, DNS first and then routes, before deadline;
+// whatever is not removed stays in the journal and the next start removes it
+// (see Acquire), which the returned error says. progress, if set, is told
+// after every removed entry. A persistent session leaves what it applied.
+// The lock is released, except when an operation did not stop before the
+// deadline: it may still be writing the journal, so nothing is written and
+// the lock stays until the OS drops it at the exit of the process. A panic
+// becomes the error.
+func (s *Session) CleanupUntil(deadline time.Time, progress func(done, total int)) (Report, error) {
+	s.once.Do(func() {
+		abandoned := false
+		defer func() {
+			if r := recover(); r != nil {
+				s.err = errors.Join(s.err, fmt.Errorf("internal error during the cleanup: %v\n%s", r, debug.Stack()))
+			}
+			s.m.closed.Store(true)
+			if abandoned {
+				return
+			}
+			if err := s.release(); err != nil {
+				s.err = errors.Join(s.err, fmt.Errorf("release the lock: %w", err))
+			}
+		}()
+		s.m.cancel() // stops an Apply in flight
+		ctx, cancel := context.WithDeadline(context.Background(), deadline)
+		defer cancel()
+		if err := s.m.lockSem(ctx); err != nil {
+			abandoned = true
+			s.m.closed.Store(true)
+			s.err = fmt.Errorf("an operation did not stop in time, the journal is left for the next start: %w", err)
+			return
+		}
+		defer s.m.unlockSem()
+		if s.m.Mode() != config.ModeSession {
+			return
+		}
+		s.rep, s.err = s.m.cleanupLocked(ctx, progress)
+	})
+	return s.rep, s.err
+}
+
+func (m *Manager) cleanupLocked(ctx context.Context, progress func(done, total int)) (Report, error) {
+	st, _, status := m.store.Load()
+	if err := statusErr(status); err != nil {
+		return Report{}, err
+	}
+	// a cleanup given little time is the OS shutting the program down
+	dl, has := ctx.Deadline()
+	abrupt := has && time.Until(dl) < abruptBelow
+	var (
+		rep  Report
+		errs []error
+	)
+	if !(st.Empty() && st.Owner == nil) {
+		var keep *config.State
+		rep, keep, errs = m.removeEntries(ctx, st, progress)
+		var serr error
+		if len(errs) == 0 {
+			serr = m.saveBare(&config.State{})
+		} else {
+			serr = m.save(keep)
+		}
+		if serr != nil {
+			errs = append(errs, fmt.Errorf("journal not updated: %w", serr))
+		}
+	}
+	if len(errs) == 0 {
+		// what the journal listed is gone: now whatever else changed since the start
+		rep.Base = m.settle(ctx, abrupt)
+	}
+	if len(errs) > 0 {
+		return rep, fmt.Errorf("%d entries were not removed, the journal keeps them for the next start: %w", len(errs), errors.Join(errs...))
+	}
+	return rep, nil
+}
+
+// Journal is the journal as it is now (what is still applied).
+//
+// It is read under the semaphore of the operations, so it never shows the
+// middle of an Apply. If an operation does not end within a few seconds (or
+// the cleanup gave up and keeps the semaphore) it returns ErrJournalBusy and
+// reads nothing: a read without the semaphore could show half of an operation.
+func (s *Session) Journal() (*config.State, config.JournalStatus, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), journalWait)
+	defer cancel()
+	if err := s.m.lockSem(ctx); err != nil {
+		return nil, config.JournalOK, fmt.Errorf("%w: %v", ErrJournalBusy, err)
+	}
+	defer s.m.unlockSem()
+	st, _, status := s.m.store.Load()
+	return st, status, nil
+}
+
+// ErrJournalBusy: an operation holds the journal and did not end in time.
+var ErrJournalBusy = errors.New("the journal is busy: an operation is still running")
